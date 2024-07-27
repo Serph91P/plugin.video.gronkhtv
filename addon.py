@@ -14,6 +14,7 @@ import xbmcplugin
 
 from urllib.request import urlopen, build_opener, install_opener
 import json
+from functools import lru_cache
 
 # Get the plugin url in plugin:// notation.
 _URL = sys.argv[0]
@@ -36,6 +37,22 @@ _CATEGORIES = [_addon.getLocalizedString(30001),
 
 # user agent for requests
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.62 Safari/537.36"
+
+# Globale Variable für den Kapitel-Cache
+chapter_cache = {}
+
+# Funktion zum Abrufen und Cachen der Kapitel
+@lru_cache(maxsize=100)  # Speichert die letzten 100 Aufrufe
+def get_chapters(episode):
+    if episode in chapter_cache:
+        return chapter_cache[episode]
+    
+    req = urlopen(f'https://api.gronkh.tv/v1/video/info?episode={episode}')
+    content = req.read().decode("utf-8")
+    chapters = json.loads(content)["chapters"]
+    
+    chapter_cache[episode] = chapters
+    return chapters
 
 def get_url(**kwargs):
     """
@@ -220,20 +237,15 @@ def list_videos(category, offset=0, search_str=""):
         list_item = xbmcgui.ListItem(label=video['title'])
         ep = video['episode']
 
-        # Add context menu items for chapters
-        # https://alwinesch.github.io/group__python__xbmcgui__listitem.html#ga14712acc2994196012036f43eb2135c4
-        # PlayMedia(media[,isdir][,1],[playoffset=xx]) -> see https://alwinesch.github.io/page__list_of_built_in_functions.html
+        # Kapitel abrufen
+        chapters = get_chapters(ep)
+        
         cm = []
-        # get chapters
-        req = urlopen(f'https://api.gronkh.tv/v1/video/info?episode={ep}')
-        content = req.read().decode("utf-8")
-        chapters = json.loads(content)["chapters"]
         chapters_content = []
         for c in chapters:
             title = str(c.get("title"))
             offset = int(c.get("offset"))
             percentage = float(offset) / float(video['video_length']) * 100.0
-##            cm.append((f'jump to [{seconds_to_time(offset)}]: {title}', f'PlayMedia(media={url}, playoffset={offset})'))
             cm.append((f'jump to [{seconds_to_time(offset)}]: {title}', f'PlayerControl(SeekPercentage({percentage}))'))
             chapters_content.append(f'[{seconds_to_time(offset)}]: {title}')
         list_item.addContextMenuItems(cm)
@@ -252,17 +264,6 @@ def list_videos(category, offset=0, search_str=""):
         tag.setFirstAired(video['created_at'])
         tag.setPlot(plot)
 
-##        list_item.setInfo('video', {'title': video['title'],
-##                                    'genre': 'Streams und Let\'s Plays',
-##                                    'mediatype': 'video',
-##                                    'duration': video['video_length'],
-##                                    'episode': ep,
-##                                    'date': video['created_at'][:10],
-##                                    'dateadded': video['created_at'],
-##                                    'aired': video['created_at'],
-##                                    'premiered': video['created_at'],
-##                                    'plot': plot
-##                                    })
         xbmc.log(video['created_at'], xbmc.LOGINFO)
         # Set graphics (thumbnail, fanart, banner, poster, landscape etc.) for the list item.
         # Here we use the same image for all items for simplicity's sake.
@@ -320,16 +321,19 @@ def list_videos(category, offset=0, search_str=""):
     xbmcplugin.endOfDirectory(_HANDLE)
 
 
-def play_video(path):
-    """
-    Play a video by the provided path.
-
-    :param path: Fully-qualified video URL
-    :type path: str
-    """
-    # Create a playable item with a path to play.
+def play_video(path, episode):
     play_item = xbmcgui.ListItem(path=path)
-    # Pass the item to the Kodi player.
+    
+    # Kapitel aus dem Cache abrufen
+    chapters = get_chapters(episode)
+    
+    # Kapitel im Kodi-Format hinzufügen
+    kodi_chapters = []
+    for chapter in chapters:
+        kodi_chapters.append((chapter['offset'], chapter['title']))
+    
+    play_item.setInfo('video', {'chapters': kodi_chapters})
+    
     xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=play_item)
 
 
@@ -357,7 +361,7 @@ def router(paramstring):
                 list_videos(params['category'])
         elif params['action'] == 'play':
             # Play a video from a provided URL.
-            play_video(get_playlist_url(params['video']))
+            play_video(get_playlist_url(params['video']), params['video'])
         else:
             # If the provided paramstring does not contain a supported action
             # we raise an exception. This helps to catch coding errors,
