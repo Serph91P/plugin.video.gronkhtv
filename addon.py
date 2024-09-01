@@ -8,6 +8,7 @@ from urllib.request import urlopen, build_opener, install_opener
 import json
 from functools import lru_cache
 import time
+import xbmcvfs
 
 # Plugin constants
 _URL = sys.argv[0]
@@ -162,33 +163,61 @@ def handle_search_results(videos, query):
 def play_video(path, episode):
     xbmc.log(f"[Gronkh.tv] Playing video: {path}, episode: {episode}", xbmc.LOGINFO)
     play_item = xbmcgui.ListItem(path=path)
+    play_item.setProperty('IsPlayable', 'true')
+
+    resume_point = get_resume_point(episode)
+    xbmc.log(f"[Gronkh.tv] Resume point: {resume_point}", xbmc.LOGINFO)
     
-    try:
-        chapters = get_chapters(episode)
-        
-        formatted_chapters = []
-        for chapter in chapters:
-            formatted_chapters.append((int(chapter['offset']), chapter['title']))
-        
-        chapters_string = ';'.join([f"{c[0]}:{c[1]}" for c in formatted_chapters])
-        xbmc.log(f"[Gronkh.tv] Chapter string: {chapters_string}", xbmc.LOGINFO)
-        
-        video_info = {
-            'mediatype': 'video',
-            'title': f'Episode {episode}',
-            'episode': episode,
-        }
-        
-        play_item.setInfo('video', video_info)
-        play_item.addStreamInfo('video', {'duration': formatted_chapters[-1][0] if formatted_chapters else 0})
-        play_item.setProperty('TotalTime', str(formatted_chapters[-1][0] if formatted_chapters else 0))
-        play_item.setProperty('Chapters', chapters_string)
-        
-    except Exception as e:
-        xbmc.log(f"[Gronkh.tv] Error processing chapters: {str(e)}", xbmc.LOGERROR)
+    if resume_point > 0:
+        resume_time = int(resume_point)
+        play_item.setInfo('video', {'resumetime': resume_time})
+        play_item.setInfo('video', {'totaltime': int(get_total_time(episode))})
     
     xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=play_item)
-    xbmc.log("[Gronkh.tv] Video playback started", xbmc.LOGINFO)
+    
+    monitor_playback(episode)       
+
+def monitor_playback(episode):
+    player = xbmc.Player()
+    while not player.isPlayingVideo():
+        xbmc.sleep(100)
+    
+    while player.isPlayingVideo():
+        try:
+            current_time = player.getTime()
+            total_time = player.getTotalTime()
+            save_resume_point(episode, current_time, total_time)
+            xbmc.log(f"[Gronkh.tv] Saved resume point: {current_time}/{total_time}", xbmc.LOGINFO)
+        except Exception as e:
+            xbmc.log(f"[Gronkh.tv] Error saving resume point: {str(e)}", xbmc.LOGERROR)
+        xbmc.sleep(1000)
+
+def get_resume_point(episode):
+    try:
+        with xbmcvfs.File(f'special://profile/addon_data/plugin.video.gronkhtv/resume_points/{episode}.txt') as f:
+            return float(f.read() or '0')
+    except Exception as e:
+        xbmc.log(f"[Gronkh.tv] Error getting resume point for episode {episode}: {str(e)}", xbmc.LOGERROR)
+        return 0
+
+def save_resume_point(episode, current_time, total_time):
+    try:
+        resume_point_dir = xbmcvfs.translatePath('special://profile/addon_data/plugin.video.gronkhtv/resume_points/')
+        if not xbmcvfs.exists(resume_point_dir):
+            xbmcvfs.mkdirs(resume_point_dir)
+        
+        with xbmcvfs.File(f'{resume_point_dir}/{episode}.txt', 'w') as f:
+            f.write(str(current_time))
+    except Exception as e:
+        xbmc.log(f"[Gronkh.tv] Error saving resume point for episode {episode}: {str(e)}", xbmc.LOGERROR)
+
+def get_total_time(episode):
+    try:
+        with xbmcvfs.File(f'special://profile/addon_data/plugin.video.gronkhtv/total_times/{episode}.txt') as f:
+            return float(f.read() or '0') 
+    except Exception as e:
+        xbmc.log(f"[Gronkh.tv] Error getting total time for episode {episode}: {str(e)}", xbmc.LOGERROR)
+        return 0
 
 def jump_to_chapter(params):
     episode = params['episode']
