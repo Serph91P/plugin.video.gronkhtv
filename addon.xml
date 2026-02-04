@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="1.3.0" provider-name="Seraph91P">
+<addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="2.0.2" provider-name="Seraph91P">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.inputstreamhelper" version="0.6.1"/>
@@ -12,9 +12,25 @@
         <language>de</language>
         <summary lang="en_GB">Watch videos from gronkh.tv!</summary>
         <summary lang="de_DE">Schaue Videos von gronkh.tv!</summary>
-        <description lang="en_GB">gronkh.tv is an online video service that offers full-length streams of Gronkh and potentially other Let's Players.</description>
-        <description lang="de_DE">gronkh.tv ist ein online Video-Streaming-Dienst und bietet Zugang zum Stream-Archiv von Gronkh und potentiell auch anderen Let's Playern.</description>
-        <news>v1.0.0 (27.01.24)[gtv] - Erste Version</news>
+        <description lang="en_GB">gronkh.tv is an online video service that offers full-length streams of Gronkh and potentially other Let's Players. Features: Thumbnails, resume playback, favorites, game filter, chapter markers, auto-next episode.</description>
+        <description lang="de_DE">gronkh.tv ist ein online Video-Streaming-Dienst und bietet Zugang zum Stream-Archiv von Gronkh. Features: Thumbnails, Wiedergabe fortsetzen, Favoriten, Spiele-Filter, Kapitel-Marker, automatisch nächste Episode.</description>
+        <news>v2.0.2 (04.02.26)
+- Cleanup: Nicht funktionierende EDL-Funktionen entfernt
+- Kapitel weiterhin ueber Kontextmenue erreichbar
+v2.0.1 (04.02.26)
+- Fix: Spiele-Filter funktioniert jetzt (API-Limit beachtet)
+- Fix: Emojis entfernt fuer bessere Kodi-Kompatibilitaet
+- Kapitel im Kontextmenue verfuegbar
+v2.0.0 (04.02.26)
+- Thumbnails fuer alle Videos
+- Verbessertes Resume-System mit Fortschrittsbalken
+- Favoriten/Watchlist
+- Filter nach Spielen
+- Erweiterte Video-Details
+- Automatisch naechste Episode
+- Kodi 21 kompatibel
+v1.0.0 (27.01.24)
+- Erste Version</news>
         <license>GNU Affero General Public License, v3</license>
         <website>https://gronkh.tv/</website>
         <source>https://github.com/Seraph91P/plugin.video.gronkhtv</source>
