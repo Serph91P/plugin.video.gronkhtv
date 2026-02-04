@@ -67,12 +67,12 @@ jobs:
                     --exclude='repo' \
                     ./ repo/plugin.video.gronkhtv/
           
-          # Create versioned zip
+          # Create versioned zip in addon folder (required for Kodi repo structure)
           cd repo
-          zip -r plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip plugin.video.gronkhtv
+          zip -r plugin.video.gronkhtv/plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip plugin.video.gronkhtv
           
-          # Also create unversioned zip for latest
-          cp plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip plugin.video.gronkhtv/plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip
+          # Also keep a copy in root for direct download
+          cp plugin.video.gronkhtv/plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip ./
       
       - name: Generate addons.xml
         run: |
@@ -188,46 +188,84 @@ jobs:
           <head>
               <title>Gronkh.tv Kodi Repository</title>
               <style>
-                  body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-                  h1 { color: #1a73e8; }
-                  .download { background: #1a73e8; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px 0; }
-                  .download:hover { background: #1557b0; }
-                  code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
-                  .instructions { background: #f9f9f9; padding: 20px; border-radius: 10px; margin: 20px 0; }
+                  body { font-family: Arial, sans-serif; max-width: 900px; margin: 50px auto; padding: 20px; background: #1a1a2e; color: #eee; }
+                  h1 { color: #4cc9f0; }
+                  h2 { color: #7209b7; border-bottom: 2px solid #7209b7; padding-bottom: 10px; }
+                  h3 { color: #f72585; }
+                  a { color: #4cc9f0; }
+                  .download { background: linear-gradient(135deg, #7209b7, #f72585); color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; display: inline-block; margin: 10px 5px; font-weight: bold; }
+                  .download:hover { opacity: 0.9; transform: scale(1.02); }
+                  code { background: #2d2d44; padding: 4px 8px; border-radius: 4px; font-family: monospace; color: #4cc9f0; }
+                  .instructions { background: #16213e; padding: 25px; border-radius: 12px; margin: 20px 0; border: 1px solid #7209b7; }
+                  .method { margin-bottom: 30px; }
+                  ol, ul { line-height: 1.8; }
+                  .url-box { background: #0f0f23; padding: 15px; border-radius: 8px; margin: 10px 0; word-break: break-all; border-left: 4px solid #4cc9f0; }
+                  .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+                  .feature { background: #16213e; padding: 12px; border-radius: 8px; }
+                  .copy-btn { background: #4cc9f0; color: #1a1a2e; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; margin-left: 10px; }
               </style>
           </head>
           <body>
               <h1>🎮 Gronkh.tv Kodi Repository</h1>
-              <p>Installiere das Repository um automatische Updates für das Gronkh.tv Addon zu erhalten.</p>
+              <p>Installiere das Repository um automatische Updates fuer das Gronkh.tv Addon zu erhalten.</p>
               
-              <h2>Installation</h2>
+              <h2>📥 Installation</h2>
+              
               <div class="instructions">
-                  <h3>Methode 1: Repository installieren (empfohlen)</h3>
-                  <ol>
-                      <li>Lade die Repository-ZIP herunter</li>
-                      <li>In Kodi: Einstellungen → Add-ons → Aus ZIP-Datei installieren</li>
-                      <li>Wähle die heruntergeladene ZIP</li>
-                      <li>Dann: Aus Repository installieren → Gronkh.tv Repository → Video Add-ons → Gronkh.tv</li>
-                  </ol>
-                  <a class="download" href="repository.gronkhtv/repository.gronkhtv-1.0.0.zip">📦 Repository herunterladen</a>
+                  <div class="method">
+                      <h3>Methode 1: Per URL im File Manager (empfohlen)</h3>
+                      <p>So fügst du das Repository direkt in Kodi hinzu:</p>
+                      <ol>
+                          <li>Gehe zu <strong>Einstellungen</strong> → <strong>Dateimanager</strong></li>
+                          <li>Wähle <strong>Quelle hinzufügen</strong></li>
+                          <li>Klicke auf <strong>&lt;Keine&gt;</strong> und gib folgende URL ein:</li>
+                      </ol>
+                      <div class="url-box">
+                          <code id="repo-url">https://serph91p.github.io/plugin.video.gronkhtv/</code>
+                          <button class="copy-btn" onclick="navigator.clipboard.writeText('https://serph91p.github.io/plugin.video.gronkhtv/')">📋 Kopieren</button>
+                      </div>
+                      <ol start="4">
+                          <li>Gib einen Namen ein, z.B. <strong>Gronkh.tv Repo</strong></li>
+                          <li>Klicke <strong>OK</strong></li>
+                          <li>Gehe zu <strong>Einstellungen</strong> → <strong>Add-ons</strong> → <strong>Aus ZIP-Datei installieren</strong></li>
+                          <li>Wähle <strong>Gronkh.tv Repo</strong></li>
+                          <li>Wähle <strong>repository.gronkhtv</strong> → <strong>repository.gronkhtv-1.0.0.zip</strong></li>
+                          <li>Dann: <strong>Aus Repository installieren</strong> → <strong>Gronkh.tv Repository</strong> → <strong>Video Add-ons</strong> → <strong>Gronkh.tv</strong></li>
+                      </ol>
+                  </div>
                   
-                  <h3>Methode 2: Direkt installieren</h3>
-                  <p>Installiere das Addon direkt (keine automatischen Updates):</p>
-                  <a class="download" href="plugin.video.gronkhtv/">📺 Addon herunterladen</a>
+                  <div class="method">
+                      <h3>Methode 2: ZIP herunterladen</h3>
+                      <p>Lade die ZIP-Datei herunter und installiere sie manuell:</p>
+                      <ol>
+                          <li>Lade die Repository-ZIP herunter</li>
+                          <li>In Kodi: <strong>Einstellungen</strong> → <strong>Add-ons</strong> → <strong>Aus ZIP-Datei installieren</strong></li>
+                          <li>Navigiere zur heruntergeladenen ZIP-Datei</li>
+                          <li>Dann: <strong>Aus Repository installieren</strong> → <strong>Gronkh.tv Repository</strong> → <strong>Video Add-ons</strong> → <strong>Gronkh.tv</strong></li>
+                      </ol>
+                      <a class="download" href="repository.gronkhtv/repository.gronkhtv-1.0.0.zip">📦 Repository ZIP</a>
+                      <a class="download" href="plugin.video.gronkhtv/">📺 Addon direkt</a>
+                  </div>
               </div>
               
-              <h2>Features</h2>
-              <ul>
-                  <li>✅ Alle Gronkh Streams</li>
-                  <li>✅ Thumbnails & Vorschaubilder</li>
-                  <li>✅ Wiedergabe fortsetzen</li>
-                  <li>✅ Favoriten/Watchlist</li>
-                  <li>✅ Nach Spielen filtern</li>
-                  <li>✅ Kapitel-Navigation</li>
-                  <li>✅ Automatisch nächste Episode</li>
-              </ul>
+              <h2>✨ Features</h2>
+              <div class="features">
+                  <div class="feature">🎬 Alle Gronkh Streams</div>
+                  <div class="feature">🖼️ Thumbnails & Poster</div>
+                  <div class="feature">⏯️ Wiedergabe fortsetzen</div>
+                  <div class="feature">⭐ Favoriten/Watchlist</div>
+                  <div class="feature">🎮 Nach Spielen filtern</div>
+                  <div class="feature">📑 Kapitel-Navigation</div>
+                  <div class="feature">⏭️ Auto nächste Episode</div>
+                  <div class="feature">🔍 Stream-Suche</div>
+              </div>
               
-              <p><a href="https://github.com/Serph91P/plugin.video.gronkhtv">GitHub Repository</a></p>
+              <h2>ℹ️ Hinweise</h2>
+              <ul>
+                  <li>Erfordert <strong>Kodi 21 (Omega)</strong> oder neuer</li>
+                  <li>Bei Problemen: <a href="https://github.com/Serph91P/plugin.video.gronkhtv/issues">GitHub Issues</a></li>
+                  <li>Quellcode: <a href="https://github.com/Serph91P/plugin.video.gronkhtv">GitHub Repository</a></li>
+              </ul>
           </body>
           </html>
           HTML
