@@ -1,0 +1,237 @@
+name: Build Kodi Repository
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Get version from addon.xml
+        id: get_version
+        run: |
+          VERSION=$(grep -oP 'version="\K[^"]+' addon.xml | head -1)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Addon version: $VERSION"
+      
+      - name: Create addon zip
+        run: |
+          mkdir -p repo/plugin.video.gronkhtv
+          
+          # Copy addon files (exclude dev files)
+          rsync -av --exclude='.git*' \
+                    --exclude='__pycache__' \
+                    --exclude='*.pyc' \
+                    --exclude='logs' \
+                    --exclude='.github' \
+                    --exclude='repo' \
+                    ./ repo/plugin.video.gronkhtv/
+          
+          # Create versioned zip
+          cd repo
+          zip -r plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip plugin.video.gronkhtv
+          
+          # Also create unversioned zip for latest
+          cp plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip plugin.video.gronkhtv/plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip
+      
+      - name: Generate addons.xml
+        run: |
+          python3 << 'EOF'
+          import os
+          import hashlib
+          import xml.etree.ElementTree as ET
+          
+          repo_dir = 'repo'
+          addons_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<addons>\n'
+          
+          # Find all addon.xml files
+          for addon_dir in os.listdir(repo_dir):
+              addon_xml_path = os.path.join(repo_dir, addon_dir, 'addon.xml')
+              if os.path.isfile(addon_xml_path):
+                  with open(addon_xml_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                      # Remove XML declaration if present
+                      if content.startswith('<?xml'):
+                          content = content.split('?>', 1)[1].strip()
+                      addons_xml += content + '\n'
+          
+          addons_xml += '</addons>'
+          
+          # Write addons.xml
+          with open(os.path.join(repo_dir, 'addons.xml'), 'w', encoding='utf-8') as f:
+              f.write(addons_xml)
+          
+          # Generate MD5 checksum
+          with open(os.path.join(repo_dir, 'addons.xml'), 'rb') as f:
+              md5 = hashlib.md5(f.read()).hexdigest()
+          
+          with open(os.path.join(repo_dir, 'addons.xml.md5'), 'w') as f:
+              f.write(md5)
+          
+          print(f"Generated addons.xml with MD5: {md5}")
+          EOF
+      
+      - name: Copy icon for repo
+        run: |
+          cp resources/icon.png repo/plugin.video.gronkhtv/icon.png 2>/dev/null || true
+      
+      - name: Create repository addon
+        run: |
+          mkdir -p repo/repository.gronkhtv
+          
+          cat > repo/repository.gronkhtv/addon.xml << 'REPOXML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <addon id="repository.gronkhtv" name="Gronkh.tv Repository" version="1.0.0" provider-name="Seraph91P">
+              <extension point="xbmc.addon.repository" name="Gronkh.tv Repository">
+                  <dir>
+                      <info compressed="false">https://serph91p.github.io/plugin.video.gronkhtv/addons.xml</info>
+                      <checksum>https://serph91p.github.io/plugin.video.gronkhtv/addons.xml.md5</checksum>
+                      <datadir zip="true">https://serph91p.github.io/plugin.video.gronkhtv</datadir>
+                  </dir>
+              </extension>
+              <extension point="xbmc.addon.metadata">
+                  <platform>all</platform>
+                  <summary lang="en_GB">Gronkh.tv Addon Repository</summary>
+                  <summary lang="de_DE">Gronkh.tv Addon Repository</summary>
+                  <description lang="en_GB">Repository for the Gronkh.tv Kodi addon. Install this to receive automatic updates.</description>
+                  <description lang="de_DE">Repository fuer das Gronkh.tv Kodi Addon. Installiere dies um automatische Updates zu erhalten.</description>
+              </extension>
+          </addon>
+          REPOXML
+          
+          # Create repo zip
+          cd repo
+          zip -r repository.gronkhtv-1.0.0.zip repository.gronkhtv
+          cp repository.gronkhtv-1.0.0.zip repository.gronkhtv/repository.gronkhtv-1.0.0.zip
+      
+      - name: Update addons.xml with repository
+        run: |
+          python3 << 'EOF'
+          import os
+          import hashlib
+          
+          repo_dir = 'repo'
+          addons_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<addons>\n'
+          
+          # Find all addon.xml files
+          for addon_dir in sorted(os.listdir(repo_dir)):
+              addon_xml_path = os.path.join(repo_dir, addon_dir, 'addon.xml')
+              if os.path.isfile(addon_xml_path):
+                  with open(addon_xml_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                      # Remove XML declaration if present
+                      if content.startswith('<?xml'):
+                          content = content.split('?>', 1)[1].strip()
+                      addons_xml += content + '\n'
+          
+          addons_xml += '</addons>'
+          
+          # Write addons.xml
+          with open(os.path.join(repo_dir, 'addons.xml'), 'w', encoding='utf-8') as f:
+              f.write(addons_xml)
+          
+          # Generate MD5 checksum
+          with open(os.path.join(repo_dir, 'addons.xml'), 'rb') as f:
+              md5 = hashlib.md5(f.read()).hexdigest()
+          
+          with open(os.path.join(repo_dir, 'addons.xml.md5'), 'w') as f:
+              f.write(md5)
+          
+          print(f"Final addons.xml with MD5: {md5}")
+          EOF
+      
+      - name: Create index.html
+        run: |
+          cat > repo/index.html << 'HTML'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Gronkh.tv Kodi Repository</title>
+              <style>
+                  body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                  h1 { color: #1a73e8; }
+                  .download { background: #1a73e8; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px 0; }
+                  .download:hover { background: #1557b0; }
+                  code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+                  .instructions { background: #f9f9f9; padding: 20px; border-radius: 10px; margin: 20px 0; }
+              </style>
+          </head>
+          <body>
+              <h1>🎮 Gronkh.tv Kodi Repository</h1>
+              <p>Installiere das Repository um automatische Updates für das Gronkh.tv Addon zu erhalten.</p>
+              
+              <h2>Installation</h2>
+              <div class="instructions">
+                  <h3>Methode 1: Repository installieren (empfohlen)</h3>
+                  <ol>
+                      <li>Lade die Repository-ZIP herunter</li>
+                      <li>In Kodi: Einstellungen → Add-ons → Aus ZIP-Datei installieren</li>
+                      <li>Wähle die heruntergeladene ZIP</li>
+                      <li>Dann: Aus Repository installieren → Gronkh.tv Repository → Video Add-ons → Gronkh.tv</li>
+                  </ol>
+                  <a class="download" href="repository.gronkhtv/repository.gronkhtv-1.0.0.zip">📦 Repository herunterladen</a>
+                  
+                  <h3>Methode 2: Direkt installieren</h3>
+                  <p>Installiere das Addon direkt (keine automatischen Updates):</p>
+                  <a class="download" href="plugin.video.gronkhtv/">📺 Addon herunterladen</a>
+              </div>
+              
+              <h2>Features</h2>
+              <ul>
+                  <li>✅ Alle Gronkh Streams</li>
+                  <li>✅ Thumbnails & Vorschaubilder</li>
+                  <li>✅ Wiedergabe fortsetzen</li>
+                  <li>✅ Favoriten/Watchlist</li>
+                  <li>✅ Nach Spielen filtern</li>
+                  <li>✅ Kapitel-Navigation</li>
+                  <li>✅ Automatisch nächste Episode</li>
+              </ul>
+              
+              <p><a href="https://github.com/Serph91P/plugin.video.gronkhtv">GitHub Repository</a></p>
+          </body>
+          </html>
+          HTML
+      
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          publish_branch: gh-pages
+          force_orphan: true
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            repo/plugin.video.gronkhtv-${{ steps.get_version.outputs.version }}.zip
+            repo/repository.gronkhtv-1.0.0.zip
+          body: |
+            ## Gronkh.tv Kodi Addon v${{ steps.get_version.outputs.version }}
+            
+            ### Installation
+            1. Lade `repository.gronkhtv-1.0.0.zip` herunter
+            2. In Kodi: Einstellungen → Add-ons → Aus ZIP-Datei installieren
+            3. Dann: Aus Repository installieren → Gronkh.tv Repository → Video Add-ons → Gronkh.tv
+            
+            Oder besuche: https://serph91p.github.io/plugin.video.gronkhtv/
