@@ -2,8 +2,12 @@ name: Build Kodi Repository
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'addon.xml'
+      - 'addon.py'
+      - 'resources/**'
   workflow_dispatch:
 
 permissions:
@@ -32,6 +36,23 @@ jobs:
           VERSION=$(grep -oP 'version="\K[^"]+' addon.xml | head -1)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Addon version: $VERSION"
+          
+          # Check if tag already exists
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "Tag v$VERSION already exists"
+          else
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            echo "Tag v$VERSION does not exist - will create"
+          fi
+      
+      - name: Create and push tag
+        if: steps.get_version.outputs.tag_exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.get_version.outputs.version }}" -m "Release v${{ steps.get_version.outputs.version }}"
+          git push origin "v${{ steps.get_version.outputs.version }}"
       
       - name: Create addon zip
         run: |
