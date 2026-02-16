@@ -1,0 +1,88 @@
+name: Make Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'addon.xml'
+      - 'addon.py'
+      - 'resources/**'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Make Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Add-on
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install libxml2-utils xmlstarlet zip
+
+      - name: Get version and check tag
+        id: version
+        run: |
+          version=$(xmlstarlet sel -t -v 'string(/addon/@version)' addon.xml)
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag
+        if: steps.version.outputs.tag_exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Get Changelog
+        if: steps.version.outputs.tag_exists == 'false'
+        id: changelog
+        run: |
+          changes=$(xmlstarlet sel -t -v '//news' -n addon.xml)
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "changes<<$EOF" >> $GITHUB_OUTPUT
+          echo "$changes" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Zip
+        if: steps.version.outputs.tag_exists == 'false'
+        id: create-zip
+        run: |
+          addon_id=${{ github.event.repository.name }}
+          version=${{ steps.version.outputs.version }}
+          filename=${addon_id}-${version}.zip
+
+          mkdir -p /tmp/build/${addon_id}
+          rsync -av --exclude='.git*' \
+                    --exclude='__pycache__' \
+                    --exclude='*.pyc' \
+                    --exclude='logs' \
+                    --exclude='.github' \
+                    ./ /tmp/build/${addon_id}/
+
+          cd /tmp/build
+          zip -r ${GITHUB_WORKSPACE}/${filename} ${addon_id}
+          echo "filename=$filename" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        if: steps.version.outputs.tag_exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          files: ${{ steps.create-zip.outputs.filename }}
+          body: ${{ steps.changelog.outputs.changes }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
