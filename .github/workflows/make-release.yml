@@ -31,13 +31,23 @@ jobs:
         id: version
         run: |
           version=$(xmlstarlet sel -t -v 'string(/addon/@version)' addon.xml)
+          filename=${{ github.event.repository.name }}-${version}.zip
           echo "version=$version" >> $GITHUB_OUTPUT
+          echo "filename=$filename" >> $GITHUB_OUTPUT
 
           if git rev-parse "v$version" >/dev/null 2>&1; then
             echo "tag_exists=true" >> $GITHUB_OUTPUT
           else
             echo "tag_exists=false" >> $GITHUB_OUTPUT
           fi
+
+          if gh api "repos/${{ github.repository }}/releases/tags/v$version" --jq '.assets[].name' 2>/dev/null | grep -Fxq -- "$filename"; then
+            echo "asset_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "asset_exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push tag
         if: steps.version.outputs.tag_exists == 'false'
@@ -48,7 +58,7 @@ jobs:
           git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Get Changelog
-        if: steps.version.outputs.tag_exists == 'false'
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         id: changelog
         run: |
           changes=$(xmlstarlet sel -t -v '//news' -n addon.xml)
@@ -58,12 +68,11 @@ jobs:
           echo "$EOF" >> $GITHUB_OUTPUT
 
       - name: Create Zip
-        if: steps.version.outputs.tag_exists == 'false'
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         id: create-zip
         run: |
           addon_id=${{ github.event.repository.name }}
-          version=${{ steps.version.outputs.version }}
-          filename=${addon_id}-${version}.zip
+          filename=${{ steps.version.outputs.filename }}
 
           mkdir -p /tmp/build/${addon_id}
           rsync -av --exclude='.git*' \
@@ -78,11 +87,18 @@ jobs:
           echo "filename=$filename" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        if: steps.version.outputs.tag_exists == 'false'
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          files: ${{ steps.create-zip.outputs.filename }}
+          files: ${{ steps.version.outputs.filename }}
           body: ${{ steps.changelog.outputs.changes }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify release asset
+        run: |
+          gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.version.outputs.version }}" --jq '.assets[].name' | grep -Fxq -- "${{ steps.version.outputs.filename }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
