@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="2.0.2" provider-name="Seraph91P">
+<addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="2.2.0" provider-name="Seraph91P">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.inputstreamhelper" version="0.6.1"/>
@@ -14,7 +14,11 @@
         <summary lang="de_DE">Schaue Videos von gronkh.tv!</summary>
         <description lang="en_GB">gronkh.tv is an online video service that offers full-length streams of Gronkh and potentially other Let's Players. Features: Thumbnails, resume playback, favorites, game filter, chapter markers, auto-next episode.</description>
         <description lang="de_DE">gronkh.tv ist ein online Video-Streaming-Dienst und bietet Zugang zum Stream-Archiv von Gronkh. Features: Thumbnails, Wiedergabe fortsetzen, Favoriten, Spiele-Filter, Kapitel-Marker, automatisch nächste Episode.</description>
-        <news>v2.0.2 (04.02.26)
+        <news>v2.2.0 (09.07.26)
+- Migration auf die aktuelle GronkhTV v3 API
+- Video-Details, Kapitel, Suche, Kategorien und Wiedergabe repariert
+- Neue Live-Streams Kategorie mit Twitch-Link-Hinweis
+v2.0.2 (04.02.26)
 - Cleanup: Nicht funktionierende EDL-Funktionen entfernt
 - Kapitel weiterhin ueber Kontextmenue erreichbar
 v2.0.1 (04.02.26)
