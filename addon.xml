@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="2.2.0" provider-name="Seraph91P">
     <requires>
-        <import addon="xbmc.python" version="3.0.0"/>
+        <import addon="xbmc.python" version="3.0.1"/>
         <import addon="script.module.inputstreamhelper" version="0.6.1"/>
     </requires>
     <extension point="xbmc.python.pluginsource" library="addon.py">
@@ -18,6 +18,15 @@
 - Migration auf die aktuelle GronkhTV v3 API
 - Video-Details, Kapitel, Suche, Kategorien und Wiedergabe repariert
 - Neue Live-Streams Kategorie mit Twitch-Link-Hinweis
+v2.1.0 (17.02.26)
+- Refactoring: Code in resources/lib/plugin.py ausgelagert (komplexen Entrypoint behoben)
+- Fix: xbmc.python Version auf 3.0.1 aktualisiert (Omega-Kompatibilitaet)
+- Fix: Icon-Transparenz entfernt (solid background)
+v2.0.4 (17.02.26)
+- Fix: xbmc.python Version auf 3.0.1 aktualisiert (Omega-Kompatibilitaet)
+v2.0.3 (16.02.26)
+- Fix: GitHub Source-URL korrigiert
+- CI/CD Workflows modernisiert
 v2.0.2 (04.02.26)
 - Cleanup: Nicht funktionierende EDL-Funktionen entfernt
 - Kapitel weiterhin ueber Kontextmenue erreichbar
@@ -37,7 +46,7 @@ v1.0.0 (27.01.24)
 - Erste Version</news>
         <license>GNU Affero General Public License, v3</license>
         <website>https://gronkh.tv/</website>
-        <source>https://github.com/Seraph91P/plugin.video.gronkhtv</source>
+        <source>https://github.com/Serph91P/plugin.video.gronkhtv</source>
         <assets>
             <icon>resources/icon.png</icon>
         </assets>
