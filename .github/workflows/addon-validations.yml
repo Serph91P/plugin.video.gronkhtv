@@ -1,0 +1,42 @@
+name: Add-on Validations
+
+on:
+  push:
+    branches: [main, develop]
+
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  addon-validations:
+    name: Add-on Validations
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Checkout Add-on
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.event.repository.name }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install git+https://github.com/xbmc/addon-check.git
+
+      - name: Pytest regression suite
+        working-directory: ${{ github.event.repository.name }}
+        run: python -m pytest -q
+
+      - name: Kodi Add-on Checker (Omega)
+        id: kodi-addon-checker
+        run: |
+          kodi-addon-checker ${{ github.event.repository.name }} --branch=omega
