@@ -3,6 +3,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from account import AuthenticationError
+
 API_BASE = "https://backend.gronkh.tv/v3"
 _TIMEOUT = 10
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -10,9 +12,21 @@ DEFAULT_HEADERS = {
     "User-Agent": _UA,
     "Accept": "application/json",
 }
+_account_session = None
+
+
+def configure_account_session(session):
+    global _account_session
+    _account_session = session
 
 
 def get_json(path, method="GET", payload=None):
+    if _account_session is not None:
+        try:
+            return _account_session.request_json(path, method=method, payload=payload)
+        except AuthenticationError:
+            pass
+
     url = _make_url(path)
     data = None
     headers = dict(DEFAULT_HEADERS)
@@ -146,6 +160,7 @@ def normalize_live_stream(stream):
 
     user_login = stream.get("user_login", "")
     return {
+        "user_id": str(stream.get("user_id") or ""),
         "user_login": user_login,
         "user_name": stream.get("user_name", ""),
         "game_name": stream.get("game_name", ""),
