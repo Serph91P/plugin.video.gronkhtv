@@ -172,6 +172,28 @@ def test_verify_zip_rejects_synthetic_traversal(tmp_path, traversal_path):
 
 
 @pytest.mark.parametrize(
+    "repository_only_path",
+    [
+        "resources/README",
+        "resources/docs/readme.MD",
+        "resources/docs/ReadMe.rSt",
+        "resources/LICENSE",
+        "resources/legal/license.TXT",
+        "resources/legal/License.Md",
+    ],
+)
+def test_verify_zip_rejects_nested_readme_and_license_basenames(tmp_path, repository_only_path):
+    """verify_zip must reject README and LICENSE basenames anywhere below the add-on root."""
+    from scripts.build_release import verify_zip
+
+    member = f"plugin.video.gronkhtv/{repository_only_path}"
+    output = _make_bad_zip(tmp_path, _base_members(), {member: "repository metadata"})
+
+    with pytest.raises(ValueError, match="[Ff]orbidden"):
+        verify_zip(output)
+
+
+@pytest.mark.parametrize(
     "mode,source_version,expected_version,should_pass",
     [
         ("build", "1.0.0", "2.0.0", False),   # mismatch on build

@@ -240,11 +240,11 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
             ".hermes/",
             "__pycache__/",
         )
-        FORBIDDEN_EXACT = {
-            "README.md", "README.rst", "README",
-            "LICENSE", "LICENSE.txt", "LICENSE.md",
-            "module.pyc",
+        FORBIDDEN_BASENAMES = {
+            "readme.md", "readme.rst", "readme",
+            "license", "license.txt", "license.md",
         }
+        FORBIDDEN_EXACT = {"module.pyc"}
         FORBIDDEN_SUFFIXES = {".pyc"}
 
         for m in members:
@@ -274,7 +274,8 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
             for prefix in FORBIDDEN_PREFIXES:
                 if rel.startswith(prefix):
                     raise ValueError(f"Forbidden repo-only path in archive: {m}")
-            if rel in FORBIDDEN_EXACT:
+            basename = rel.rsplit("/", 1)[-1].casefold()
+            if basename in FORBIDDEN_BASENAMES or rel in FORBIDDEN_EXACT:
                 raise ValueError(f"Forbidden file in archive: {m}")
             for suffix in FORBIDDEN_SUFFIXES:
                 if rel.endswith(suffix):
