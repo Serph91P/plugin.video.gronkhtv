@@ -25,7 +25,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libxml2-utils xmlstarlet zip
+          sudo apt-get install libxml2-utils xmlstarlet
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Get version and check tag
         id: version
@@ -49,6 +54,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Create Zip
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
+        id: create-zip
+        run: |
+          filename=${{ steps.version.outputs.filename }}
+          python scripts/build_release.py --source . --output "${GITHUB_WORKSPACE}/${filename}" --expected-version "${{ steps.version.outputs.version }}"
+          echo "filename=$filename" >> $GITHUB_OUTPUT
+
+      - name: Verify Zip
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
+        run: |
+          python scripts/build_release.py --verify-only --output "${GITHUB_WORKSPACE}/${{ steps.create-zip.outputs.filename }}" --expected-version "${{ steps.version.outputs.version }}"
+
+      - name: Check tag points to current commit (retry safety)
+        if: steps.version.outputs.tag_exists == 'true' && steps.version.outputs.asset_exists == 'false'
+        run: |
+          tag_sha=$(git rev-parse "v${{ steps.version.outputs.version }}^{}")
+          if [ "$tag_sha" != "${{ github.sha }}" ]; then
+            echo "Tag v${{ steps.version.outputs.version }} points to $tag_sha but current commit is ${{ github.sha }}"
+            echo "Refusing to attach asset built from different commit to existing immutable tag"
+            exit 1
+          fi
+
       - name: Create and push tag
         if: steps.version.outputs.tag_exists == 'false'
         run: |
@@ -67,31 +95,12 @@ jobs:
           echo "$changes" >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
 
-      - name: Create Zip
-        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
-        id: create-zip
-        run: |
-          addon_id=${{ github.event.repository.name }}
-          filename=${{ steps.version.outputs.filename }}
-
-          mkdir -p /tmp/build/${addon_id}
-          rsync -av --exclude='.git*' \
-                    --exclude='__pycache__' \
-                    --exclude='*.pyc' \
-                    --exclude='logs' \
-                    --exclude='.github' \
-                    ./ /tmp/build/${addon_id}/
-
-          cd /tmp/build
-          zip -r ${GITHUB_WORKSPACE}/${filename} ${addon_id}
-          echo "filename=$filename" >> $GITHUB_OUTPUT
-
       - name: Create Release
         if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          files: ${{ steps.version.outputs.filename }}
+          files: "${{ steps.create-zip.outputs.filename }}"
           body: ${{ steps.changelog.outputs.changes }}
           fail_on_unmatched_files: true
         env:
