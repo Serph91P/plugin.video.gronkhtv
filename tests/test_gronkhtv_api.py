@@ -7,6 +7,7 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 import gronkhtv_api  # noqa: E402
+from account import AuthenticationError  # noqa: E402
 from gronkhtv_api import (  # noqa: E402
     category_videos,
     discovery,
@@ -63,6 +64,7 @@ CATEGORY_PAYLOAD = {
 }
 
 LIVE_STREAM_PAYLOAD = {
+    "user_id": "12875057",
     "user_login": "gronkh",
     "user_name": "Gronkh",
     "game_name": "Just Chatting",
@@ -219,6 +221,7 @@ def test_normalize_live_stream_maps_promoted_stream_shape():
     stream = normalize_live_stream(LIVE_STREAM_PAYLOAD)
 
     assert stream == {
+        "user_id": "12875057",
         "user_login": "gronkh",
         "user_name": "Gronkh",
         "game_name": "Just Chatting",
@@ -244,3 +247,52 @@ def test_live_streams_fetches_promoted_streams_and_normalizes(monkeypatch):
     assert calls == ["/promoted/streams"]
     assert streams[0]["user_login"] == "gronkh"
     assert streams[0]["viewer_count"] == 1234
+
+
+def test_get_json_uses_configured_account_session(monkeypatch):
+    calls = []
+
+    class FakeSession:
+        def request_json(self, path, method="GET", payload=None):
+            calls.append((path, method, payload))
+            return {"data": [{"id": "video"}]}
+
+    monkeypatch.setattr(gronkhtv_api, "_account_session", FakeSession())
+
+    result = gronkhtv_api.get_json(
+        "/videos/search",
+        method="POST",
+        payload={"query": "demo"},
+    )
+
+    assert result == {"data": [{"id": "video"}]}
+    assert calls == [("/videos/search", "POST", {"query": "demo"})]
+
+
+def test_get_json_falls_back_to_public_request_for_expired_account_session(monkeypatch):
+    calls = []
+
+    class ExpiredSession:
+        def request_json(self, path, method="GET", payload=None):
+            calls.append((path, method, payload))
+            raise AuthenticationError("expired")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return b'{"data": [{"id": "public-video"}]}'
+
+    monkeypatch.setattr(gronkhtv_api, "_account_session", ExpiredSession())
+    monkeypatch.setattr(
+        gronkhtv_api, "urlopen", lambda request, timeout: FakeResponse()
+    )
+
+    result = gronkhtv_api.get_json("/videos/discovery/newest")
+
+    assert result == {"data": [{"id": "public-video"}]}
+    assert calls == [("/videos/discovery/newest", "GET", None)]

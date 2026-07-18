@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<settings>
+    <category label="30200">
+        <setting id="account_email" type="text" label="30201" default=""/>
+        <setting id="account_status" type="text" label="30202" default="" enable="false"/>
+        <setting id="account_login" type="action" label="30203" action="RunPlugin(plugin://$ID/?action=account_login)" option="close"/>
+        <setting id="account_logout" type="action" label="30205" action="RunPlugin(plugin://$ID/?action=account_logout)" option="close"/>
+    </category>
+    <category label="30206">
+        <setting id="use_account_playlists" type="bool" label="30207" default="true"/>
+        <setting id="twitch_settings" type="action" label="30208" action="RunPlugin(plugin://$ID/?action=open_twitch_settings)" option="close"/>
+    </category>
+</settings>
