@@ -146,10 +146,17 @@ def validate_archive_members(files: List[Tuple[str, Path]]) -> None:
         if top_level not in ALLOWED_ROOTS:
             raise ValueError(f"Disallowed root entry: {top_level} in {arc_path}")
 
+        # Exact root file validation - addon.xml and addon.py must be exact root files
+        if top_level in {"addon.xml", "addon.py"}:
+            if len(parts) != 1:
+                raise ValueError(f"Invalid archive member (exact root file required): {arc_path}")
+
         # If under resources, must be under resources/
         if top_level == "resources":
             if not is_allowed_under_resources(Path(rel)):
                 raise ValueError(f"Invalid resources path: {rel}")
+            if ".." in rel.split("/"):
+                raise ValueError(f"Traversal path component in {arc_path}")
 
         # Source must exist and be a regular file
         if not src_path.exists():
@@ -203,6 +210,7 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
     - Require both root files (addon.xml, addon.py) + at least one resources file
     - Parse embedded addon.xml and verify id=plugin.video.gronkhtv and version=source_version
     """
+    import stat
     with zipfile.ZipFile(output_path, "r") as zf:
         members = sorted(zf.namelist())
 
@@ -240,9 +248,16 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
         FORBIDDEN_SUFFIXES = {".pyc"}
 
         for m in members:
+            info = zf.getinfo(m)
+
             # Reject directory entries (trailing slash)
             if m.endswith("/"):
                 raise ValueError(f"Directory entry not allowed in archive: {m}")
+
+            # Reject symlink entries via external_attr (Unix S_IFLNK)
+            mode = info.external_attr >> 16
+            if stat.S_IFMT(mode) == stat.S_IFLNK:
+                raise ValueError(f"Symlink entry not allowed in archive: {m}")
 
             rel = m[len(root) + 1 :] if m.startswith(root + "/") else m
 
@@ -250,7 +265,7 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
             if rel.startswith("/") or (os.name == "nt" and len(rel) >= 3 and rel[1:3] == ":/"):
                 raise ValueError(f"Absolute path in archive: {m}")
 
-            # Reject traversal
+            # Reject traversal (including synthetic paths like resources/../evil)
             if ".." in rel.split("/"):
                 raise ValueError(f"Traversal path in archive: {m}")
 
@@ -275,11 +290,15 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
                 raise ValueError(f"Normalized path collision in archive: {m}")
             seen_normalized.add(norm)
 
-            # Validate allowed structure
+            # Validate allowed structure - EXACT root file matching
             parts = rel.split("/")
             if parts[0] == "addon.xml":
+                if len(parts) != 1:
+                    raise ValueError(f"Invalid archive member (addon.xml must be exact root file): {m}")
                 has_addon_xml = True
             elif parts[0] == "addon.py":
+                if len(parts) != 1:
+                    raise ValueError(f"Invalid archive member (addon.py must be exact root file): {m}")
                 has_addon_py = True
             elif parts[0] == "resources" and len(parts) > 1:
                 has_resources_file = True

@@ -70,7 +70,7 @@ jobs:
       - name: Check tag points to current commit (retry safety)
         if: steps.version.outputs.tag_exists == 'true' && steps.version.outputs.asset_exists == 'false'
         run: |
-          tag_sha=$(git rev-parse "v${{ steps.version.outputs.version }}")
+          tag_sha=$(git rev-parse "v${{ steps.version.outputs.version }}^{}")
           if [ "$tag_sha" != "${{ github.sha }}" ]; then
             echo "Tag v${{ steps.version.outputs.version }} points to $tag_sha but current commit is ${{ github.sha }}"
             echo "Refusing to attach asset built from different commit to existing immutable tag"
