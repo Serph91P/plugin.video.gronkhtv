@@ -1,3 +1,3 @@
-from .twitch import twitch_plugin_url
+from .twitch import twitch_plugin_entries, twitch_plugin_url
 
-__all__ = ["twitch_plugin_url"]
+__all__ = ["twitch_plugin_entries", "twitch_plugin_url"]

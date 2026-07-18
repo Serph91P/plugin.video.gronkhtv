@@ -15,3 +15,14 @@ def twitch_plugin_url(stream):
     if channel_name:
         parameters["channel_name"] = channel_name
     return f"plugin://{TWITCH_ADDON_ID}/?{urlencode(parameters)}"
+
+
+def twitch_plugin_entries(streams):
+    entries = []
+    for stream in streams:
+        try:
+            url = twitch_plugin_url(stream)
+        except ValueError:
+            continue
+        entries.append((stream, url))
+    return entries

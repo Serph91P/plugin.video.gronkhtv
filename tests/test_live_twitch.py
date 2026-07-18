@@ -7,7 +7,7 @@ LIB = ROOT / "resources" / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
-from live.twitch import twitch_plugin_url  # noqa: E402
+from live.twitch import twitch_plugin_entries, twitch_plugin_url  # noqa: E402
 
 
 def test_twitch_plugin_url_hands_live_channel_to_twitch_addon():
@@ -44,3 +44,17 @@ def test_twitch_plugin_url_rejects_missing_channel():
         assert "Twitch" in str(exc)
     else:
         raise AssertionError("Expected missing Twitch channel to fail")
+
+
+def test_twitch_plugin_entries_skips_incomplete_streams():
+    valid = {
+        "user_id": "12875057",
+        "user_login": "gronkh",
+    }
+
+    assert twitch_plugin_entries([{}, valid]) == [
+        (
+            valid,
+            "plugin://plugin.video.twitch/?mode=play&channel_id=12875057&channel_name=gronkh",
+        )
+    ]

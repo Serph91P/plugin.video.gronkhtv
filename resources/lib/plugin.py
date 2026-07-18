@@ -23,7 +23,7 @@ from gronkhtv_api import (
     search_videos,
     video_by_episode,
 )
-from live import twitch_plugin_url
+from live import twitch_plugin_entries, twitch_plugin_url
 from playback import configure_authenticated_hls
 
 # Plugin constants
@@ -382,7 +382,15 @@ def list_live_streams():
         )
         streams = []
 
-    if not streams:
+    stream_entries = twitch_plugin_entries(streams)
+    skipped_streams = len(streams) - len(stream_entries)
+    if skipped_streams:
+        xbmc.log(
+            f"[Gronkh.tv] Skipped {skipped_streams} live streams without a Twitch channel",
+            xbmc.LOGWARNING,
+        )
+
+    if not stream_entries:
         list_item = xbmcgui.ListItem(label="Aktuell keine Live-Streams")
         tag = list_item.getVideoInfoTag()
         tag.setTitle("Aktuell keine Live-Streams")
@@ -390,7 +398,7 @@ def list_live_streams():
         tag.setMediaType("video")
         xbmcplugin.addDirectoryItem(_HANDLE, "", list_item, False)
     else:
-        for stream in streams:
+        for stream, url in stream_entries:
             user_name = stream.get("user_name") or stream.get("user_login") or "Twitch"
             title = stream.get("title") or user_name
             game_name = stream.get("game_name") or "Unbekannt"
@@ -430,7 +438,6 @@ def list_live_streams():
             tag.setMediaType("video")
             list_item.setProperty("IsPlayable", "true")
 
-            url = twitch_plugin_url(stream)
             xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, False)
 
     xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
@@ -1104,6 +1111,8 @@ def handle_account_login(params=None):
                 type=xbmcgui.INPUT_ALPHANUM,
             ).strip()
             if not code:
+                _account_session.clear()
+                configure_account_session(None)
                 dialog.notification(
                     _plugin,
                     _addon.getLocalizedString(30215),
@@ -1134,6 +1143,9 @@ def handle_account_login(params=None):
         )
         xbmc.executebuiltin("Container.Refresh")
     except (AuthenticationError, SessionError, ValueError) as exc:
+        _account_session.clear()
+        configure_account_session(None)
+        _set_account_status(_addon.getLocalizedString(30209))
         xbmc.log(f"[Gronkh.tv] Account login failed: {exc}", xbmc.LOGWARNING)
         dialog.notification(
             _plugin,

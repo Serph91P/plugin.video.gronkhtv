@@ -41,7 +41,7 @@ def test_plugin_routes_account_actions_and_uses_separate_feature_packages():
     assert '"account_logout": handle_account_logout' in source
     assert '"account_status": handle_account_status' in source
     assert "from account import" in source
-    assert "from live import twitch_plugin_url" in source
+    assert "from live import" in source
     assert "from playback import" in source
     assert "configure_authenticated_hls(list_item, headers" in source
     assert 'setProperty("inputstream.adaptive.stream_headers"' not in source
@@ -65,3 +65,38 @@ def test_all_direct_player_calls_use_authenticated_list_item_helper():
                 direct_play_functions.append(function.name)
 
     assert direct_play_functions == ["_play_direct"]
+
+
+def test_account_login_discards_challenge_session_on_cancel_and_error():
+    source = (ROOT / "resources" / "lib" / "plugin.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "handle_account_login"
+    )
+
+    cancelled_two_factor = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and isinstance(node.test.operand, ast.Name)
+        and node.test.operand.id == "code"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "clear"
+        for node in ast.walk(cancelled_two_factor)
+    )
+
+    login_error = next(node for node in function.body if isinstance(node, ast.Try))
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "clear"
+        for handler in login_error.handlers
+        for node in ast.walk(handler)
+    )
