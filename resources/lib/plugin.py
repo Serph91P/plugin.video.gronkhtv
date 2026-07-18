@@ -13,6 +13,13 @@ import os
 import inputstreamhelper
 
 from account import AuthenticationError, GronkhTVSession, SessionError
+from context_menu import (
+    chapter_label,
+    details_label,
+    favorite_label,
+    restart_label,
+    resume_label,
+)
 from gronkhtv_api import (
     category_videos,
     configure_account_session,
@@ -559,15 +566,16 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         games_in_stream = []
 
         for c in chapters:
-            title = str(c.get("title"))
+            title = c.get("title") or "Unbenanntes Kapitel"
             chapter_offset = int(c.get("offset"))
+            position = seconds_to_time(chapter_offset)
             cm.append(
                 (
-                    f">> [{seconds_to_time(chapter_offset)}]: {title}",
+                    chapter_label(position, title),
                     f"RunPlugin(plugin://plugin.video.gronkhtv/?action=jump_to_chapter&episode={ep}&offset={chapter_offset})",
                 )
             )
-            chapters_content.append(f"[{seconds_to_time(chapter_offset)}]: {title}")
+            chapters_content.append(f"[{position}]: {title}")
             # Spiele sammeln
             game = c.get("game")
             if game and game.get("title") and game.get("title") not in games_in_stream:
@@ -579,14 +587,14 @@ def list_videos(category, offset=0, search_str="", game_id=None):
             cm.insert(
                 0,
                 (
-                    f"[>] Fortsetzen bei {seconds_to_time(int(resume_point))}",
+                    resume_label(seconds_to_time(int(resume_point))),
                     f"RunPlugin(plugin://plugin.video.gronkhtv/?action=play_resume&episode={ep})",
                 ),
             )
             cm.insert(
                 1,
                 (
-                    "[|<] Von Anfang starten",
+                    restart_label(),
                     f"RunPlugin(plugin://plugin.video.gronkhtv/?action=play_from_start&episode={ep})",
                 ),
             )
@@ -595,7 +603,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         if is_favorite(ep):
             cm.append(
                 (
-                    "[X] Aus Favoriten entfernen",
+                    favorite_label(True),
                     f"RunPlugin(plugin://plugin.video.gronkhtv/?action=remove_favorite&episode={ep})",
                 )
             )
@@ -616,7 +624,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
             )
             cm.append(
                 (
-                    "[+] Zu Favoriten hinzufuegen",
+                    favorite_label(False),
                     f"RunPlugin(plugin://plugin.video.gronkhtv/?action=add_favorite&episode={ep}&video_data={video_json})",
                 )
             )
@@ -624,7 +632,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         # Video-Details anzeigen
         cm.append(
             (
-                "[i] Stream-Details anzeigen",
+                details_label(),
                 f"RunPlugin(plugin://plugin.video.gronkhtv/?action=show_details&episode={ep})",
             )
         )
