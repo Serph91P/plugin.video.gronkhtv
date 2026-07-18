@@ -169,3 +169,63 @@ def test_verify_zip_rejects_synthetic_traversal(tmp_path, traversal_path):
     with pytest.raises(ValueError) as exc:
         verify_zip(output)
     assert "traversal" in str(exc.value).lower() or ".." in str(exc.value).lower() or "invalid" in str(exc.value).lower()
+
+
+@pytest.mark.parametrize(
+    "mode,source_version,expected_version,should_pass",
+    [
+        ("build", "1.0.0", "2.0.0", False),   # mismatch on build
+        ("verify", "1.0.0", "2.0.0", False),  # mismatch on verify
+        ("build", "1.0.0", "1.0.0", True),    # match on build
+        ("verify", "1.0.0", "1.0.0", True),   # match on verify
+    ],
+)
+def test_cli_expected_version(tmp_path, mode, source_version, expected_version, should_pass):
+    """CLI --expected-version must enforce version match on build and verify."""
+    script = ROOT / "scripts" / "build_release.py"
+    output = tmp_path / "out.zip"
+
+    if mode == "build":
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "addon.xml").write_text(f'<addon id="plugin.video.gronkhtv" version="{source_version}"/>')
+        (source / "addon.py").write_text("pass")
+        (source / "resources").mkdir()
+        (source / "resources" / "test.txt").write_text("test")
+        cmd = ["python3", str(script), "--source", str(source), "--output", str(output), "--expected-version", expected_version]
+    else:
+        import zipfile
+        with zipfile.ZipFile(output, "w") as zf:
+            zf.writestr("plugin.video.gronkhtv/addon.xml", f'<addon id="plugin.video.gronkhtv" version="{source_version}"/>')
+            zf.writestr("plugin.video.gronkhtv/addon.py", "pass")
+            zf.writestr("plugin.video.gronkhtv/resources/test.txt", "test")
+        cmd = ["python3", str(script), "--verify-only", "--output", str(output), "--expected-version", expected_version]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    if should_pass:
+        assert result.returncode == 0, f"Expected pass but got: {result.stderr}"
+    else:
+        assert result.returncode != 0
+        assert "version" in (result.stderr + result.stdout).lower() or "mismatch" in (result.stderr + result.stdout).lower()
+
+
+def test_workflow_passes_expected_version_to_build_and_verify():
+    """Workflow must pass --expected-version to both build and verify steps."""
+    import yaml
+    workflow_path = ROOT / ".github" / "workflows" / "make-release.yml"
+    with open(workflow_path) as f:
+        workflow = yaml.safe_load(f)
+
+    steps = workflow["jobs"]["release"]["steps"]
+
+    # Find Create Zip step
+    create_zip_step = next(s for s in steps if s.get("name") == "Create Zip")
+    create_zip_run = create_zip_step["run"]
+    assert "--expected-version" in create_zip_run
+    assert "${{ steps.version.outputs.version }}" in create_zip_run
+
+    # Find Verify Zip step
+    verify_zip_step = next(s for s in steps if s.get("name") == "Verify Zip")
+    verify_zip_run = verify_zip_step["run"]
+    assert "--expected-version" in verify_zip_run
+    assert "${{ steps.version.outputs.version }}" in verify_zip_run

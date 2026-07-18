@@ -59,13 +59,13 @@ jobs:
         id: create-zip
         run: |
           filename=${{ steps.version.outputs.filename }}
-          python scripts/build_release.py --source . --output "${GITHUB_WORKSPACE}/${filename}"
+          python scripts/build_release.py --source . --output "${GITHUB_WORKSPACE}/${filename}" --expected-version "${{ steps.version.outputs.version }}"
           echo "filename=$filename" >> $GITHUB_OUTPUT
 
       - name: Verify Zip
         if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         run: |
-          python scripts/build_release.py --verify-only --output "${GITHUB_WORKSPACE}/${{ steps.create-zip.outputs.filename }}"
+          python scripts/build_release.py --verify-only --output "${GITHUB_WORKSPACE}/${{ steps.create-zip.outputs.filename }}" --expected-version "${{ steps.version.outputs.version }}"
 
       - name: Check tag points to current commit (retry safety)
         if: steps.version.outputs.tag_exists == 'true' && steps.version.outputs.asset_exists == 'false'

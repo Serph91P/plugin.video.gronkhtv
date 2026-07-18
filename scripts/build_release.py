@@ -349,10 +349,11 @@ def main() -> int:
     parser.add_argument("--source", type=Path, default=Path.cwd(), help="Source directory")
     parser.add_argument("--output", type=Path, required=True, help="Output ZIP path")
     parser.add_argument("--verify-only", action="store_true", help="Only verify existing archive")
+    parser.add_argument("--expected-version", type=str, help="Expected addon version (for validation)")
     args = parser.parse_args()
 
     if args.verify_only:
-        members = verify_zip(args.output)
+        members = verify_zip(args.output, source_version=args.expected_version)
         print(f"Verified {len(members)} members in {args.output}")
         for m in members:
             print(f"  {m}")
@@ -372,6 +373,10 @@ def main() -> int:
 
     # Parse addon.xml from source for version verification
     addon_id, version = parse_addon_xml(source / "addon.xml")
+
+    # Check expected version if provided
+    if args.expected_version and version != args.expected_version:
+        raise ValueError(f"Version mismatch: source={version}, expected={args.expected_version}")
 
     # Verify with version check
     members = verify_zip(output, source_version=version)
