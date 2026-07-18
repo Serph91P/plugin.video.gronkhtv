@@ -25,6 +25,11 @@ def test_repository_notification_follows_successful_main_release():
     assert "      - 'addon.py'" in make_release
     assert "      - 'resources/**'" in make_release
     assert "permissions:\n  contents: write" in make_release
+    assert "Set up Python" in make_release
+    assert "python-version: '3.11'" in make_release
+    assert "scripts/build_release.py" in make_release
+    assert "rsync" not in make_release
+    assert "zip -r" not in make_release
 
     assert "workflow_run:" in notify_repository
     assert 'workflows: ["Make Release"]' in notify_repository
@@ -83,6 +88,7 @@ def test_release_retries_when_exact_version_asset_is_missing():
     assert 'echo "asset_exists=false" >> $GITHUB_OUTPUT' in version
     assert retry_condition in changelog
     assert retry_condition in create_zip
+    assert "scripts/build_release.py" in create_zip
     assert "filename=${{ steps.version.outputs.filename }}" in create_zip
     assert retry_condition in create_release
     assert "files: ${{ steps.version.outputs.filename }}" in create_release

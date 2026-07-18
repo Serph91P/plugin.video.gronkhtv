@@ -25,7 +25,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libxml2-utils xmlstarlet zip
+          sudo apt-get install libxml2-utils xmlstarlet
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Get version and check tag
         id: version
@@ -71,19 +76,8 @@ jobs:
         if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         id: create-zip
         run: |
-          addon_id=${{ github.event.repository.name }}
           filename=${{ steps.version.outputs.filename }}
-
-          mkdir -p /tmp/build/${addon_id}
-          rsync -av --exclude='.git*' \
-                    --exclude='__pycache__' \
-                    --exclude='*.pyc' \
-                    --exclude='logs' \
-                    --exclude='.github' \
-                    ./ /tmp/build/${addon_id}/
-
-          cd /tmp/build
-          zip -r ${GITHUB_WORKSPACE}/${filename} ${addon_id}
+          python scripts/build_release.py --source . --output ${GITHUB_WORKSPACE}/${filename}
           echo "filename=$filename" >> $GITHUB_OUTPUT
 
       - name: Create Release
