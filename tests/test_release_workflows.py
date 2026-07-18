@@ -25,6 +25,11 @@ def test_repository_notification_follows_successful_main_release():
     assert "      - 'addon.py'" in make_release
     assert "      - 'resources/**'" in make_release
     assert "permissions:\n  contents: write" in make_release
+    assert "Set up Python" in make_release
+    assert "python-version: '3.11'" in make_release
+    assert "scripts/build_release.py" in make_release
+    assert "rsync" not in make_release
+    assert "zip -r" not in make_release
 
     assert "workflow_run:" in notify_repository
     assert 'workflows: ["Make Release"]' in notify_repository
@@ -83,9 +88,10 @@ def test_release_retries_when_exact_version_asset_is_missing():
     assert 'echo "asset_exists=false" >> $GITHUB_OUTPUT' in version
     assert retry_condition in changelog
     assert retry_condition in create_zip
+    assert "scripts/build_release.py" in create_zip
     assert "filename=${{ steps.version.outputs.filename }}" in create_zip
     assert retry_condition in create_release
-    assert "files: ${{ steps.version.outputs.filename }}" in create_release
+    assert 'files: "${{ steps.create-zip.outputs.filename }}"' in create_release
     assert "fail_on_unmatched_files: true" in create_release
 
 
@@ -102,4 +108,45 @@ def test_release_finishes_with_exact_asset_verification():
     )
     assert "--jq '.assets[].name'" in verify
     assert 'grep -Fxq -- "${{ steps.version.outputs.filename }}"' in verify
+    assert "steps.create-zip.outputs.filename" not in verify
     assert make_release.rstrip().endswith(verify.rstrip())
+
+
+def test_release_builds_zip_before_tag_creation():
+    """Verify workflow order: Create Zip -> Verify Zip -> Check tag -> Create tag -> Create Release -> Verify asset."""
+    make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
+
+    # Find step indices
+    create_zip_idx = make_release.index("      - name: Create Zip\n")
+    verify_zip_idx = make_release.index("      - name: Verify Zip\n")
+    check_tag_idx = make_release.index("      - name: Check tag points to current commit (retry safety)\n")
+    create_tag_idx = make_release.index("      - name: Create and push tag\n")
+    create_release_idx = make_release.index("      - name: Create Release\n")
+    verify_asset_idx = make_release.index("      - name: Verify release asset\n")
+
+    # Order: Create Zip -> Verify Zip -> Check tag -> Create tag -> Create Release -> Verify asset
+    assert create_zip_idx < verify_zip_idx, "Create Zip must come before Verify Zip"
+    assert verify_zip_idx < check_tag_idx, "Verify Zip must come before Check tag"
+    assert check_tag_idx < create_tag_idx, "Check tag must come before Create tag"
+    assert create_tag_idx < create_release_idx, "Create tag must come before Create Release"
+    assert create_release_idx < verify_asset_idx, "Create Release must come before Verify asset"
+
+
+def test_release_has_exact_head_check_for_retry():
+    """On retry with existing tag but missing asset, fail unless tag points to current commit."""
+    make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
+
+    # Check for the exact-head check step
+    assert "Check tag points to current commit (retry safety)" in make_release
+    assert "tag_sha=$(git rev-parse" in make_release
+    assert 'if [ "$tag_sha" != "${{ github.sha }}" ]; then' in make_release
+    assert "Refusing to attach asset built from different commit" in make_release
+    assert "exit 1" in make_release
+
+
+def test_release_quotes_output_path():
+    """Output path in Create Zip must be quoted: \"${GITHUB_WORKSPACE}/${filename}\"."""
+    make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
+
+    create_zip_step = workflow_step(make_release, "Create Zip")
+    assert '"${GITHUB_WORKSPACE}/${filename}"' in create_zip_step
