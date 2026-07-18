@@ -108,6 +108,6 @@ jobs:
 
       - name: Verify release asset
         run: |
-          gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.version.outputs.version }}" --jq '.assets[].name' | grep -Fxq -- "${{ steps.create-zip.outputs.filename }}"
+          gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.version.outputs.version }}" --jq '.assets[].name' | grep -Fxq -- "${{ steps.version.outputs.filename }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

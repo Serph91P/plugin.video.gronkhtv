@@ -107,7 +107,8 @@ def test_release_finishes_with_exact_asset_verification():
         'v${{ steps.version.outputs.version }}"' in verify
     )
     assert "--jq '.assets[].name'" in verify
-    assert 'grep -Fxq -- "${{ steps.create-zip.outputs.filename }}"' in verify
+    assert 'grep -Fxq -- "${{ steps.version.outputs.filename }}"' in verify
+    assert "steps.create-zip.outputs.filename" not in verify
     assert make_release.rstrip().endswith(verify.rstrip())
 
 
