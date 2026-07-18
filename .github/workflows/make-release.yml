@@ -54,6 +54,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Create Zip
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
+        id: create-zip
+        run: |
+          filename=${{ steps.version.outputs.filename }}
+          python scripts/build_release.py --source . --output "${GITHUB_WORKSPACE}/${filename}"
+          echo "filename=$filename" >> $GITHUB_OUTPUT
+
+      - name: Verify Zip
+        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
+        run: |
+          python scripts/build_release.py --verify-only --output "${GITHUB_WORKSPACE}/${{ steps.create-zip.outputs.filename }}"
+
+      - name: Check tag points to current commit (retry safety)
+        if: steps.version.outputs.tag_exists == 'true' && steps.version.outputs.asset_exists == 'false'
+        run: |
+          tag_sha=$(git rev-parse "v${{ steps.version.outputs.version }}")
+          if [ "$tag_sha" != "${{ github.sha }}" ]; then
+            echo "Tag v${{ steps.version.outputs.version }} points to $tag_sha but current commit is ${{ github.sha }}"
+            echo "Refusing to attach asset built from different commit to existing immutable tag"
+            exit 1
+          fi
+
       - name: Create and push tag
         if: steps.version.outputs.tag_exists == 'false'
         run: |
@@ -72,20 +95,12 @@ jobs:
           echo "$changes" >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
 
-      - name: Create Zip
-        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
-        id: create-zip
-        run: |
-          filename=${{ steps.version.outputs.filename }}
-          python scripts/build_release.py --source . --output ${GITHUB_WORKSPACE}/${filename}
-          echo "filename=$filename" >> $GITHUB_OUTPUT
-
       - name: Create Release
         if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          files: ${{ steps.version.outputs.filename }}
+          files: "${{ steps.create-zip.outputs.filename }}"
           body: ${{ steps.changelog.outputs.changes }}
           fail_on_unmatched_files: true
         env:
@@ -93,6 +108,6 @@ jobs:
 
       - name: Verify release asset
         run: |
-          gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.version.outputs.version }}" --jq '.assets[].name' | grep -Fxq -- "${{ steps.version.outputs.filename }}"
+          gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.version.outputs.version }}" --jq '.assets[].name' | grep -Fxq -- "${{ steps.create-zip.outputs.filename }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -19,6 +19,7 @@ import sys
 import zipfile
 from pathlib import Path
 from typing import List, Set, Tuple
+import unicodedata
 
 
 ALLOWED_ROOTS = {"addon.xml", "addon.py", "resources"}
@@ -38,6 +39,11 @@ EXCLUDED_NAMES = {
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".pyd"}
 EXCLUDED_PREFIXES = {".", "__pycache__"}
+
+
+def normalize_path_key(path: str) -> str:
+    """Normalize path for collision detection: NFC + casefold."""
+    return unicodedata.normalize("NFC", path).casefold()
 
 
 def is_excluded(name: str) -> bool:
@@ -79,17 +85,29 @@ def collect_runtime_files(root: Path) -> List[Tuple[str, Path]]:
             continue
 
         if item.name in {"addon.xml", "addon.py"}:
-            if item.is_file() and not item.is_symlink():
+            if item.is_symlink():
+                raise ValueError(f"Symlinked {item.name} not allowed: {item}")
+            if item.is_file():
                 files.append((f"plugin.video.gronkhtv/{item.name}", item))
-        elif item.name == "resources" and item.is_dir():
+            else:
+                raise ValueError(f"{item.name} must be a regular file: {item}")
+        elif item.name == "resources":
+            if item.is_symlink():
+                raise ValueError(f"Symlinked resources directory not allowed: {item}")
+            if not item.is_dir():
+                raise ValueError(f"resources must be a directory: {item}")
             for res_file in sorted(item.rglob("*")):
                 if res_file.is_symlink():
-                    continue
+                    raise ValueError(f"Symlinked path under resources not allowed: {res_file}")
                 if is_excluded(res_file.name):
                     continue
                 if res_file.is_file():
                     rel = res_file.relative_to(root)
                     files.append((f"plugin.video.gronkhtv/{rel.as_posix()}", res_file))
+                elif res_file.is_dir():
+                    continue
+                else:
+                    raise ValueError(f"Invalid file type under resources: {res_file}")
 
     files.sort(key=lambda x: x[0])
     return files
@@ -118,10 +136,10 @@ def validate_archive_members(files: List[Tuple[str, Path]]) -> None:
             if part.startswith("."):
                 raise ValueError(f"Dot path component in {arc_path}: {part}")
 
-        # No case collisions (case-insensitive check)
-        norm = rel.lower()
+        # No normalized path collisions (NFC + casefold)
+        norm = normalize_path_key(rel)
         if norm in seen_normalized:
-            raise ValueError(f"Case-insensitive collision: {arc_path}")
+            raise ValueError(f"Normalized path collision: {arc_path}")
         seen_normalized.add(norm)
 
         # Must be allowed root type
@@ -173,28 +191,124 @@ def build_deterministic_zip(files: List[Tuple[str, Path]], output_path: Path) ->
                 zf.writestr(info, f.read())
 
 
-def verify_zip(output_path: Path) -> List[str]:
-    """Verify ZIP contents and return member list."""
+def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
+    """Verify ZIP contents and return member list.
+
+    Enforces exact archive contract:
+    - Every regular member under single root plugin.video.gronkhtv/
+    - Only allowed members: addon.xml, addon.py, or resources/**/*
+    - Reject: directory/symlink entries, traversal, absolute paths,
+      case/normalized collisions, repo-only paths, tests/workflows/.hermes,
+      .pyc, __pycache__, README, LICENSE
+    - Require both root files (addon.xml, addon.py) + at least one resources file
+    - Parse embedded addon.xml and verify id=plugin.video.gronkhtv and version=source_version
+    """
     with zipfile.ZipFile(output_path, "r") as zf:
         members = sorted(zf.namelist())
 
-        # Verify all members under single root
+        # Verify all members under single root (ignore absolute paths that create empty root)
         roots = {m.split("/")[0] for m in members if "/" in m}
+        # Filter out empty root from absolute paths
+        roots = {r for r in roots if r}
         if len(roots) != 1:
             raise ValueError(f"Multiple roots: {roots}")
         root = roots.pop()
         if root != "plugin.video.gronkhtv":
             raise ValueError(f"Root must be plugin.video.gronkhtv, got {root}")
 
-        # Verify no forbidden entries
+        # Track required files
+        has_addon_xml = False
+        has_addon_py = False
+        has_resources_file = False
+
+        # For collision detection
+        seen_normalized: Set[str] = set()
+
+        # Forbidden path patterns (exact match or prefix)
+        FORBIDDEN_PREFIXES = (
+            "tests/",
+            ".github/",
+            "workflows/",
+            ".hermes/",
+            "__pycache__/",
+        )
+        FORBIDDEN_EXACT = {
+            "README.md", "README.rst", "README",
+            "LICENSE", "LICENSE.txt", "LICENSE.md",
+            "module.pyc",
+        }
+        FORBIDDEN_SUFFIXES = {".pyc"}
+
         for m in members:
+            # Reject directory entries (trailing slash)
             if m.endswith("/"):
-                continue  # directory entry
+                raise ValueError(f"Directory entry not allowed in archive: {m}")
+
             rel = m[len(root) + 1 :] if m.startswith(root + "/") else m
-            if rel.startswith(".") or "/." in rel:
-                raise ValueError(f"Dot path in archive: {m}")
-            if any(part.lower() in {"readme.md", "license", "license.txt", "license.md"} for part in rel.split("/")):
+
+            # Reject absolute paths
+            if rel.startswith("/") or (os.name == "nt" and len(rel) >= 3 and rel[1:3] == ":/"):
+                raise ValueError(f"Absolute path in archive: {m}")
+
+            # Reject traversal
+            if ".." in rel.split("/"):
+                raise ValueError(f"Traversal path in archive: {m}")
+
+            # Check forbidden patterns BEFORE dot component check
+            # (so .github/ is caught as forbidden repo-only path, not as dot component)
+            for prefix in FORBIDDEN_PREFIXES:
+                if rel.startswith(prefix):
+                    raise ValueError(f"Forbidden repo-only path in archive: {m}")
+            if rel in FORBIDDEN_EXACT:
                 raise ValueError(f"Forbidden file in archive: {m}")
+            for suffix in FORBIDDEN_SUFFIXES:
+                if rel.endswith(suffix):
+                    raise ValueError(f"Forbidden bytecode file in archive: {m}")
+
+            # Reject dot components (for any remaining cases)
+            if rel.startswith(".") or "/." in rel:
+                raise ValueError(f"Dot path component in archive: {m}")
+
+            # Normalize for collision detection (NFC + casefold)
+            norm = normalize_path_key(rel)
+            if norm in seen_normalized:
+                raise ValueError(f"Normalized path collision in archive: {m}")
+            seen_normalized.add(norm)
+
+            # Validate allowed structure
+            parts = rel.split("/")
+            if parts[0] == "addon.xml":
+                has_addon_xml = True
+            elif parts[0] == "addon.py":
+                has_addon_py = True
+            elif parts[0] == "resources" and len(parts) > 1:
+                has_resources_file = True
+            else:
+                raise ValueError(f"Invalid archive member (not under allowed paths): {m}")
+
+        # Require both root files
+        if not has_addon_xml:
+            raise ValueError("Missing required addon.xml at root")
+        if not has_addon_py:
+            raise ValueError("Missing required addon.py at root")
+
+        # Require at least one resources file
+        if not has_resources_file:
+            raise ValueError("Missing required files under resources/")
+
+        # Parse and verify embedded addon.xml
+        with zf.open(f"{root}/addon.xml") as f:
+            addon_content = f.read().decode("utf-8")
+        import xml.etree.ElementTree as ET
+        addon_root = ET.fromstring(addon_content)
+        addon_id = addon_root.get("id")
+        addon_version = addon_root.get("version")
+
+        if addon_id != "plugin.video.gronkhtv":
+            raise ValueError(f"Invalid addon id in embedded addon.xml: {addon_id}")
+
+        if source_version and addon_version != source_version:
+            raise ValueError(f"Version mismatch: embedded={addon_version}, source={source_version}")
 
         return members
 
@@ -237,11 +351,12 @@ def main() -> int:
     # Build deterministic ZIP
     build_deterministic_zip(files, output)
 
-    # Verify
-    members = verify_zip(output)
-
-    # Parse addon.xml from source and verify version/id
+    # Parse addon.xml from source for version verification
     addon_id, version = parse_addon_xml(source / "addon.xml")
+
+    # Verify with version check
+    members = verify_zip(output, source_version=version)
+
     print(f"Built {output}")
     print(f"Addon ID: {addon_id}, Version: {version}")
     print(f"Members: {len(members)}")
