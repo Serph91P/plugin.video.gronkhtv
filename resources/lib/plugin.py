@@ -10,9 +10,12 @@ from functools import lru_cache
 import time
 import xbmcvfs
 import os
+import inputstreamhelper
 
+from account import AuthenticationError, GronkhTVSession, SessionError
 from gronkhtv_api import (
     category_videos,
+    configure_account_session,
     discovery,
     live_streams,
     playlist_url_for_episode,
@@ -20,6 +23,8 @@ from gronkhtv_api import (
     search_videos,
     video_by_episode,
 )
+from live import twitch_plugin_url
+from playback import configure_authenticated_hls
 
 # Plugin constants
 _URL = sys.argv[0]
@@ -40,7 +45,8 @@ _CATEGORIES = [
     "Nach Spielen",  # Neu: Spiele-Filter
     "Live-Streams",
     "Favoriten",
-]  # Neu: Favoriten
+    _addon.getLocalizedString(30200),  # Konto
+]
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _SEARCH_PAGE_SIZE = 20
@@ -51,6 +57,11 @@ _ADDON_DATA = xbmcvfs.translatePath(
 )
 _RESUME_DIR = os.path.join(_ADDON_DATA, "resume_points")
 _FAVORITES_FILE = os.path.join(_ADDON_DATA, "favorites.json")
+_ACCOUNT_COOKIE_FILE = os.path.join(_ADDON_DATA, "account", "cookies.txt")
+_account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
+configure_account_session(
+    _account_session if os.path.exists(_ACCOUNT_COOKIE_FILE) else None
+)
 
 chapter_cache = {}
 video_info_cache = {}
@@ -191,6 +202,57 @@ def get_playlist_url(episode):
     return playlist_url_for_episode(episode)
 
 
+def _configure_authenticated_playback(list_item, playlist_url):
+    if not _setting_enabled("use_account_playlists", True):
+        return False
+    if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        return False
+
+    helper = inputstreamhelper.Helper("hls")
+    if not helper.check_inputstream():
+        xbmc.log(
+            "[Gronkh.tv] InputStream Adaptive is unavailable",
+            xbmc.LOGWARNING,
+        )
+        return False
+
+    headers = _account_session.request_headers(playlist_url)
+    configure_authenticated_hls(list_item, headers, helper.inputstream_addon)
+    return True
+
+
+def _play_direct(playlist_url, player=None):
+    player = player or xbmc.Player()
+    list_item = xbmcgui.ListItem(path=playlist_url)
+    list_item.setProperty("IsPlayable", "true")
+    _configure_authenticated_playback(list_item, playlist_url)
+    player.play(playlist_url, list_item)
+    return player
+
+
+def _setting_enabled(setting_id, default=False):
+    value = _addon.getSetting(setting_id)
+    if value == "":
+        return default
+    return value.lower() == "true"
+
+
+def _account_name(user):
+    if not isinstance(user, dict):
+        return ""
+    return (
+        user.get("displayname")
+        or user.get("login")
+        or user.get("usertag")
+        or user.get("email")
+        or ""
+    )
+
+
+def _set_account_status(status):
+    _addon.setSetting("account_status", status)
+
+
 def _page_from_offset(offset):
     try:
         offset = int(offset)
@@ -244,6 +306,7 @@ def list_categories():
         4: "DefaultAddonGame.png",  # Spiele
         5: "DefaultLiveTV.png",
         6: "DefaultFavourites.png",  # Favoriten
+        7: "DefaultUser.png",  # Konto
     }
 
     for i, category in enumerate(categories):
@@ -333,7 +396,6 @@ def list_live_streams():
             game_name = stream.get("game_name") or "Unbekannt"
             viewer_count = stream.get("viewer_count", 0)
             started_at = stream.get("started_at", "")
-            stream_url = stream.get("url", "")
 
             list_item = xbmcgui.ListItem(label=f"{user_name}: {title}")
             thumbnail_url = stream.get("thumbnail_url", "")
@@ -354,12 +416,10 @@ def list_live_streams():
             ]
             if started_at:
                 plot_parts.append(f"Live seit: {started_at}")
-            if stream_url:
-                plot_parts.append(f"URL: {stream_url}")
             plot_parts.extend(
                 [
                     "",
-                    "Twitch-Wiedergabe wird von diesem Addon nicht direkt aufgeloest.",
+                    "Wiedergabe und Twitch-Kontovorteile laufen ueber das Twitch-Addon.",
                 ]
             )
 
@@ -368,14 +428,84 @@ def list_live_streams():
             tag.setPlot("\n".join(plot_parts))
             tag.setGenres(["Live-Streams", game_name])
             tag.setMediaType("video")
+            list_item.setProperty("IsPlayable", "true")
 
-            url = get_url(
-                action="show_live_stream",
-                user_login=stream.get("user_login", ""),
-                stream_url=stream_url,
-                title=title,
-            )
+            url = twitch_plugin_url(stream)
             xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, False)
+
+    xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
+    xbmcplugin.endOfDirectory(_HANDLE)
+
+
+def _read_account_user():
+    if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        _set_account_status(_addon.getLocalizedString(30209))
+        return None
+    try:
+        user = _account_session.current_user()
+    except (AuthenticationError, SessionError):
+        _account_session.clear()
+        configure_account_session(None)
+        _set_account_status(_addon.getLocalizedString(30210))
+        return None
+
+    name = _account_name(user)
+    status = (
+        f"{_addon.getLocalizedString(30211)}: {name}"
+        if name
+        else _addon.getLocalizedString(30211)
+    )
+    _set_account_status(status)
+    return user
+
+
+def _add_account_entry(label, action, icon):
+    list_item = xbmcgui.ListItem(label=label)
+    list_item.setArt({"icon": icon})
+    tag = list_item.getVideoInfoTag()
+    tag.setTitle(label)
+    tag.setMediaType("video")
+    xbmcplugin.addDirectoryItem(
+        _HANDLE,
+        get_url(action=action),
+        list_item,
+        False,
+    )
+
+
+def list_account():
+    xbmcplugin.setPluginCategory(_HANDLE, _addon.getLocalizedString(30200))
+    xbmcplugin.setContent(_HANDLE, "videos")
+    user = _read_account_user()
+    status = _addon.getSetting("account_status") or _addon.getLocalizedString(30209)
+
+    _add_account_entry(
+        f"{_addon.getLocalizedString(30202)}: {status}",
+        "account_status",
+        "DefaultUser.png",
+    )
+    if user:
+        _add_account_entry(
+            _addon.getLocalizedString(30205),
+            "account_logout",
+            "DefaultAddonService.png",
+        )
+    else:
+        _add_account_entry(
+            _addon.getLocalizedString(30203),
+            "account_login",
+            "DefaultAddonService.png",
+        )
+    _add_account_entry(
+        _addon.getLocalizedString(30212),
+        "open_settings",
+        "DefaultAddonHelper.png",
+    )
+    _add_account_entry(
+        _addon.getLocalizedString(30208),
+        "open_twitch_settings",
+        "DefaultAddonService.png",
+    )
 
     xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
     xbmcplugin.endOfDirectory(_HANDLE)
@@ -384,6 +514,10 @@ def list_live_streams():
 def list_videos(category, offset=0, search_str="", game_id=None):
     xbmcplugin.setPluginCategory(_HANDLE, category)
     xbmcplugin.setContent(_HANDLE, "videos")
+
+    if category == _CATEGORIES[7]:  # Konto
+        list_account()
+        return
 
     # Spezialfall: Spiele-Kategorie zeigt Spiele-Liste
     if category == _CATEGORIES[4]:  # "Nach Spielen"
@@ -672,6 +806,7 @@ def play_video(path, episode, start_offset=0):
 
     play_item = xbmcgui.ListItem(path=path)
     play_item.setProperty("IsPlayable", "true")
+    _configure_authenticated_playback(play_item, path)
 
     # Thumbnail setzen
     preview_url = info.get("preview_url", "") if info else ""
@@ -764,7 +899,7 @@ def monitor_playback(episode, next_episode=None):
                     f"[Gronkh.tv] Auto-playing next episode: {next_ep}", xbmc.LOGINFO
                 )
                 next_url = get_playlist_url(next_ep)
-                player.play(next_url)
+                _play_direct(next_url, player)
 
                 # Warten bis nächste Episode startet
                 xbmc.sleep(2000)
@@ -832,7 +967,7 @@ def jump_to_chapter(params):
     if not player.isPlayingVideo():
         url = get_playlist_url(episode)
         xbmc.log(f"[Gronkh.tv] Starting playback of {url}", xbmc.LOGINFO)
-        player.play(url)
+        _play_direct(url, player)
 
         # Wait for playback to start
         start_time = time.time()
@@ -861,6 +996,11 @@ def router(paramstring):
         "show_details": handle_show_details,
         "show_live_stream": handle_show_live_stream,
         "list_game_videos": handle_list_game_videos,
+        "account_login": handle_account_login,
+        "account_logout": handle_account_logout,
+        "account_status": handle_account_status,
+        "open_settings": handle_open_settings,
+        "open_twitch_settings": handle_open_twitch_settings,
     }
 
     try:
@@ -932,13 +1072,108 @@ def handle_show_details(params):
 
 
 def handle_show_live_stream(params):
-    """Zeigt den Twitch-Link fuer einen Live-Stream an."""
-    title = params.get("title") or params.get("user_login") or "Live-Stream"
-    stream_url = params.get("stream_url", "")
-    message = "Twitch-Wiedergabe wird von diesem Addon nicht direkt aufgeloest."
-    if stream_url:
-        message = f"{message}\n\n{stream_url}"
-    xbmcgui.Dialog().ok(title, message)
+    """Starts a promoted channel through plugin.video.twitch."""
+    stream_url = twitch_plugin_url(params)
+    xbmc.executebuiltin(f"PlayMedia({stream_url})")
+
+
+def handle_account_login(params=None):
+    dialog = xbmcgui.Dialog()
+    saved_login = _addon.getSetting("account_email")
+    login = dialog.input(
+        _addon.getLocalizedString(30201),
+        defaultt=saved_login,
+        type=xbmcgui.INPUT_ALPHANUM,
+    ).strip()
+    if not login:
+        return
+
+    password = dialog.input(
+        _addon.getLocalizedString(30213),
+        type=xbmcgui.INPUT_ALPHANUM,
+        option=xbmcgui.ALPHANUM_HIDE_INPUT,
+    )
+    if not password:
+        return
+
+    try:
+        result = _account_session.login(login, password)
+        if result.requires_two_factor:
+            code = dialog.input(
+                _addon.getLocalizedString(30214),
+                type=xbmcgui.INPUT_ALPHANUM,
+            ).strip()
+            if not code:
+                dialog.notification(
+                    _plugin,
+                    _addon.getLocalizedString(30215),
+                    xbmcgui.NOTIFICATION_WARNING,
+                )
+                return
+            result = _account_session.login(
+                login,
+                password,
+                two_factor_code=code,
+            )
+
+        if not result.authenticated:
+            raise AuthenticationError(_addon.getLocalizedString(30216))
+        configure_account_session(_account_session)
+        _addon.setSetting("account_email", login)
+        name = _account_name(result.user)
+        status = (
+            f"{_addon.getLocalizedString(30211)}: {name}"
+            if name
+            else _addon.getLocalizedString(30211)
+        )
+        _set_account_status(status)
+        dialog.notification(
+            _plugin,
+            status,
+            xbmcgui.NOTIFICATION_INFO,
+        )
+        xbmc.executebuiltin("Container.Refresh")
+    except (AuthenticationError, SessionError, ValueError) as exc:
+        xbmc.log(f"[Gronkh.tv] Account login failed: {exc}", xbmc.LOGWARNING)
+        dialog.notification(
+            _plugin,
+            _addon.getLocalizedString(30216),
+            xbmcgui.NOTIFICATION_ERROR,
+        )
+
+
+def handle_account_logout(params=None):
+    dialog = xbmcgui.Dialog()
+    if not dialog.yesno(_plugin, _addon.getLocalizedString(30217)):
+        return
+    try:
+        _account_session.logout()
+    except SessionError as exc:
+        xbmc.log(f"[Gronkh.tv] Remote logout failed: {exc}", xbmc.LOGWARNING)
+        _account_session.clear()
+    configure_account_session(None)
+    _set_account_status(_addon.getLocalizedString(30209))
+    dialog.notification(
+        _plugin,
+        _addon.getLocalizedString(30218),
+        xbmcgui.NOTIFICATION_INFO,
+    )
+    xbmc.executebuiltin("Container.Refresh")
+
+
+def handle_account_status(params=None):
+    user = _read_account_user()
+    status = _addon.getSetting("account_status") or _addon.getLocalizedString(30209)
+    notification = xbmcgui.NOTIFICATION_INFO if user else xbmcgui.NOTIFICATION_WARNING
+    xbmcgui.Dialog().notification(_plugin, status, notification)
+
+
+def handle_open_settings(params=None):
+    _addon.openSettings()
+
+
+def handle_open_twitch_settings(params=None):
+    xbmc.executebuiltin("Addon.OpenSettings(plugin.video.twitch)")
 
 
 def handle_list_game_videos(params):
@@ -954,8 +1189,7 @@ def handle_play_resume(params):
     episode = params["episode"]
     resume_point = get_resume_point(episode)
     url = get_playlist_url(episode)
-    player = xbmc.Player()
-    player.play(url)
+    player = _play_direct(url)
 
     # Warten bis Wiedergabe startet
     start_time = time.time()
@@ -980,8 +1214,7 @@ def handle_play_from_start(params):
         xbmc.log(f"[Gronkh.tv] Error deleting resume point: {str(e)}", xbmc.LOGERROR)
 
     url = get_playlist_url(episode)
-    player = xbmc.Player()
-    player.play(url)
+    _play_direct(url)
 
 
 def seconds_to_time(s):

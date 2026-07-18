@@ -13,28 +13,97 @@ msgstr ""
 "Language: en\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
-
-# Menü
-
+# Menu
 msgctxt "#30001"
-msgid "Neueste Uploads"
-msgstr "Neueste Uploads"
+msgid "Latest uploads"
+msgstr "Latest uploads"
 
 msgctxt "#30002"
-msgid "Meist gesehen"
-msgstr "Meist gesehen"
+msgid "Most viewed"
+msgstr "Most viewed"
 
 msgctxt "#30003"
 msgid "Browse"
 msgstr "Browse"
 
 msgctxt "#30004"
-msgid "Suche"
-msgstr "Suche"
+msgid "Search"
+msgstr "Search"
 
-
-# Fehlerausgabe
-
+# Errors
 msgctxt "#30101"
-msgid "Der Suchbegriff muss mindestens 3 Zeichen lang sein."
-msgstr "Der Suchbegriff muss mindestens 3 Zeichen lang sein."
+msgid "The search term must be at least 3 characters long."
+msgstr "The search term must be at least 3 characters long."
+
+# Account and playback
+msgctxt "#30200"
+msgid "Account"
+msgstr "Account"
+
+msgctxt "#30201"
+msgid "Email or login"
+msgstr "Email or login"
+
+msgctxt "#30202"
+msgid "Account status"
+msgstr "Account status"
+
+msgctxt "#30203"
+msgid "Sign in"
+msgstr "Sign in"
+
+msgctxt "#30205"
+msgid "Sign out"
+msgstr "Sign out"
+
+msgctxt "#30206"
+msgid "Playback"
+msgstr "Playback"
+
+msgctxt "#30207"
+msgid "Use account session for archive playback"
+msgstr "Use account session for archive playback"
+
+msgctxt "#30208"
+msgid "Open Twitch add-on settings"
+msgstr "Open Twitch add-on settings"
+
+msgctxt "#30209"
+msgid "Not signed in"
+msgstr "Not signed in"
+
+msgctxt "#30210"
+msgid "Session expired"
+msgstr "Session expired"
+
+msgctxt "#30211"
+msgid "Signed in"
+msgstr "Signed in"
+
+msgctxt "#30212"
+msgid "Open add-on settings"
+msgstr "Open add-on settings"
+
+msgctxt "#30213"
+msgid "Password"
+msgstr "Password"
+
+msgctxt "#30214"
+msgid "Two-factor authentication code"
+msgstr "Two-factor authentication code"
+
+msgctxt "#30215"
+msgid "Sign-in cancelled because no code was entered"
+msgstr "Sign-in cancelled because no code was entered"
+
+msgctxt "#30216"
+msgid "Sign-in failed"
+msgstr "Sign-in failed"
+
+msgctxt "#30217"
+msgid "Do you want to sign out?"
+msgstr "Do you want to sign out?"
+
+msgctxt "#30218"
+msgid "Signed out"
+msgstr "Signed out"
