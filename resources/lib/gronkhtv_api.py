@@ -91,9 +91,11 @@ def normalize_chapter(chapter):
         chapter = {}
 
     category = _normalize_category(chapter.get("category") or chapter.get("game"))
+    title = chapter.get("title") or category.get("title") or "Unbenanntes Kapitel"
+    offset = chapter.get("start_offset", chapter.get("offset"))
     return {
-        "title": chapter.get("title", ""),
-        "offset": _as_int(chapter.get("offset"), 0),
+        "title": title,
+        "offset": _as_int(offset, 0),
         "category": category,
         "game": _category_to_legacy_game(category),
     }

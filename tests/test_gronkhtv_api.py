@@ -124,6 +124,37 @@ def test_normalize_chapter_maps_category_to_legacy_game_alias():
     }
 
 
+def test_normalize_chapter_maps_v3_title_and_start_offset():
+    chapter = normalize_chapter(
+        {
+            "title": None,
+            "start_offset": "900",
+            "category": {"title": "Tabletop RPGs"},
+        }
+    )
+
+    assert chapter["title"] == "Tabletop RPGs"
+    assert chapter["offset"] == 900
+
+
+def test_normalize_chapter_preserves_legacy_title_and_offset():
+    chapter = normalize_chapter(
+        {
+            "title": "Intro",
+            "offset": "42",
+            "category": {"title": "Ignored fallback"},
+        }
+    )
+
+    assert chapter["title"] == "Intro"
+    assert chapter["offset"] == 42
+
+
+def test_normalize_chapter_uses_safe_title_without_category():
+    assert normalize_chapter({"title": ""})["title"] == "Unbenanntes Kapitel"
+    assert normalize_chapter({})["title"] == "Unbenanntes Kapitel"
+
+
 def test_normalize_video_uses_safe_defaults_for_missing_optional_fields():
     video = normalize_video({"id": "video-id", "episode": 1})
 
