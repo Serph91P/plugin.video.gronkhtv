@@ -15,14 +15,14 @@ from context_menu import (  # noqa: E402
 )
 
 
-def test_context_menu_labels_use_consistent_symbols():
-    assert resume_label("01:23") == "▶ Fortsetzen bei 01:23"
-    assert restart_label() == "⏮ Von Anfang starten"
-    assert favorite_label(False) == "☆ Zu Favoriten hinzufügen"
-    assert favorite_label(True) == "★ Aus Favoriten entfernen"
-    assert details_label() == "ⓘ Stream-Details anzeigen"
+def test_context_menu_labels_do_not_depend_on_icon_glyphs():
+    assert resume_label("01:23") == "Fortsetzen bei 01:23"
+    assert restart_label() == "Von Anfang starten"
+    assert favorite_label(False) == "Zu Favoriten hinzufügen"
+    assert favorite_label(True) == "Aus Favoriten entfernen"
+    assert details_label() == "Stream-Details anzeigen"
 
 
 def test_chapter_label_never_displays_none():
-    assert chapter_label("00:15:00", "Tabletop RPGs") == "⏩ [00:15:00]: Tabletop RPGs"
-    assert chapter_label("00:00:00", None) == "⏩ [00:00:00]: Unbenanntes Kapitel"
+    assert chapter_label("00:15:00", "Tabletop RPGs") == "Kapitel [00:15:00]: Tabletop RPGs"
+    assert chapter_label("00:00:00", None) == "Kapitel [00:00:00]: Unbenanntes Kapitel"
