@@ -30,13 +30,46 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest pyyaml
-          python -m pip install git+https://github.com/xbmc/addon-check.git
+          python -m pip install git+https://github.com/xbmc/addon-check.git@67be5c1eca23e01402a447f995e2216bd83202f3
 
       - name: Pytest regression suite
         working-directory: ${{ github.event.repository.name }}
         run: python -m pytest -q
 
       - name: Kodi Add-on Checker (Omega)
-        id: kodi-addon-checker
         run: |
           kodi-addon-checker ${{ github.event.repository.name }} --branch=omega
+
+      - name: Kodi Add-on Checker (Nexus)
+        run: |
+          kodi-addon-checker ${{ github.event.repository.name }} --branch=nexus
+
+  package:
+    name: Package Validation
+    needs: addon-validations
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    permissions:
+      contents: read
+      id-token: write
+    uses: Serph91P/repository.serph91p/.github/workflows/reusable-addon-package.yml@7adff881ab5d0a7fc63f7474a78b2688e2e6eee4
+    with:
+      addon_id: plugin.video.gronkhtv
+      runtime_entries_json: '["addon.xml","addon.py","resources/"]'
+
+  publication:
+    name: Publish Validated Package
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/notify-repository.yml
+    with:
+      addon_id: plugin.video.gronkhtv
+      addon_version: ${{ needs.package.outputs.addon_version }}
+      asset_name: ${{ needs.package.outputs.asset_name }}
+      artifact_sha256: ${{ needs.package.outputs.artifact_sha256 }}
+      publication_id: ${{ needs.package.outputs.publication_id }}
+    secrets:
+      REPO_DISPATCH_TOKEN: ${{ secrets.REPO_DISPATCH_TOKEN }}

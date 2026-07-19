@@ -13,32 +13,52 @@ Produces a deterministic ZIP archive with:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
 import stat
 import sys
+import tempfile
+import unicodedata
+import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path
 from typing import List, Set, Tuple
-import unicodedata
 
 
+EXPECTED_ADDON_ID = "plugin.video.gronkhtv"
 ALLOWED_ROOTS = {"addon.xml", "addon.py", "resources"}
-EXCLUDED_NAMES = {
-    "README.md",
-    "README.rst",
-    "LICENSE",
-    "LICENSE.txt",
-    "LICENSE.md",
-    ".gitignore",
-    ".gitattributes",
+FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+REGULAR_FILE_MODE = stat.S_IFREG | 0o644
+VERSION_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
+FORBIDDEN_COMPONENTS = {
+    ".git",
     ".github",
     ".hermes",
-    "tests",
     "__pycache__",
-    ".pyc",
+    "tests",
+    "workflows",
 }
-EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".pyd"}
-EXCLUDED_PREFIXES = {".", "__pycache__"}
+FORBIDDEN_BASENAMES = {
+    ".gitattributes",
+    ".gitignore",
+    "license",
+    "license.md",
+    "license.txt",
+    "readme",
+    "readme.md",
+    "readme.rst",
+}
+FORBIDDEN_SUFFIXES = {".pyc", ".pyd", ".pyo"}
+WINDOWS_RESERVED_BASENAMES = {
+    "aux",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 
 
 def normalize_path_key(path: str) -> str:
@@ -46,16 +66,63 @@ def normalize_path_key(path: str) -> str:
     return unicodedata.normalize("NFC", path).casefold()
 
 
-def is_excluded(name: str) -> bool:
-    if name in EXCLUDED_NAMES:
-        return True
-    for suffix in EXCLUDED_SUFFIXES:
-        if name.endswith(suffix):
-            return True
-    for prefix in EXCLUDED_PREFIXES:
-        if name == prefix or name.startswith(prefix + "/"):
-            return True
-    return False
+def register_normalized_path(path: str, seen: Set[str]) -> None:
+    parts = path.split("/")
+    if "\\" in path or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Non-canonical path: {path}")
+
+    normalized = normalize_path_key(path)
+    for existing in seen:
+        if (
+            normalized == existing
+            or normalized.startswith(existing + "/")
+            or existing.startswith(normalized + "/")
+        ):
+            raise ValueError(f"Normalized path collision: {path}")
+    seen.add(normalized)
+
+
+def validate_runtime_path(path: str) -> None:
+    """Reject repository-only, cache, hidden, and compiled runtime paths."""
+    parts = path.split("/")
+    folded = [part.casefold() for part in parts]
+    if any(part.endswith((" ", ".")) for part in parts):
+        raise ValueError(f"Windows-unsafe trailing dot or space: {path}")
+    if any(":" in part for part in parts):
+        raise ValueError(f"Windows-unsafe colon or alternate data stream: {path}")
+    for part in folded:
+        device_basename = part.split(".", 1)[0].rstrip(" .")
+        if device_basename in WINDOWS_RESERVED_BASENAMES:
+            raise ValueError(f"Windows-reserved device basename: {path}")
+    if any(part.startswith(".") for part in parts):
+        raise ValueError(f"Dot path component not allowed: {path}")
+    if any(part in FORBIDDEN_COMPONENTS for part in folded):
+        raise ValueError(f"Forbidden repository or cache path: {path}")
+    if any(part in FORBIDDEN_BASENAMES for part in folded):
+        raise ValueError(f"Forbidden repository file: {path}")
+    if folded and any(folded[-1].endswith(suffix) for suffix in FORBIDDEN_SUFFIXES):
+        raise ValueError(f"Forbidden compiled file: {path}")
+
+
+def require_regular_source_file(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise ValueError(f"Source does not exist: {path}") from exc
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"Source must be a regular file: {path}")
+
+
+def validate_addon_element(root: ET.Element) -> tuple[str, str]:
+    if root.tag != "addon":
+        raise ValueError(f"addon.xml root must be addon, got {root.tag}")
+    addon_id = root.get("id")
+    version = root.get("version")
+    if addon_id != EXPECTED_ADDON_ID:
+        raise ValueError(f"addon.xml id must be {EXPECTED_ADDON_ID}, got {addon_id}")
+    if version is None or VERSION_TOKEN.fullmatch(version) is None:
+        raise ValueError(f"addon.xml has unsafe version token: {version!r}")
+    return addon_id, version
 
 
 def is_allowed_root(name: str) -> bool:
@@ -78,36 +145,26 @@ def collect_runtime_files(root: Path) -> List[Tuple[str, Path]]:
     files: List[Tuple[str, Path]] = []
 
     for item in sorted(root.iterdir()):
-        if is_excluded(item.name):
-            continue
-
         if not is_allowed_root(item.name):
-            continue
+            kind = "symlink" if item.is_symlink() else "member"
+            raise ValueError(f"Unapproved source {kind}: {item}")
 
         if item.name in {"addon.xml", "addon.py"}:
-            if item.is_symlink():
-                raise ValueError(f"Symlinked {item.name} not allowed: {item}")
-            if item.is_file():
-                files.append((f"plugin.video.gronkhtv/{item.name}", item))
-            else:
-                raise ValueError(f"{item.name} must be a regular file: {item}")
+            require_regular_source_file(item)
+            files.append((f"plugin.video.gronkhtv/{item.name}", item))
         elif item.name == "resources":
-            if item.is_symlink():
-                raise ValueError(f"Symlinked resources directory not allowed: {item}")
-            if not item.is_dir():
+            if not stat.S_ISDIR(item.lstat().st_mode):
                 raise ValueError(f"resources must be a directory: {item}")
             for res_file in sorted(item.rglob("*")):
-                if res_file.is_symlink():
-                    raise ValueError(f"Symlinked path under resources not allowed: {res_file}")
-                if is_excluded(res_file.name):
-                    continue
-                if res_file.is_file():
-                    rel = res_file.relative_to(root)
+                rel = res_file.relative_to(root)
+                validate_runtime_path(rel.as_posix())
+                mode = res_file.lstat().st_mode
+                if stat.S_ISREG(mode):
                     files.append((f"plugin.video.gronkhtv/{rel.as_posix()}", res_file))
-                elif res_file.is_dir():
+                elif stat.S_ISDIR(mode):
                     continue
                 else:
-                    raise ValueError(f"Invalid file type under resources: {res_file}")
+                    raise ValueError(f"Source must be a regular file: {res_file}")
 
     files.sort(key=lambda x: x[0])
     return files
@@ -136,12 +193,6 @@ def validate_archive_members(files: List[Tuple[str, Path]]) -> None:
             if part.startswith("."):
                 raise ValueError(f"Dot path component in {arc_path}: {part}")
 
-        # No normalized path collisions (NFC + casefold)
-        norm = normalize_path_key(rel)
-        if norm in seen_normalized:
-            raise ValueError(f"Normalized path collision: {arc_path}")
-        seen_normalized.add(norm)
-
         # Must be allowed root type
         if top_level not in ALLOWED_ROOTS:
             raise ValueError(f"Disallowed root entry: {top_level} in {arc_path}")
@@ -158,11 +209,10 @@ def validate_archive_members(files: List[Tuple[str, Path]]) -> None:
             if ".." in rel.split("/"):
                 raise ValueError(f"Traversal path component in {arc_path}")
 
-        # Source must exist and be a regular file
-        if not src_path.exists():
-            raise ValueError(f"Source does not exist: {src_path}")
-        if not src_path.is_file() or src_path.is_symlink():
-            raise ValueError(f"Source not a regular file: {src_path}")
+        validate_runtime_path(rel)
+        require_regular_source_file(src_path)
+
+        register_normalized_path(rel, seen_normalized)
 
     # Must have exactly the three allowed roots
     required_roots = {"addon.xml", "addon.py", "resources"}
@@ -184,21 +234,21 @@ def validate_archive_members(files: List[Tuple[str, Path]]) -> None:
 
 def build_deterministic_zip(files: List[Tuple[str, Path]], output_path: Path) -> None:
     """Build a deterministic ZIP archive."""
-    # Fixed timestamp: 1980-01-01 00:00:00 (DOS epoch)
-    fixed_time = (1980, 1, 1, 0, 0, 0)
-
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for arc_path, src_path in files:
             info = zipfile.ZipInfo(arc_path)
-            info.date_time = fixed_time
-            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.date_time = FIXED_ZIP_TIME
+            info.create_system = 3
+            info.external_attr = REGULAR_FILE_MODE << 16
             info.compress_type = zipfile.ZIP_DEFLATED
+            info.extra = b""
+            info.comment = b""
 
             with open(src_path, "rb") as f:
                 zf.writestr(info, f.read())
 
 
-def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
+def verify_zip(output_path: Path, source_version: str | None = None) -> List[str]:
     """Verify ZIP contents and return member list.
 
     Enforces exact archive contract:
@@ -210,9 +260,13 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
     - Require both root files (addon.xml, addon.py) + at least one resources file
     - Parse embedded addon.xml and verify id=plugin.video.gronkhtv and version=source_version
     """
-    import stat
     with zipfile.ZipFile(output_path, "r") as zf:
-        members = sorted(zf.namelist())
+        if zf.comment:
+            raise ValueError("Archive comment not allowed")
+        infos = zf.infolist()
+        members = [info.filename for info in infos]
+        if members != sorted(members):
+            raise ValueError("Archive members are not in canonical order")
 
         # Verify all members under single root (ignore absolute paths that create empty root)
         roots = {m.split("/")[0] for m in members if "/" in m}
@@ -232,32 +286,30 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
         # For collision detection
         seen_normalized: Set[str] = set()
 
-        # Forbidden path patterns (exact match or prefix)
-        FORBIDDEN_PREFIXES = (
-            "tests/",
-            ".github/",
-            "workflows/",
-            ".hermes/",
-            "__pycache__/",
-        )
-        FORBIDDEN_BASENAMES = {
-            "readme.md", "readme.rst", "readme",
-            "license", "license.txt", "license.md",
-        }
-        FORBIDDEN_EXACT = {"module.pyc"}
-        FORBIDDEN_SUFFIXES = {".pyc"}
-
-        for m in members:
-            info = zf.getinfo(m)
-
-            # Reject directory entries (trailing slash)
-            if m.endswith("/"):
-                raise ValueError(f"Directory entry not allowed in archive: {m}")
-
-            # Reject symlink entries via external_attr (Unix S_IFLNK)
+        for info in infos:
+            m = info.filename
+            if info.date_time != FIXED_ZIP_TIME:
+                raise ValueError(f"Invalid timestamp for archive member: {m}")
+            if info.create_system != 3:
+                raise ValueError(f"Archive member must use Unix metadata: {m}")
             mode = info.external_attr >> 16
-            if stat.S_IFMT(mode) == stat.S_IFLNK:
-                raise ValueError(f"Symlink entry not allowed in archive: {m}")
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"Archive member must be a regular file: {m}")
+            if stat.S_IMODE(mode) != 0o644 or info.external_attr & 0xFFFF:
+                raise ValueError(f"Archive member must have mode 0644: {m}")
+            if info.compress_type != zipfile.ZIP_DEFLATED:
+                raise ValueError(f"Archive member must use deflate compression: {m}")
+            if info.extra:
+                raise ValueError(f"Archive member extra data not allowed: {m}")
+            if info.comment:
+                raise ValueError(f"Archive member comment not allowed: {m}")
+            try:
+                m.encode("ascii")
+                expected_flags = 0
+            except UnicodeEncodeError:
+                expected_flags = 0x800
+            if info.flag_bits != expected_flags:
+                raise ValueError(f"Unsafe archive member flags for {m}: {info.flag_bits:#x}")
 
             rel = m[len(root) + 1 :] if m.startswith(root + "/") else m
 
@@ -269,27 +321,7 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
             if ".." in rel.split("/"):
                 raise ValueError(f"Traversal path in archive: {m}")
 
-            # Check forbidden patterns BEFORE dot component check
-            # (so .github/ is caught as forbidden repo-only path, not as dot component)
-            for prefix in FORBIDDEN_PREFIXES:
-                if rel.startswith(prefix):
-                    raise ValueError(f"Forbidden repo-only path in archive: {m}")
-            basename = rel.rsplit("/", 1)[-1].casefold()
-            if basename in FORBIDDEN_BASENAMES or rel in FORBIDDEN_EXACT:
-                raise ValueError(f"Forbidden file in archive: {m}")
-            for suffix in FORBIDDEN_SUFFIXES:
-                if rel.endswith(suffix):
-                    raise ValueError(f"Forbidden bytecode file in archive: {m}")
-
-            # Reject dot components (for any remaining cases)
-            if rel.startswith(".") or "/." in rel:
-                raise ValueError(f"Dot path component in archive: {m}")
-
-            # Normalize for collision detection (NFC + casefold)
-            norm = normalize_path_key(rel)
-            if norm in seen_normalized:
-                raise ValueError(f"Normalized path collision in archive: {m}")
-            seen_normalized.add(norm)
+            validate_runtime_path(rel)
 
             # Validate allowed structure - EXACT root file matching
             parts = rel.split("/")
@@ -306,6 +338,8 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
             else:
                 raise ValueError(f"Invalid archive member (not under allowed paths): {m}")
 
+            register_normalized_path(rel, seen_normalized)
+
         # Require both root files
         if not has_addon_xml:
             raise ValueError("Missing required addon.xml at root")
@@ -316,18 +350,19 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
         if not has_resources_file:
             raise ValueError("Missing required files under resources/")
 
+        # Reading through EOF verifies local headers, decompression, sizes, and CRCs.
+        for info in infos:
+            with zf.open(info, "r") as member:
+                while member.read(1024 * 1024):
+                    pass
+
         # Parse and verify embedded addon.xml
         with zf.open(f"{root}/addon.xml") as f:
             addon_content = f.read().decode("utf-8")
-        import xml.etree.ElementTree as ET
         addon_root = ET.fromstring(addon_content)
-        addon_id = addon_root.get("id")
-        addon_version = addon_root.get("version")
+        _, addon_version = validate_addon_element(addon_root)
 
-        if addon_id != "plugin.video.gronkhtv":
-            raise ValueError(f"Invalid addon id in embedded addon.xml: {addon_id}")
-
-        if source_version and addon_version != source_version:
+        if source_version is not None and addon_version != source_version:
             raise ValueError(f"Version mismatch: embedded={addon_version}, source={source_version}")
 
         return members
@@ -335,14 +370,67 @@ def verify_zip(output_path: Path, source_version: str = None) -> List[str]:
 
 def parse_addon_xml(addon_xml_path: Path) -> tuple[str, str]:
     """Parse addon.xml and return (id, version)."""
-    import xml.etree.ElementTree as ET
     tree = ET.parse(addon_xml_path)
-    root = tree.getroot()
-    addon_id = root.get("id")
-    version = root.get("version")
-    if not addon_id or not version:
-        raise ValueError("addon.xml missing id or version")
-    return addon_id, version
+    return validate_addon_element(tree.getroot())
+
+
+def verify_checksum(output_path: Path, expected: str) -> tuple[bool, str]:
+    checksum = hashlib.sha256(Path(output_path).read_bytes()).hexdigest()
+    return checksum == expected, checksum
+
+
+def validate_package(output_path: Path, source: Path | None = None) -> list[str]:
+    try:
+        source_version = None
+        if source is not None:
+            _, source_version = parse_addon_xml(Path(source) / "addon.xml")
+        verify_zip(Path(output_path), source_version=source_version)
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        ET.ParseError,
+        zipfile.BadZipFile,
+        zlib.error,
+    ) as exc:
+        return [str(exc)]
+    return []
+
+
+def build_package(
+    source: Path, output: Path, expected_version: str | None = None
+) -> dict[str, object]:
+    source = Path(source).resolve()
+    output = Path(output).resolve()
+    addon_id, version = parse_addon_xml(source / "addon.xml")
+    if expected_version and version != expected_version:
+        raise ValueError(
+            f"Version mismatch: source={version}, expected={expected_version}"
+        )
+
+    files = collect_runtime_files(source)
+    validate_archive_members(files)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    os.close(descriptor)
+    temporary_output = Path(temporary_name)
+    try:
+        build_deterministic_zip(files, temporary_output)
+        members = verify_zip(temporary_output, source_version=version)
+        checksum = hashlib.sha256(temporary_output.read_bytes()).hexdigest()
+        temporary_output.replace(output)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+
+    return {
+        "addon_id": addon_id,
+        "addon_version": version,
+        "checksum": checksum,
+        "filename": f"{addon_id}-{version}.zip",
+        "members": members,
+    }
 
 
 def main() -> int:
@@ -360,32 +448,14 @@ def main() -> int:
             print(f"  {m}")
         return 0
 
-    source = args.source.resolve()
     output = args.output.resolve()
-
-    # Collect runtime files
-    files = collect_runtime_files(source)
-
-    # Validate
-    validate_archive_members(files)
-
-    # Build deterministic ZIP
-    build_deterministic_zip(files, output)
-
-    # Parse addon.xml from source for version verification
-    addon_id, version = parse_addon_xml(source / "addon.xml")
-
-    # Check expected version if provided
-    if args.expected_version and version != args.expected_version:
-        raise ValueError(f"Version mismatch: source={version}, expected={args.expected_version}")
-
-    # Verify with version check
-    members = verify_zip(output, source_version=version)
+    info = build_package(args.source, output, expected_version=args.expected_version)
 
     print(f"Built {output}")
-    print(f"Addon ID: {addon_id}, Version: {version}")
-    print(f"Members: {len(members)}")
-    for m in members:
+    print(f"Addon ID: {info['addon_id']}, Version: {info['addon_version']}")
+    print(f"SHA256: {info['checksum']}")
+    print(f"Members: {len(info['members'])}")
+    for m in info["members"]:
         print(f"  {m}")
 
     return 0
