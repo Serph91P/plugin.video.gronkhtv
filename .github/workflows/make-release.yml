@@ -35,20 +35,23 @@ jobs:
       - name: Get version and check tag
         id: version
         run: |
-          version=$(xmlstarlet sel -t -v 'string(/addon/@version)' addon.xml)
+          version="$(xmlstarlet sel -t -v 'string(/addon/@version)' addon.xml)"
+          # shellcheck disable=SC2086
           filename=${{ github.event.repository.name }}-${version}.zip
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "filename=$filename" >> $GITHUB_OUTPUT
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "filename=$filename" >> "$GITHUB_OUTPUT"
 
           if git rev-parse "v$version" >/dev/null 2>&1; then
-            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
           if gh api "repos/${{ github.repository }}/releases/tags/v$version" --jq '.assets[].name' 2>/dev/null | grep -Fxq -- "$filename"; then
+            # shellcheck disable=SC2086
             echo "asset_exists=true" >> $GITHUB_OUTPUT
           else
+            # shellcheck disable=SC2086
             echo "asset_exists=false" >> $GITHUB_OUTPUT
           fi
         env:
@@ -60,7 +63,7 @@ jobs:
         run: |
           filename=${{ steps.version.outputs.filename }}
           python scripts/build_release.py --source . --output "${GITHUB_WORKSPACE}/${filename}" --expected-version "${{ steps.version.outputs.version }}"
-          echo "filename=$filename" >> $GITHUB_OUTPUT
+          echo "filename=$filename" >> "$GITHUB_OUTPUT"
 
       - name: Verify Zip
         if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
@@ -91,9 +94,11 @@ jobs:
         run: |
           changes=$(xmlstarlet sel -t -v '//news' -n addon.xml)
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-          echo "changes<<$EOF" >> $GITHUB_OUTPUT
-          echo "$changes" >> $GITHUB_OUTPUT
-          echo "$EOF" >> $GITHUB_OUTPUT
+          {
+            echo "changes<<$EOF"
+            echo "$changes"
+            echo "$EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
