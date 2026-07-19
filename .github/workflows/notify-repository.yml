@@ -3,6 +3,15 @@ name: Notify Repository
 on:
   workflow_call:
     inputs:
+      validation_run_id:
+        required: true
+        type: number
+      validation_head_sha:
+        required: true
+        type: string
+      validation_event:
+        required: true
+        type: string
       addon_id:
         required: true
         type: string
@@ -31,11 +40,11 @@ jobs:
     uses: Serph91P/repository.serph91p/.github/workflows/reusable-notify-repository.yml@7adff881ab5d0a7fc63f7474a78b2688e2e6eee4
     with:
       source_repository: ${{ github.repository }}
-      candidate_sha: ${{ github.sha }}
-      validation_run_id: ${{ github.run_id }}
+      candidate_sha: ${{ inputs.validation_head_sha }}
+      validation_run_id: ${{ inputs.validation_run_id }}
       validation_workflow: Add-on Validations
       validation_workflow_path: .github/workflows/addon-validations.yml
-      validation_event: ${{ github.event_name }}
+      validation_event: ${{ inputs.validation_event }}
       expected_branch: develop
       addon_id: ${{ inputs.addon_id }}
       addon_version: ${{ inputs.addon_version }}

@@ -55,21 +55,3 @@ jobs:
     with:
       addon_id: plugin.video.gronkhtv
       runtime_entries_json: '["addon.xml","addon.py","resources/"]'
-
-  publication:
-    name: Publish Validated Package
-    needs: package
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-    permissions:
-      actions: read
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/notify-repository.yml
-    with:
-      addon_id: plugin.video.gronkhtv
-      addon_version: ${{ needs.package.outputs.addon_version }}
-      asset_name: ${{ needs.package.outputs.asset_name }}
-      artifact_sha256: ${{ needs.package.outputs.artifact_sha256 }}
-      publication_id: ${{ needs.package.outputs.publication_id }}
-    secrets:
-      REPO_DISPATCH_TOKEN: ${{ secrets.REPO_DISPATCH_TOKEN }}

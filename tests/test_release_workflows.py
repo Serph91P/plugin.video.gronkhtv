@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import json
+import re
 import urllib.request
 import zipfile
 from functools import cache
@@ -283,33 +284,9 @@ def test_addon_validations_calls_pinned_package_only_for_develop_push():
     assert "from tools.validate_release" not in text
 
 
-def test_publication_uses_only_complete_package_outputs_on_develop_push():
+def test_addon_validations_has_no_publication_job():
     workflow = load_workflow(WORKFLOWS / "addon-validations.yml")
-    publication = workflow["jobs"]["publication"]
-
-    assert publication["needs"] == "package"
-    assert publication["if"] == (
-        "github.event_name == 'push' && github.ref == 'refs/heads/develop'"
-    )
-    assert publication["uses"] == "./.github/workflows/notify-repository.yml"
-    assert publication["permissions"] == {
-        "actions": "read",
-        "contents": "read",
-        "id-token": "write",
-    }
-    assert publication["with"] == {
-        "addon_id": "plugin.video.gronkhtv",
-        "addon_version": "${{ needs.package.outputs.addon_version }}",
-        "asset_name": "${{ needs.package.outputs.asset_name }}",
-        "artifact_sha256": "${{ needs.package.outputs.artifact_sha256 }}",
-        "publication_id": "${{ needs.package.outputs.publication_id }}",
-    }
-    assert all(publication["with"].values())
-    assert publication["secrets"] == {
-        "REPO_DISPATCH_TOKEN": "${{ secrets.REPO_DISPATCH_TOKEN }}"
-    }
-    assert "runs-on" not in publication
-    assert "steps" not in publication
+    assert "publication" not in workflow["jobs"]
 
 
 def test_local_notifier_is_a_strict_pinned_reusable_wrapper():
@@ -318,7 +295,10 @@ def test_local_notifier_is_a_strict_pinned_reusable_wrapper():
     workflow = load_workflow(path)
     call = workflow["on"]["workflow_call"]
     job = workflow["jobs"]["notify-repository"]
-    package_inputs = {
+    expected_inputs = {
+        "validation_run_id",
+        "validation_head_sha",
+        "validation_event",
         "addon_id",
         "addon_version",
         "asset_name",
@@ -326,11 +306,17 @@ def test_local_notifier_is_a_strict_pinned_reusable_wrapper():
         "publication_id",
     }
 
-    assert set(call["inputs"]) == package_inputs
+    assert set(call["inputs"]) == expected_inputs
     assert all(
-        spec == {"required": "true", "type": "string"}
+        spec in (
+            {"required": "true", "type": "string"},
+            {"required": "true", "type": "number"},
+        )
         for spec in call["inputs"].values()
     )
+    assert call["inputs"]["validation_run_id"]["type"] == "number"
+    assert call["inputs"]["validation_head_sha"]["type"] == "string"
+    assert call["inputs"]["validation_event"]["type"] == "string"
     assert call["secrets"] == {
         "REPO_DISPATCH_TOKEN": {"required": "true"}
     }
@@ -342,11 +328,11 @@ def test_local_notifier_is_a_strict_pinned_reusable_wrapper():
     }
     assert job["with"] == {
         "source_repository": "${{ github.repository }}",
-        "candidate_sha": "${{ github.sha }}",
-        "validation_run_id": "${{ github.run_id }}",
+        "candidate_sha": "${{ inputs.validation_head_sha }}",
+        "validation_run_id": "${{ inputs.validation_run_id }}",
         "validation_workflow": "Add-on Validations",
         "validation_workflow_path": ".github/workflows/addon-validations.yml",
-        "validation_event": "${{ github.event_name }}",
+        "validation_event": "${{ inputs.validation_event }}",
         "expected_branch": "develop",
         "addon_id": "${{ inputs.addon_id }}",
         "addon_version": "${{ inputs.addon_version }}",
@@ -496,11 +482,73 @@ def test_pinned_notifier_owns_pagination_identity_and_metadata_only_payload():
     assert "does not match immutable notifier input" in source
 
 
+def test_publication_decoupled_from_validations_run():
+    publication_wf = (WORKFLOWS / "addon-publication.yml").read_text(
+        encoding="utf-8"
+    )
+    publication = load_workflow(WORKFLOWS / "addon-publication.yml")
+    assert publication["on"]["workflow_run"]["workflows"] == [
+        "Add-on Validations"
+    ]
+    assert (
+        "github.event.workflow_run.conclusion == 'success'" in publication_wf
+    )
+    assert (
+        "github.event.workflow_run.event == 'push'" in publication_wf
+    )
+    assert "github.event.workflow_run.head_branch == 'develop'" in publication_wf
+    assert "workflow_run" not in publication["on"].get("push", {})
+    assert "workflow_run" not in publication["on"].get("pull_request", {})
+
+    notify_call = publication["jobs"]["notify"]
+    assert notify_call["uses"] == "./.github/workflows/notify-repository.yml"
+    assert notify_call["with"]["validation_run_id"] == (
+        "${{ github.event.workflow_run.id }}"
+    )
+    assert notify_call["with"]["validation_head_sha"] == (
+        "${{ github.event.workflow_run.head_sha }}"
+    )
+    assert "github.run_id" not in str(notify_call["with"].values())
+    assert "github.sha" not in str(notify_call["with"].values())
+
+    addon_validations = load_workflow(WORKFLOWS / "addon-validations.yml")
+    assert "publication" not in addon_validations["jobs"]
+
+
+def test_addon_publication_pins_third_party_actions_to_immutable_sha():
+    """Every third-party action reference in addon-publication.yml must use a full 40-char SHA."""
+    text = (WORKFLOWS / "addon-publication.yml").read_text(encoding="utf-8")
+    mutable = re.compile(r"uses:\s+\S+@v\d+\b")
+    match = mutable.search(text)
+    assert match is None, f"mutable tag reference found: {match.group()}"
+    assert "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093" in text
+
+
+def test_local_notifier_accepts_and_forwards_validation_identity():
+    path = WORKFLOWS / "notify-repository.yml"
+    text = path.read_text(encoding="utf-8")
+    workflow = load_workflow(path)
+    call = workflow["on"]["workflow_call"]
+    job = workflow["jobs"]["notify-repository"]
+    assert "validation_run_id" in call["inputs"]
+    assert "validation_head_sha" in call["inputs"]
+    assert "validation_event" in call["inputs"]
+    assert call["inputs"]["validation_run_id"]["type"] == "number"
+    assert call["inputs"]["validation_head_sha"]["type"] == "string"
+    assert call["inputs"]["validation_event"]["type"] == "string"
+    assert "github.run_id" not in text
+    assert "github.sha" not in text
+    assert job["with"]["validation_run_id"] == "${{ inputs.validation_run_id }}"
+    assert job["with"]["candidate_sha"] == "${{ inputs.validation_head_sha }}"
+    assert job["with"]["validation_event"] == "${{ inputs.validation_event }}"
+    assert "github.event.workflow_run" not in text
+
+
 def test_local_callers_keep_dispatch_and_package_bytes_target_owned():
     local = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (
-            WORKFLOWS / "addon-validations.yml",
+            WORKFLOWS / "addon-publication.yml",
             WORKFLOWS / "notify-repository.yml",
         )
     )
