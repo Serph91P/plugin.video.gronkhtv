@@ -13,14 +13,15 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 REUSABLE_REPOSITORY = "Serph91P/repository.serph91p"
-REUSABLE_PIN = "7adff881ab5d0a7fc63f7474a78b2688e2e6eee4"
+PACKAGE_PIN = "7adff881ab5d0a7fc63f7474a78b2688e2e6eee4"
+NOTIFIER_PIN = "5afd718564c0d55a914978e43aafd34c92a53029"
 PACKAGE_WORKFLOW = (
     f"{REUSABLE_REPOSITORY}/.github/workflows/"
-    f"reusable-addon-package.yml@{REUSABLE_PIN}"
+    f"reusable-addon-package.yml@{PACKAGE_PIN}"
 )
 NOTIFIER_WORKFLOW = (
     f"{REUSABLE_REPOSITORY}/.github/workflows/"
-    f"reusable-notify-repository.yml@{REUSABLE_PIN}"
+    f"reusable-notify-repository.yml@{NOTIFIER_PIN}"
 )
 
 
@@ -29,17 +30,17 @@ def load_workflow(path):
 
 
 @cache
-def pinned_text(path):
+def pinned_text(path, pin):
     url = (
         f"https://raw.githubusercontent.com/{REUSABLE_REPOSITORY}/"
-        f"{REUSABLE_PIN}/{path}"
+        f"{pin}/{path}"
     )
     with urllib.request.urlopen(url, timeout=30) as response:
         return response.read().decode("utf-8")
 
 
-def load_pinned_workflow(path):
-    return yaml.load(pinned_text(path), Loader=yaml.BaseLoader)
+def load_pinned_workflow(path, pin):
+    return yaml.load(pinned_text(path, pin), Loader=yaml.BaseLoader)
 
 
 def assigned_literal(source, name):
@@ -353,7 +354,7 @@ def test_local_notifier_is_a_strict_pinned_reusable_wrapper():
 
 def test_pinned_package_contract_and_retention_are_exact():
     workflow = load_pinned_workflow(
-        ".github/workflows/reusable-addon-package.yml"
+        ".github/workflows/reusable-addon-package.yml", PACKAGE_PIN
     )
     call = workflow["on"]["workflow_call"]
     steps = workflow["jobs"]["package"]["steps"]
@@ -385,7 +386,7 @@ def test_pinned_package_contract_and_retention_are_exact():
 
 def test_pinned_notifier_requires_complete_fail_closed_identity():
     workflow = load_pinned_workflow(
-        ".github/workflows/reusable-notify-repository.yml"
+        ".github/workflows/reusable-notify-repository.yml", NOTIFIER_PIN
     )
     call = workflow["on"]["workflow_call"]
     required_inputs = {
@@ -429,7 +430,7 @@ def test_pinned_notifier_requires_complete_fail_closed_identity():
 
 
 def test_pinned_notifier_owns_pagination_identity_and_metadata_only_payload():
-    source = pinned_text("addon-publication/notify_repository.py")
+    source = pinned_text("addon-publication/notify_repository.py", NOTIFIER_PIN)
 
     assert assigned_literal(source, "INPUT_FIELDS") == (
         "source_repository",
@@ -460,7 +461,7 @@ def test_pinned_notifier_owns_pagination_identity_and_metadata_only_payload():
     assert "def _next_link(" in source
     assert "def find_required_artifacts(" in source
     assert "must occur exactly once" in source
-    assert "artifact retention must be exactly 30 days" in source
+    assert "artifact retention is outside the accepted range" in source
     assert "def validate_inputs(" in source
     assert "def validate_run(" in source
     assert "def validate_evidence(" in source
@@ -562,5 +563,33 @@ def test_local_callers_keep_dispatch_and_package_bytes_target_owned():
         "actions/upload-artifact",
         "build_package(",
         "validation-evidence.json",
+        "secrets: inherit",
     ):
         assert forbidden not in local
+
+
+def test_local_workflows_forbid_secrets_inherit_and_forward_only_dispatch_token():
+    publication = (WORKFLOWS / "addon-publication.yml").read_text(encoding="utf-8")
+    notifier = (WORKFLOWS / "notify-repository.yml").read_text(encoding="utf-8")
+
+    assert "secrets: inherit" not in publication
+    assert "secrets: inherit" not in notifier
+
+    pub_workflow = load_workflow(WORKFLOWS / "addon-publication.yml")
+    notify_call = pub_workflow["jobs"]["notify"]
+    assert "secrets" in notify_call
+    assert set(notify_call["secrets"]) == {"REPO_DISPATCH_TOKEN"}
+    assert notify_call["secrets"]["REPO_DISPATCH_TOKEN"] == (
+        "${{ secrets.REPO_DISPATCH_TOKEN }}"
+    )
+
+    notifier_workflow = load_workflow(WORKFLOWS / "notify-repository.yml")
+    notifier_job = notifier_workflow["jobs"]["notify-repository"]
+    assert "secrets" in notifier_job
+    assert set(notifier_job["secrets"]) == {"REPO_DISPATCH_TOKEN"}
+    assert notifier_job["secrets"]["REPO_DISPATCH_TOKEN"] == (
+        "${{ secrets.REPO_DISPATCH_TOKEN }}"
+    )
+
+    assert publication.count("${{ secrets.") == 1
+    assert notifier.count("${{ secrets.") == 1
