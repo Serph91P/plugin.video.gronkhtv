@@ -34,11 +34,13 @@ jobs:
       - name: Extract metadata
         id: evidence
         run: |
-          FILE=$(ls *.json)
-          echo "addon_version=$(jq -r .addon_version "$FILE")" >> "$GITHUB_OUTPUT"
-          echo "asset_name=$(jq -r .asset_name "$FILE")" >> "$GITHUB_OUTPUT"
-          echo "artifact_sha256=$(jq -r .artifact_sha256 "$FILE")" >> "$GITHUB_OUTPUT"
-          echo "publication_id=$(jq -r .publication_id "$FILE")" >> "$GITHUB_OUTPUT"
+          FILE=$(ls ./*.json)
+          {
+            echo "addon_version=$(jq -r .addon_version "$FILE")"
+            echo "asset_name=$(jq -r .asset_name "$FILE")"
+            echo "artifact_sha256=$(jq -r .artifact_sha256 "$FILE")"
+            echo "publication_id=$(jq -r .publication_id "$FILE")"
+          } >> "$GITHUB_OUTPUT"
 
   notify:
     name: Publish Validated Package
