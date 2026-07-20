@@ -1,6 +1,4 @@
 import ast
-import hashlib
-import json
 import re
 import urllib.request
 import zipfile
@@ -233,30 +231,42 @@ def test_validated_package_contains_only_runtime_files(tmp_path):
         assert archive.namelist() == info["members"]
 
 
-def test_validation_evidence_binds_candidate_and_package(tmp_path):
-    from tools.validate_release import load_validation_evidence, write_validation_evidence
+def test_local_validate_release_module_is_dead_code():
+    """GREEN: tools/validate_release.py is gone; production uses the pinned reusable workflow."""
+    dead_module = ROOT / "tools" / "validate_release.py"
+    assert not dead_module.exists(), (
+        "tools/validate_release.py must not exist after dead-code removal"
+    )
 
-    package = tmp_path / "plugin.video.gronkhtv-1.2.3.zip"
-    package.write_bytes(b"validated package")
-    checksum = hashlib.sha256(package.read_bytes()).hexdigest()
-    candidate = "a" * 40
-    evidence = {
-        "candidate_sha": candidate,
-        "validation_run_id": "12345",
-        "validation_head_sha": candidate,
-        "addon_id": "plugin.video.gronkhtv",
-        "addon_version": "1.2.3",
-        "asset_name": package.name,
-        "artifact_sha256": checksum,
-        "tag": "",
-        "publication_id": "plugin.video.gronkhtv@1.2.3",
-    }
-    evidence_path = tmp_path / "validation-evidence.json"
 
-    write_validation_evidence(evidence_path, evidence)
+def test_evidence_fields_match_notifier_contract():
+    source = pinned_text("addon-publication/notify_repository.py", NOTIFIER_PIN)
+    assert "def validate_evidence(" in source
+    for field in (
+        "candidate_sha",
+        "validation_run_id",
+        "validation_head_sha",
+        "addon_id",
+        "addon_version",
+        "asset_name",
+        "artifact_sha256",
+        "publication_id",
+    ):
+        assert f'"{field}"' in source or f"'{field}'" in source, (
+            f"pinned notifier must validate field {field}"
+        )
 
-    assert load_validation_evidence(evidence_path) == evidence
-    assert json.loads(evidence_path.read_text(encoding="utf-8")) == evidence
+
+def test_evidence_json_roundtrip_matches_notifier_schema():
+    """The evidence JSON schema is defined by the pinned reusable workflow, not a local helper."""
+    source = pinned_text("addon-publication/notify_repository.py", NOTIFIER_PIN)
+    assert '"tag"' in source or "'tag'" in source, (
+        "pinned notifier must handle the tag field"
+    )
+    assert "candidate SHA must be 40 lowercase hexadecimal characters" in source
+    assert "artifact SHA-256 must be 64 lowercase hexadecimal characters" in source
+    assert "publication ID does not match configured identity" in source
+    assert "package filename does not match configured identity" in source
 
 
 def test_addon_validations_calls_pinned_package_only_for_develop_push():
