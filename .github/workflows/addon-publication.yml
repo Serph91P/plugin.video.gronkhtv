@@ -1,0 +1,63 @@
+name: Add-on Publication
+
+on:
+  workflow_run:
+    workflows: [Add-on Validations]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    name: Extract Validation Metadata
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'develop'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      addon_version: ${{ steps.evidence.outputs.addon_version }}
+      asset_name: ${{ steps.evidence.outputs.asset_name }}
+      artifact_sha256: ${{ steps.evidence.outputs.artifact_sha256 }}
+      publication_id: ${{ steps.evidence.outputs.publication_id }}
+    steps:
+      - name: Download validation evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: validation-evidence
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Extract metadata
+        id: evidence
+        run: |
+          FILE=$(ls ./*.json)
+          {
+            echo "addon_version=$(jq -r .addon_version "$FILE")"
+            echo "asset_name=$(jq -r .asset_name "$FILE")"
+            echo "artifact_sha256=$(jq -r .artifact_sha256 "$FILE")"
+            echo "publication_id=$(jq -r .publication_id "$FILE")"
+          } >> "$GITHUB_OUTPUT"
+
+  notify:
+    name: Publish Validated Package
+    needs: extract
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/notify-repository.yml
+    with:
+      validation_run_id: ${{ github.event.workflow_run.id }}
+      validation_head_sha: ${{ github.event.workflow_run.head_sha }}
+      validation_event: ${{ github.event.workflow_run.event }}
+      addon_id: plugin.video.gronkhtv
+      addon_version: ${{ needs.extract.outputs.addon_version }}
+      asset_name: ${{ needs.extract.outputs.asset_name }}
+      artifact_sha256: ${{ needs.extract.outputs.artifact_sha256 }}
+      publication_id: ${{ needs.extract.outputs.publication_id }}
+    secrets:
+      REPO_DISPATCH_TOKEN: ${{ secrets.REPO_DISPATCH_TOKEN }}

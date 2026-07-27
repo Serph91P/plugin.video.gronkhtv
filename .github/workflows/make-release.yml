@@ -35,8 +35,7 @@ jobs:
       - name: Get version and check tag
         id: version
         run: |
-          version="$(xmlstarlet sel -t -v 'string(/addon/@version)' addon.xml)"
-          # shellcheck disable=SC2086
+          version=$(python -c 'from pathlib import Path; from scripts.build_release import parse_addon_xml; print(parse_addon_xml(Path("addon.xml"))[1])')
           filename=${{ github.event.repository.name }}-${version}.zip
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "filename=$filename" >> "$GITHUB_OUTPUT"
@@ -48,11 +47,9 @@ jobs:
           fi
 
           if gh api "repos/${{ github.repository }}/releases/tags/v$version" --jq '.assets[].name' 2>/dev/null | grep -Fxq -- "$filename"; then
-            # shellcheck disable=SC2086
-            echo "asset_exists=true" >> $GITHUB_OUTPUT
+            echo "asset_exists=true" >> "$GITHUB_OUTPUT"
           else
-            # shellcheck disable=SC2086
-            echo "asset_exists=false" >> $GITHUB_OUTPUT
+            echo "asset_exists=false" >> "$GITHUB_OUTPUT"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,7 +59,9 @@ jobs:
         id: create-zip
         run: |
           filename=${{ steps.version.outputs.filename }}
-          python scripts/build_release.py --source . --output "${GITHUB_WORKSPACE}/${filename}" --expected-version "${{ steps.version.outputs.version }}"
+          package_source=$(mktemp -d)
+          cp -a -- addon.xml addon.py resources "$package_source/"
+          python scripts/build_release.py --source "$package_source" --output "${GITHUB_WORKSPACE}/${filename}" --expected-version "${{ steps.version.outputs.version }}"
           echo "filename=$filename" >> "$GITHUB_OUTPUT"
 
       - name: Verify Zip
