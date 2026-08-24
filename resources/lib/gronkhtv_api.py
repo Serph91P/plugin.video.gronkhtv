@@ -9,6 +9,7 @@ from account import AuthenticationError
 API_BASE = "https://backend.gronkh.tv/v3"
 _TIMEOUT = 10
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+_MAX_URL_DECODE_ROUNDS = 4
 DEFAULT_HEADERS = {
     "User-Agent": _UA,
     "Accept": "application/json",
@@ -190,12 +191,15 @@ def _relative_api_path(path):
     if not isinstance(path, str) or not path:
         raise ValueError("GronkhTV requests require a relative API path")
     parsed = urlsplit(path)
-    decoded_path = unquote(parsed.path)
+    decoded_path = _repeated_unquote(parsed.path)
     if (
         parsed.scheme
         or parsed.netloc
         or parsed.fragment
+        or "#" in path
         or "\\" in decoded_path
+        or "//" in decoded_path
+        or decoded_path.count("/") != parsed.path.count("/")
         or any(part == ".." for part in decoded_path.split("/"))
     ):
         raise ValueError("GronkhTV requests require a relative API path")
@@ -204,18 +208,43 @@ def _relative_api_path(path):
 
 
 def _v3_url(url):
+    if not isinstance(url, str):
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin")
     parsed = urlsplit(url)
-    decoded_path = unquote(parsed.path)
+    decoded_path = _repeated_unquote(parsed.path)
     if (
         parsed.scheme != "https"
         or parsed.netloc != "backend.gronkh.tv"
-        or not parsed.path.startswith("/v3/")
+        or "?" in url
+        or "#" in url
         or parsed.fragment
         or "\\" in decoded_path
+        or "//" in decoded_path
+        or decoded_path.count("/") != parsed.path.count("/")
         or any(part == ".." for part in decoded_path.split("/"))
     ):
         raise ValueError("Playlist URL must use the GronkhTV v3 origin")
-    return url
+    parts = parsed.path.split("/")
+    if (
+        len(parts) != 5
+        or parts[:3] != ["", "v3", "videos"]
+        or parts[4] != "playlist"
+    ):
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin")
+    try:
+        video_id = str(UUID(parts[3]))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin") from exc
+    return f"{API_BASE}/videos/{video_id}/playlist"
+
+
+def _repeated_unquote(value):
+    for _ in range(_MAX_URL_DECODE_ROUNDS):
+        decoded = unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value
 
 
 def _positive_int(value, name):

@@ -1321,6 +1321,12 @@ def _seek_to_offset(player, offset, timeout=10, tolerance=3, expected_path=None)
                     xbmc.sleep(100)
                     continue
                 duration = float(player.getTotalTime())
+                if math.isfinite(duration) and duration > 0 and offset > duration:
+                    xbmc.log(
+                        f"[Gronkh.tv] Offset {offset} exceeds duration {duration}",
+                        xbmc.LOGWARNING,
+                    )
+                    return False
                 position = float(player.getTime())
                 seekable = (
                     math.isfinite(duration)

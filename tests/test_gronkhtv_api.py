@@ -414,3 +414,84 @@ def test_video_by_episode_rejects_non_positive_integer_before_request(episode, m
 def test_playlist_url_rejects_external_or_unsafe_api_values(video):
     with pytest.raises(ValueError, match="GronkhTV v3 origin"):
         playlist_url_for_video(video)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/videos//search",
+        "/videos%2Fsearch",
+        "/videos%252Fsearch",
+        "/videos\\search",
+        "/videos%5Csearch",
+        "/videos/%2e%2e/users/self",
+        "/videos/%252e%252e/users/self",
+        "//attacker.invalid/videos/search",
+        "https:videos/search",
+        "https://attacker.invalid/videos/search",
+        "/videos/search#fragment",
+        "/videos/search#",
+    ],
+)
+def test_get_json_rejects_encoded_or_authority_paths_before_request(path, monkeypatch):
+    calls = []
+
+    class FakeSession:
+        def request_json(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(gronkhtv_api, "_account_session", FakeSession())
+    monkeypatch.setattr(
+        gronkhtv_api,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("public request reached for invalid path"),
+    )
+
+    with pytest.raises(ValueError, match="relative API path"):
+        gronkhtv_api.get_json(path)
+
+    assert calls == []
+
+
+def test_relative_api_path_preserves_valid_v3_routes_and_query():
+    assert gronkhtv_api._relative_api_path("/videos/search") == "/videos/search"
+    assert (
+        gronkhtv_api._relative_api_path("/categories/minecraft/videos?page=3")
+        == "/categories/minecraft/videos?page=3"
+    )
+
+
+def test_playlist_url_canonicalizes_uppercase_uuid_from_api_value():
+    playlist = "https://backend.gronkh.tv/v3/videos/CBE1AFD0-C240-4C74-BA0A-0307A093FF9B/playlist"
+
+    assert playlist_url_for_video({"urls": {"playlist": playlist}}) == (
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist"
+    )
+
+
+def test_playlist_url_constructed_from_uppercase_uuid_remains_valid():
+    assert playlist_url_for_video({"id": "CBE1AFD0-C240-4C74-BA0A-0307A093FF9B"}) == (
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist"
+    )
+
+
+@pytest.mark.parametrize(
+    "playlist",
+    [
+        "https://user@backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist",
+        "https://backend.gronkh.tv:443/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist?token=secret",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist?",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist#fragment",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist#",
+        "https://backend.gronkh.tv/v3//videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b%2Fplaylist",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b%252Fplaylist",
+        "https://backend.gronkh.tv/v3/videos/cbe1afd0-c240-4c74-ba0a-0307a093ff9b\\playlist",
+        "https://backend.gronkh.tv/v3/videos/%252e%252e/cbe1afd0-c240-4c74-ba0a-0307a093ff9b/playlist",
+        "https://backend.gronkh.tv/v3/videos/not-a-uuid/playlist",
+    ],
+)
+def test_playlist_url_rejects_noncanonical_v3_values(playlist):
+    with pytest.raises(ValueError, match="GronkhTV v3 origin"):
+        playlist_url_for_video({"urls": {"playlist": playlist}})

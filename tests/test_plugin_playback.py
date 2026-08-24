@@ -228,6 +228,15 @@ def test_verified_seek_performs_only_one_bounded_retry(plugin, monkeypatch):
     assert player.seek_calls == [120.0, 120.0]
 
 
+def test_verified_seek_rejects_offset_beyond_known_duration_before_seek(plugin, monkeypatch):
+    _install_clock(plugin, monkeypatch)
+    player = FakeSeekPlayer()
+
+    assert plugin._seek_to_offset(player, 301, timeout=1, tolerance=2) is False
+
+    assert player.seek_calls == []
+
+
 def test_jump_to_chapter_reports_error_when_seek_cannot_be_verified(plugin, monkeypatch):
     _install_clock(plugin, monkeypatch)
     player = FakeSeekPlayer(seek_succeeds=False)
