@@ -1,6 +1,7 @@
 import json
+from uuid import UUID
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from account import AuthenticationError
@@ -21,6 +22,7 @@ def configure_account_session(session):
 
 
 def get_json(path, method="GET", payload=None):
+    path = _relative_api_path(path)
     if _account_session is not None:
         try:
             return _account_session.request_json(path, method=method, payload=payload)
@@ -102,16 +104,21 @@ def normalize_chapter(chapter):
 
 
 def video_by_episode(episode):
+    episode = _positive_int(episode, "episode")
     return normalize_video(unwrap_data(get_json(f"/videos/episode/{episode}")))
 
 
 def playlist_url_for_video(video):
     normalized = normalize_video(video)
     if normalized["playlist_url"]:
-        return normalized["playlist_url"]
+        return _v3_url(normalized["playlist_url"])
     video_id = normalized.get("id")
     if not video_id:
         return ""
+    try:
+        video_id = str(UUID(str(video_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin") from exc
     return f"{API_BASE}/videos/{video_id}/playlist"
 
 
@@ -175,9 +182,52 @@ def normalize_live_stream(stream):
 
 
 def _make_url(path):
-    if path.startswith("http://") or path.startswith("https://"):
-        return path
-    return f"{API_BASE}{path if path.startswith('/') else '/' + path}"
+    path = _relative_api_path(path)
+    return f"{API_BASE}{path}"
+
+
+def _relative_api_path(path):
+    if not isinstance(path, str) or not path:
+        raise ValueError("GronkhTV requests require a relative API path")
+    parsed = urlsplit(path)
+    decoded_path = unquote(parsed.path)
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.fragment
+        or "\\" in decoded_path
+        or any(part == ".." for part in decoded_path.split("/"))
+    ):
+        raise ValueError("GronkhTV requests require a relative API path")
+    normalized_path = parsed.path if parsed.path.startswith("/") else f"/{parsed.path}"
+    return normalized_path + (f"?{parsed.query}" if parsed.query else "")
+
+
+def _v3_url(url):
+    parsed = urlsplit(url)
+    decoded_path = unquote(parsed.path)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "backend.gronkh.tv"
+        or not parsed.path.startswith("/v3/")
+        or parsed.fragment
+        or "\\" in decoded_path
+        or any(part == ".." for part in decoded_path.split("/"))
+    ):
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin")
+    return url
+
+
+def _positive_int(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
 
 
 def _search_payload(query=None, page=None):

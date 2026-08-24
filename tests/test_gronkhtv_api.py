@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "resources" / "lib"
 if str(LIB) not in sys.path:
@@ -15,9 +17,11 @@ from gronkhtv_api import (  # noqa: E402
     normalize_chapter,
     normalize_live_stream,
     normalize_video,
+    playlist_url_for_video,
     search_categories,
     search_videos,
     unwrap_data,
+    video_by_episode,
 )
 
 
@@ -327,3 +331,86 @@ def test_get_json_falls_back_to_public_request_for_expired_account_session(monke
 
     assert result == {"data": [{"id": "public-video"}]}
     assert calls == [("/videos/discovery/newest", "GET", None)]
+
+
+def test_video_by_episode_uses_exact_v3_request_and_normalizes(monkeypatch):
+    requests = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return ('{"data": ' + __import__("json").dumps(VIDEO_PAYLOAD) + "}").encode()
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(gronkhtv_api, "_account_session", None)
+    monkeypatch.setattr(gronkhtv_api, "urlopen", fake_urlopen)
+
+    video = video_by_episode(1105)
+
+    request, timeout = requests[0]
+    assert request.full_url == "https://backend.gronkh.tv/v3/videos/episode/1105"
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert request.get_header("Accept") == "application/json"
+    assert request.get_header("User-agent") == gronkhtv_api.DEFAULT_HEADERS["User-Agent"]
+    assert timeout == 10
+    assert video["episode"] == 1105
+    assert video["chapters"][0]["title"] == "Intro"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "https://attacker.invalid/videos/episode/1",
+        "http://backend.gronkh.tv/v3/videos/episode/1",
+        "//attacker.invalid/videos/episode/1",
+        "/../users/self",
+    ],
+)
+def test_get_json_rejects_urls_outside_fixed_v3_origin_before_session(path, monkeypatch):
+    calls = []
+
+    class FakeSession:
+        def request_json(self, path, method="GET", payload=None):
+            calls.append((path, method, payload))
+
+    monkeypatch.setattr(gronkhtv_api, "_account_session", FakeSession())
+
+    with pytest.raises(ValueError, match="relative API path"):
+        gronkhtv_api.get_json(path)
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("episode", [None, "", "0", 0, -1, "1.5", "abc", True])
+def test_video_by_episode_rejects_non_positive_integer_before_request(episode, monkeypatch):
+    monkeypatch.setattr(
+        gronkhtv_api,
+        "get_json",
+        lambda path: pytest.fail(f"request reached for invalid episode: {path}"),
+    )
+
+    with pytest.raises(ValueError, match="positive integer"):
+        video_by_episode(episode)
+
+
+@pytest.mark.parametrize(
+    "video",
+    [
+        {"urls": {"playlist": "https://attacker.invalid/stream.m3u8"}},
+        {"urls": {"playlist": "http://backend.gronkh.tv/v3/videos/id/playlist"}},
+        {"urls": {"playlist": "https://backend.gronkh.tv/videos/id/playlist"}},
+        {"id": "../../users/self"},
+    ],
+)
+def test_playlist_url_rejects_external_or_unsafe_api_values(video):
+    with pytest.raises(ValueError, match="GronkhTV v3 origin"):
+        playlist_url_for_video(video)
