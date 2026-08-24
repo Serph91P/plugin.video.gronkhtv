@@ -6,6 +6,7 @@ import xbmcgui
 import xbmcplugin
 from urllib.request import build_opener, install_opener
 import json
+import math
 from functools import lru_cache
 import time
 import xbmcvfs
@@ -32,6 +33,7 @@ from gronkhtv_api import (
 )
 from live import twitch_plugin_entries, twitch_plugin_url
 from playback import configure_authenticated_hls
+from resume_store import is_completed, read_record, remove_record, write_record
 
 # Plugin constants
 _URL = sys.argv[0]
@@ -57,6 +59,7 @@ _CATEGORIES = [
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _SEARCH_PAGE_SIZE = 20
+_MAX_CHAPTER_ROUTE_OFFSET = 31536000
 
 # Addon data paths
 _ADDON_DATA = xbmcvfs.translatePath(
@@ -547,6 +550,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
     for video in videos:
         list_item = xbmcgui.ListItem(label=video["title"])
         ep = video["episode"]
+        video_duration = video.get("video_length", 0)
 
         # Thumbnails/Artwork setzen
         preview_url = video.get("preview_url", "")
@@ -566,13 +570,12 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         games_in_stream = []
 
         for c in chapters:
-            title = c.get("title") or "Unbenanntes Kapitel"
-            chapter_offset = int(c.get("offset"))
+            title, chapter_offset = _chapter_values(c)
             position = seconds_to_time(chapter_offset)
             cm.append(
                 (
                     chapter_label(position, title),
-                    f"RunPlugin(plugin://plugin.video.gronkhtv/?action=jump_to_chapter&episode={ep}&offset={chapter_offset})",
+                    f"RunPlugin(plugin://plugin.video.gronkhtv/?action=jump_to_chapter&episode={ep}&offset={chapter_offset:g})",
                 )
             )
             chapters_content.append(f"[{position}]: {title}")
@@ -582,7 +585,9 @@ def list_videos(category, offset=0, search_str="", game_id=None):
                 games_in_stream.append(game.get("title"))
 
         # Kontextmenü für Resume hinzufügen
-        resume_point = get_resume_point(ep)
+        resume_record = get_resume_record(ep, legacy_duration=video_duration)
+        resume_point = resume_record["position"] if resume_record else 0
+        resume_duration = resume_record["duration"] if resume_record else video_duration
         if resume_point > 60:  # Nur anzeigen wenn mehr als 1 Minute geschaut
             cm.insert(
                 0,
@@ -656,7 +661,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         if games_in_stream:
             plot_parts.append(f"Spiele: {', '.join(games_in_stream)}")
         if resume_point > 60:
-            progress = (resume_point / video.get("video_length", 1)) * 100
+            progress = (resume_point / resume_duration) * 100 if resume_duration else 0
             plot_parts.append(
                 f"Fortschritt: {progress:.1f}% ({seconds_to_time(int(resume_point))})"
             )
@@ -680,7 +685,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
 
         # Resume-Fortschritt setzen für Fortschrittsbalken
         if resume_point > 0:
-            tag.setResumePoint(resume_point, video.get("video_length", 0))
+            tag.setResumePoint(resume_point, resume_duration)
 
         list_item.setProperty("IsPlayable", "true")
         url = get_url(action="play", video=video["episode"])
@@ -797,8 +802,9 @@ def show_video_details(episode):
         f"[B]Kapitel ({len(chapters)}):[/B]",
     ]
     for ch in chapters:
-        offset = seconds_to_time(ch.get("offset", 0))
-        details.append(f"  [{offset}] {ch.get('title', '?')}")
+        title, chapter_offset = _chapter_values(ch)
+        offset = seconds_to_time(chapter_offset)
+        details.append(f"  [{offset}] {title}")
 
     if prev_ep:
         details.append(f"\n[B]Vorherige Episode:[/B] {prev_ep.get('title', '?')}")
@@ -812,6 +818,7 @@ def show_video_details(episode):
 
 def play_video(path, episode, start_offset=0):
     """Spielt ein Video ab mit Auto-Next Unterstützung"""
+    start_offset = _non_negative_finite(start_offset, "offset")
     xbmc.log(f"[Gronkh.tv] Playing video: {path}, episode: {episode}", xbmc.LOGINFO)
 
     # Video-Info holen für nächste Episode
@@ -839,7 +846,8 @@ def play_video(path, episode, start_offset=0):
     tag.setEpisode(int(episode))
     tag.setMediaType("video")
 
-    resume_point = get_resume_point(episode)
+    resume_record = get_resume_record(episode, legacy_duration=video_length)
+    resume_point = resume_record["position"] if resume_record else 0
     xbmc.log(f"[Gronkh.tv] Resume point: {resume_point}", xbmc.LOGINFO)
 
     # Start-Offset (für Kapitel-Sprung oder Resume)
@@ -859,45 +867,56 @@ def monitor_playback(episode, next_episode=None):
     player = xbmc.Player()
     monitor = xbmc.Monitor()
 
-    # Warten bis Wiedergabe startet
-    timeout = 0
-    while not player.isPlayingVideo() and timeout < 100:
-        xbmc.sleep(100)
-        timeout += 1
+    for _ in range(100):
+        if player.isPlayingVideo():
+            break
+        if monitor.waitForAbort(0.1):
+            return
 
     if not player.isPlayingVideo():
         xbmc.log("[Gronkh.tv] Playback did not start", xbmc.LOGWARNING)
         return
 
-    last_time = 0
-    total_time = 0
+    latest = None
+    next_save = time.monotonic() + 5
 
-    while player.isPlayingVideo() and not monitor.abortRequested():
-        try:
-            current_time = player.getTime()
-            total_time = player.getTotalTime()
-            last_time = current_time
+    try:
+        while player.isPlayingVideo() and not monitor.abortRequested():
+            try:
+                current_time = _non_negative_finite(player.getTime(), "player time")
+                total_time = _non_negative_finite(
+                    player.getTotalTime(), "player duration"
+                )
+                if latest is None or current_time > 0 or latest["position"] == 0:
+                    if latest and total_time == 0 and latest["duration"] > 0:
+                        total_time = latest["duration"]
+                    latest = {"position": current_time, "duration": total_time}
 
-            # Alle 5 Sekunden speichern (statt jede Sekunde)
-            if int(current_time) % 5 == 0:
-                save_resume_point(episode, current_time, total_time)
-        except Exception as e:
+                now = time.monotonic()
+                if latest and now >= next_save:
+                    save_resume_point(
+                        episode, latest["position"], latest["duration"]
+                    )
+                    next_save = now + 5
+            except Exception as exc:
+                xbmc.log(
+                    f"[Gronkh.tv] Error in playback monitor: {exc}",
+                    xbmc.LOGWARNING,
+                )
+            if monitor.waitForAbort(1):
+                break
+    finally:
+        if latest:
+            save_resume_point(episode, latest["position"], latest["duration"])
             xbmc.log(
-                f"[Gronkh.tv] Error in playback monitor: {str(e)}", xbmc.LOGWARNING
+                "[Gronkh.tv] Final resume point saved: "
+                f"{latest['position']}/{latest['duration']}",
+                xbmc.LOGINFO,
             )
-        xbmc.sleep(1000)
-
-    # Finalen Fortschritt speichern
-    if last_time > 0:
-        save_resume_point(episode, last_time, total_time)
-        xbmc.log(
-            f"[Gronkh.tv] Final resume point saved: {last_time}/{total_time}",
-            xbmc.LOGINFO,
-        )
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
-    if total_time > 0 and last_time > 0:
-        progress = (last_time / total_time) * 100
+    if latest and latest["duration"] > 0 and latest["position"] > 0:
+        progress = (latest["position"] / latest["duration"]) * 100
         if progress >= 95 and next_episode and next_episode.get("episode"):
             # Automatisch nächste Episode fragen
             next_title = next_episode.get(
@@ -921,39 +940,62 @@ def monitor_playback(episode, next_episode=None):
                 monitor_playback(next_ep)
 
 
-def get_resume_point(episode):
+def _resume_path(episode):
+    episode = _positive_int(episode, "episode")
+    return os.path.join(_RESUME_DIR, f"{episode}.txt")
+
+
+def get_resume_record(episode, legacy_duration=0):
+    path = _resume_path(episode)
     try:
-        resume_file = xbmcvfs.translatePath(
-            f"special://profile/addon_data/plugin.video.gronkhtv/resume_points/{episode}.txt"
-        )
-        if xbmcvfs.exists(resume_file):
-            with xbmcvfs.File(resume_file) as f:
-                content = f.read()
-                return float(content) if content else 0
-        return 0
+        record = read_record(xbmcvfs, path, legacy_duration=legacy_duration)
+        if record and is_completed(record):
+            if not remove_record(xbmcvfs, path):
+                xbmc.log(
+                    f"[Gronkh.tv] Could not remove completed resume record: {path}",
+                    xbmc.LOGERROR,
+                )
+            return None
+        return record
     except Exception as e:
         xbmc.log(
-            f"[Gronkh.tv] Error getting resume point for episode {episode}: {str(e)}",
+            f"[Gronkh.tv] Error getting resume record for episode {episode}: {str(e)}",
             xbmc.LOGERROR,
         )
-        return 0
+        return None
+
+
+def get_resume_point(episode, legacy_duration=0):
+    record = get_resume_record(episode, legacy_duration=legacy_duration)
+    return record["position"] if record else 0
 
 
 def save_resume_point(episode, current_time, total_time):
+    path = _resume_path(episode)
     try:
-        resume_point_dir = xbmcvfs.translatePath(
-            "special://profile/addon_data/plugin.video.gronkhtv/resume_points/"
+        record = {
+            "position": _non_negative_finite(current_time, "resume position"),
+            "duration": _non_negative_finite(total_time, "resume duration"),
+        }
+        existing = get_resume_record(episode, legacy_duration=record["duration"])
+        if existing and existing["position"] > 0 and record["position"] == 0:
+            return False
+        if is_completed(record):
+            return remove_record(xbmcvfs, path)
+        write_record(
+            xbmcvfs,
+            _RESUME_DIR,
+            path,
+            record["position"],
+            record["duration"],
         )
-        if not xbmcvfs.exists(resume_point_dir):
-            xbmcvfs.mkdirs(resume_point_dir)
-
-        with xbmcvfs.File(f"{resume_point_dir}/{episode}.txt", "w") as f:
-            f.write(str(current_time))
+        return True
     except Exception as e:
         xbmc.log(
             f"[Gronkh.tv] Error saving resume point for episode {episode}: {str(e)}",
             xbmc.LOGERROR,
         )
+        return False
 
 
 def get_total_time(episode):
@@ -971,29 +1013,23 @@ def get_total_time(episode):
 
 
 def jump_to_chapter(params):
-    episode = params["episode"]
-    offset = params["offset"]
+    episode = _positive_int(params.get("episode"), "episode")
+    offset = _non_negative_finite(params.get("offset"), "offset")
     xbmc.log(
         f"[Gronkh.tv] Jumping to chapter in episode {episode} at offset {offset}",
         xbmc.LOGINFO,
     )
     player = xbmc.Player()
+    url = get_playlist_url(episode)
+    xbmc.log(f"[Gronkh.tv] Starting playback of {url}", xbmc.LOGINFO)
+    _play_direct(url, player)
 
-    if not player.isPlayingVideo():
-        url = get_playlist_url(episode)
-        xbmc.log(f"[Gronkh.tv] Starting playback of {url}", xbmc.LOGINFO)
-        _play_direct(url, player)
-
-        # Wait for playback to start
-        start_time = time.time()
-        while not player.isPlayingVideo() and time.time() - start_time < 10:
-            xbmc.sleep(100)
-
-    if player.isPlayingVideo():
-        xbmc.log(f"[Gronkh.tv] Seeking to offset {offset}", xbmc.LOGINFO)
-        player.seekTime(float(offset))
-    else:
-        xbmc.log("[Gronkh.tv] Failed to start playback", xbmc.LOGERROR)
+    if _seek_to_offset(player, offset, expected_path=url):
+        monitor_playback(episode)
+        return True
+    _stop_failed_playback(player)
+    _report_seek_failure("Kapitelsprung fehlgeschlagen")
+    return False
 
 
 def router(paramstring):
@@ -1046,12 +1082,13 @@ def handle_listing(params):
 
 
 def handle_play(params):
-    play_video(get_playlist_url(params["video"]), params["video"])
+    episode = _positive_int(params.get("video"), "episode")
+    play_video(get_playlist_url(episode), episode)
 
 
 def handle_add_favorite(params):
     """Fügt ein Video zu den Favoriten hinzu"""
-    episode = int(params["episode"])
+    episode = _positive_int(params.get("episode"), "episode")
     video_data_str = params.get("video_data", "")
     if video_data_str:
         from urllib.parse import unquote
@@ -1076,13 +1113,13 @@ def handle_add_favorite(params):
 
 def handle_remove_favorite(params):
     """Entfernt ein Video aus den Favoriten"""
-    episode = params["episode"]
+    episode = _positive_int(params.get("episode"), "episode")
     remove_from_favorites(episode)
 
 
 def handle_show_details(params):
     """Zeigt Video-Details an"""
-    episode = int(params["episode"])
+    episode = _positive_int(params.get("episode"), "episode")
     show_video_details(episode)
 
 
@@ -1206,30 +1243,27 @@ def handle_list_game_videos(params):
 
 def handle_play_resume(params):
     """Video an gespeicherter Position fortsetzen"""
-    episode = params["episode"]
-    resume_point = get_resume_point(episode)
+    episode = _positive_int(params.get("episode"), "episode")
+    resume_record = get_resume_record(episode)
+    resume_point = resume_record["position"] if resume_record else 0
     url = get_playlist_url(episode)
     player = _play_direct(url)
 
-    # Warten bis Wiedergabe startet
-    start_time = time.time()
-    while not player.isPlayingVideo() and time.time() - start_time < 10:
-        xbmc.sleep(100)
-
-    if player.isPlayingVideo() and resume_point > 0:
-        player.seekTime(float(resume_point))
+    if resume_point > 0 and _seek_to_offset(
+        player, resume_point, expected_path=url
+    ):
+        monitor_playback(episode)
+        return True
+    _stop_failed_playback(player)
+    _report_seek_failure("Fortsetzen fehlgeschlagen")
+    return False
 
 
 def handle_play_from_start(params):
     """Video von Anfang starten und Resume-Point löschen"""
-    episode = params["episode"]
-    # Resume-Point löschen
+    episode = _positive_int(params.get("episode"), "episode")
     try:
-        resume_file = xbmcvfs.translatePath(
-            f"special://profile/addon_data/plugin.video.gronkhtv/resume_points/{episode}.txt"
-        )
-        if xbmcvfs.exists(resume_file):
-            xbmcvfs.delete(resume_file)
+        remove_record(xbmcvfs, _resume_path(episode))
     except Exception as e:
         xbmc.log(f"[Gronkh.tv] Error deleting resume point: {str(e)}", xbmc.LOGERROR)
 
@@ -1242,6 +1276,99 @@ def seconds_to_time(s):
     m = int((s / 60) % 60)
     s = int(s % 60)
     return f"{h}:{m:02d}:{s:02d}"
+
+
+def _positive_int(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _non_negative_finite(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite non-negative seconds")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite non-negative seconds") from exc
+    if not math.isfinite(parsed) or not 0 <= parsed <= _MAX_CHAPTER_ROUTE_OFFSET:
+        raise ValueError(f"{name} must be finite non-negative seconds")
+    return parsed
+
+
+def _chapter_values(chapter):
+    category = chapter.get("category") or chapter.get("game") or {}
+    title = chapter.get("title") or category.get("title") or "Unbenanntes Kapitel"
+    offset = chapter.get("start_offset", chapter.get("offset", 0))
+    return title, _non_negative_finite(offset, "chapter offset")
+
+
+def _seek_to_offset(player, offset, timeout=10, tolerance=3, expected_path=None):
+    offset = _non_negative_finite(offset, "offset")
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    next_attempt = 0
+
+    while time.monotonic() < deadline:
+        try:
+            if player.isPlayingVideo():
+                if expected_path and player.getPlayingFile() != expected_path:
+                    xbmc.sleep(100)
+                    continue
+                duration = float(player.getTotalTime())
+                if math.isfinite(duration) and duration > 0 and offset > duration:
+                    xbmc.log(
+                        f"[Gronkh.tv] Offset {offset} exceeds duration {duration}",
+                        xbmc.LOGWARNING,
+                    )
+                    return False
+                position = float(player.getTime())
+                seekable = (
+                    math.isfinite(duration)
+                    and duration > 0
+                    and math.isfinite(position)
+                    and position >= 0
+                )
+                if seekable and abs(position - offset) <= tolerance:
+                    return True
+                if seekable and attempts < 2 and time.monotonic() >= next_attempt:
+                    xbmc.log(
+                        f"[Gronkh.tv] Seeking to offset {offset} (attempt {attempts + 1})",
+                        xbmc.LOGINFO,
+                    )
+                    player.seekTime(offset)
+                    attempts += 1
+                    next_attempt = time.monotonic() + 0.5
+        except Exception as exc:
+            xbmc.log(
+                f"[Gronkh.tv] Player not seekable yet: {exc}", xbmc.LOGWARNING
+            )
+        xbmc.sleep(100)
+
+    xbmc.log(
+        f"[Gronkh.tv] Could not verify seek to offset {offset}", xbmc.LOGERROR
+    )
+    return False
+
+
+def _stop_failed_playback(player):
+    try:
+        player.stop()
+    except Exception as exc:
+        xbmc.log(f"[Gronkh.tv] Could not stop failed playback: {exc}", xbmc.LOGERROR)
+
+
+def _report_seek_failure(message):
+    xbmc.log(f"[Gronkh.tv] {message}", xbmc.LOGERROR)
+    xbmcgui.Dialog().notification(
+        _plugin, message, xbmcgui.NOTIFICATION_ERROR
+    )
 
 
 def run():

@@ -1,6 +1,7 @@
 import json
+from uuid import UUID
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from account import AuthenticationError
@@ -8,6 +9,7 @@ from account import AuthenticationError
 API_BASE = "https://backend.gronkh.tv/v3"
 _TIMEOUT = 10
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+_MAX_URL_DECODE_ROUNDS = 4
 DEFAULT_HEADERS = {
     "User-Agent": _UA,
     "Accept": "application/json",
@@ -21,6 +23,7 @@ def configure_account_session(session):
 
 
 def get_json(path, method="GET", payload=None):
+    path = _relative_api_path(path)
     if _account_session is not None:
         try:
             return _account_session.request_json(path, method=method, payload=payload)
@@ -102,16 +105,21 @@ def normalize_chapter(chapter):
 
 
 def video_by_episode(episode):
+    episode = _positive_int(episode, "episode")
     return normalize_video(unwrap_data(get_json(f"/videos/episode/{episode}")))
 
 
 def playlist_url_for_video(video):
     normalized = normalize_video(video)
     if normalized["playlist_url"]:
-        return normalized["playlist_url"]
+        return _v3_url(normalized["playlist_url"])
     video_id = normalized.get("id")
     if not video_id:
         return ""
+    try:
+        video_id = str(UUID(str(video_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin") from exc
     return f"{API_BASE}/videos/{video_id}/playlist"
 
 
@@ -175,9 +183,80 @@ def normalize_live_stream(stream):
 
 
 def _make_url(path):
-    if path.startswith("http://") or path.startswith("https://"):
-        return path
-    return f"{API_BASE}{path if path.startswith('/') else '/' + path}"
+    path = _relative_api_path(path)
+    return f"{API_BASE}{path}"
+
+
+def _relative_api_path(path):
+    if not isinstance(path, str) or not path:
+        raise ValueError("GronkhTV requests require a relative API path")
+    parsed = urlsplit(path)
+    decoded_path = _repeated_unquote(parsed.path)
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.fragment
+        or "#" in path
+        or "\\" in decoded_path
+        or "//" in decoded_path
+        or decoded_path.count("/") != parsed.path.count("/")
+        or any(part == ".." for part in decoded_path.split("/"))
+    ):
+        raise ValueError("GronkhTV requests require a relative API path")
+    normalized_path = parsed.path if parsed.path.startswith("/") else f"/{parsed.path}"
+    return normalized_path + (f"?{parsed.query}" if parsed.query else "")
+
+
+def _v3_url(url):
+    if not isinstance(url, str):
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin")
+    parsed = urlsplit(url)
+    decoded_path = _repeated_unquote(parsed.path)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "backend.gronkh.tv"
+        or "?" in url
+        or "#" in url
+        or parsed.fragment
+        or "\\" in decoded_path
+        or "//" in decoded_path
+        or decoded_path.count("/") != parsed.path.count("/")
+        or any(part == ".." for part in decoded_path.split("/"))
+    ):
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin")
+    parts = parsed.path.split("/")
+    if (
+        len(parts) != 5
+        or parts[:3] != ["", "v3", "videos"]
+        or parts[4] != "playlist"
+    ):
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin")
+    try:
+        video_id = str(UUID(parts[3]))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Playlist URL must use the GronkhTV v3 origin") from exc
+    return f"{API_BASE}/videos/{video_id}/playlist"
+
+
+def _repeated_unquote(value):
+    for _ in range(_MAX_URL_DECODE_ROUNDS):
+        decoded = unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value
+
+
+def _positive_int(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
 
 
 def _search_payload(query=None, page=None):
