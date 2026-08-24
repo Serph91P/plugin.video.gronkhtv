@@ -35,19 +35,7 @@ v2.2.0 (09.07.26)
 v2.1.0 (17.02.26)
 - Refactoring: Code in resources/lib/plugin.py ausgelagert (komplexen Entrypoint behoben)
 - Fix: xbmc.python Version auf 3.0.1 aktualisiert (Omega-Kompatibilitaet)
-- Fix: Icon-Transparenz entfernt (solid background)
-v2.0.4 (17.02.26)
-- Fix: xbmc.python Version auf 3.0.1 aktualisiert (Omega-Kompatibilitaet)
-v2.0.3 (16.02.26)
-- Fix: GitHub Source-URL korrigiert
-- CI/CD Workflows modernisiert
-v2.0.2 (04.02.26)
-- Cleanup: Nicht funktionierende EDL-Funktionen entfernt
-- Kapitel weiterhin ueber Kontextmenue erreichbar
-v2.0.1 (04.02.26)
-- Fix: Spiele-Filter funktioniert jetzt (API-Limit beachtet)
-- Fix: Emojis entfernt fuer bessere Kodi-Kompatibilitaet
-- Kapitel im Kontextmenue verfuegbar</news>
+- Fix: Icon-Transparenz entfernt (solid background)</news>
         <license>GNU Affero General Public License, v3</license>
         <website>https://gronkh.tv/</website>
         <source>https://github.com/Serph91P/plugin.video.gronkhtv</source>
