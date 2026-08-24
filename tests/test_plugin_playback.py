@@ -109,10 +109,103 @@ def test_episode_routes_reject_non_positive_integers(plugin, handler, parameter,
         getattr(plugin, handler)(params)
 
 
-@pytest.mark.parametrize("offset", ["", "-1", "nan", "inf", "-inf", "abc"])
-def test_chapter_route_rejects_invalid_offset_before_player_or_api(plugin, offset):
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [("0", 0.0), ("1.5", 1.5), ("31536000", 31536000.0)],
+)
+def test_chapter_offset_validator_accepts_inclusive_finite_range(
+    plugin, offset, expected
+):
+    assert plugin._non_negative_finite(offset, "offset") == expected
+
+
+@pytest.mark.parametrize(
+    "offset", ["-1", "nan", "inf", "-inf", "1e308", "1e309", "31536000.1"]
+)
+def test_chapter_offset_validator_rejects_out_of_range_values(plugin, offset):
+    with pytest.raises(ValueError, match="finite non-negative"):
+        plugin._non_negative_finite(offset, "offset")
+
+
+@pytest.mark.parametrize(
+    "offset",
+    ["", "-1", "nan", "inf", "-inf", "abc", "1e308", "1e309", "31536000.1"],
+)
+def test_chapter_route_rejects_invalid_offset_before_all_route_sinks(
+    plugin, monkeypatch, offset
+):
+    sinks = []
+    player = object()
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: sinks.append("player") or player)
+    monkeypatch.setattr(
+        plugin,
+        "get_playlist_url",
+        lambda episode: sinks.append("playlist") or "https://media/playlist",
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_play_direct",
+        lambda url, actual_player: sinks.append("play") or actual_player,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_seek_to_offset",
+        lambda *args, **kwargs: sinks.append("seek") or True,
+    )
+    monkeypatch.setattr(
+        plugin, "monitor_playback", lambda episode: sinks.append("monitor")
+    )
+
     with pytest.raises(ValueError, match="finite non-negative"):
         plugin.jump_to_chapter({"episode": "1105", "offset": offset})
+
+    assert sinks == []
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [("0", 0.0), ("1.5", 1.5), ("120", 120.0), ("31536000", 31536000.0)],
+)
+def test_chapter_route_accepts_offsets_through_inclusive_maximum(
+    plugin, monkeypatch, offset, expected
+):
+    sinks = []
+    player = object()
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: sinks.append("player") or player)
+    monkeypatch.setattr(
+        plugin,
+        "get_playlist_url",
+        lambda episode: sinks.append(("playlist", episode)) or "https://media/playlist",
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_play_direct",
+        lambda url, actual_player: sinks.append(("play", url, actual_player))
+        or actual_player,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_seek_to_offset",
+        lambda actual_player, actual_offset, **kwargs: sinks.append(
+            ("seek", actual_player, actual_offset)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "monitor_playback",
+        lambda episode: sinks.append(("monitor", episode)),
+    )
+
+    assert plugin.jump_to_chapter({"episode": "1105", "offset": offset}) is True
+
+    assert sinks == [
+        "player",
+        ("playlist", 1105),
+        ("play", "https://media/playlist", player),
+        ("seek", player, expected),
+        ("monitor", 1105),
+    ]
 
 
 def test_chapter_values_use_title_category_safe_fallback_and_v3_offset(plugin):

@@ -59,6 +59,7 @@ _CATEGORIES = [
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _SEARCH_PAGE_SIZE = 20
+_MAX_CHAPTER_ROUTE_OFFSET = 31536000
 
 # Addon data paths
 _ADDON_DATA = xbmcvfs.translatePath(
@@ -1296,7 +1297,7 @@ def _non_negative_finite(value, name):
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be finite non-negative seconds") from exc
-    if not math.isfinite(parsed) or parsed < 0:
+    if not math.isfinite(parsed) or not 0 <= parsed <= _MAX_CHAPTER_ROUTE_OFFSET:
         raise ValueError(f"{name} must be finite non-negative seconds")
     return parsed
 
