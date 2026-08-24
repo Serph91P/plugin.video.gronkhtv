@@ -1269,6 +1269,7 @@ def handle_play_from_start(params):
 
     url = get_playlist_url(episode)
     _play_direct(url)
+    monitor_playback(episode)
 
 
 def seconds_to_time(s):
