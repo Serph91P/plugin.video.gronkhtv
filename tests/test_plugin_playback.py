@@ -503,6 +503,10 @@ class PlaybackPlayer:
     def __init__(self, monitor, samples):
         self.monitor = monitor
         self.samples = samples
+        self.play_calls = []
+
+    def play(self, playlist_url, list_item):
+        self.play_calls.append((playlist_url, list_item))
 
     def isPlayingVideo(self):
         return self.monitor.index < len(self.samples)
@@ -518,6 +522,37 @@ class PlaybackPlayer:
         if isinstance(duration, Exception):
             raise duration
         return duration
+
+
+def test_play_from_start_removes_prior_resume_and_monitors_new_playback(
+    plugin, monkeypatch
+):
+    monitor = PlaybackMonitor(1)
+    player = PlaybackPlayer(monitor, [(12.5, 300)])
+    removed = []
+    saves = []
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: player)
+    monkeypatch.setattr(plugin.xbmc, "Monitor", lambda: monitor)
+    monkeypatch.setattr(plugin.xbmcgui, "ListItem", RecordingListItem)
+    monkeypatch.setattr(
+        plugin, "get_playlist_url", lambda episode: f"https://media/{episode}/playlist"
+    )
+    monkeypatch.setattr(plugin, "_configure_authenticated_playback", lambda *args: True)
+    monkeypatch.setattr(
+        plugin, "remove_record", lambda vfs, path: removed.append(path) or True
+    )
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: monitor.now)
+    monkeypatch.setattr(
+        plugin,
+        "save_resume_point",
+        lambda episode, position, duration: saves.append((episode, position, duration)),
+    )
+
+    plugin.handle_play_from_start({"episode": "1105"})
+
+    assert removed == [plugin._resume_path(1105)]
+    assert [url for url, _ in player.play_calls] == ["https://media/1105/playlist"]
+    assert saves == [(1105, 12.5, 300.0)]
 
 
 def _run_monitor(plugin, monkeypatch, samples, abort_after=None):
