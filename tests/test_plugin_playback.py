@@ -468,7 +468,7 @@ def test_context_menu_preserves_resume_chapter_action_order_and_urls(
             "RunPlugin(plugin://plugin.video.gronkhtv/?action=play_from_start&episode=1105)",
         ),
         (
-            "Kapitel [0:01:30]: Game",
+            "Game (0:01:30)",
             "RunPlugin(plugin://plugin.video.gronkhtv/?action=jump_to_chapter&episode=1105&offset=90)",
         ),
         (

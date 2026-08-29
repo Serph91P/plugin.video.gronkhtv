@@ -6,7 +6,7 @@ LIB = ROOT / "resources" / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
-from context_menu import (  # noqa: E402
+from context_menu import (
     chapter_label,
     details_label,
     favorite_label,
@@ -23,6 +23,6 @@ def test_context_menu_labels_do_not_depend_on_icon_glyphs():
     assert details_label() == "Stream-Details anzeigen"
 
 
-def test_chapter_label_never_displays_none():
-    assert chapter_label("00:15:00", "Tabletop RPGs") == "Kapitel [00:15:00]: Tabletop RPGs"
-    assert chapter_label("00:00:00", None) == "Kapitel [00:00:00]: Unbenanntes Kapitel"
+def test_chapter_label_puts_title_before_position_without_none():
+    assert chapter_label("00:15:00", "Tabletop RPGs") == "Tabletop RPGs (00:15:00)"
+    assert chapter_label("00:00:00", None) == "Unbenanntes Kapitel (00:00:00)"
