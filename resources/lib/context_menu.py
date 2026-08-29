@@ -18,7 +18,7 @@ def favorite_label(is_favorite):
 
 
 def chapter_label(position, title):
-    return f"Kapitel [{position}]: {title or _DEFAULT_CHAPTER_TITLE}"
+    return f"{title or _DEFAULT_CHAPTER_TITLE} ({position})"
 
 
 def details_label():
