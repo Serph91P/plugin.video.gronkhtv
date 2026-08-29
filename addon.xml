@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="2.3.3" provider-name="Seraph91P">
+<addon id="plugin.video.gronkhtv" name="Gronkh.tv" version="2.3.4" provider-name="Seraph91P">
     <requires>
         <import addon="xbmc.python" version="3.0.1"/>
         <import addon="script.module.inputstreamhelper" version="0.6.1"/>
@@ -15,7 +15,9 @@
         <summary lang="de_DE">Schaue Videos von gronkh.tv!</summary>
         <description lang="en_GB">gronkh.tv is an online video service that offers full-length streams of Gronkh and potentially other Let's Players. Features: Account session, archive playback, Twitch live streams, thumbnails, resume playback, favorites, game filter, chapter markers, auto-next episode.</description>
         <description lang="de_DE">gronkh.tv ist ein online Video-Streaming-Dienst und bietet Zugang zum Stream-Archiv von Gronkh. Features: Kontositzung, Archiv-Wiedergabe, Twitch-Livestreams, Thumbnails, Wiedergabe fortsetzen, Favoriten, Spiele-Filter, Kapitel-Marker, automatisch nächste Episode.</description>
-        <news>v2.3.3 (24.08.26)
+        <news>v2.3.4 (29.08.26)
+- Klarere Kapitelmenue-Labels mit Titel vor Zeitposition
+v2.3.3 (24.08.26)
 - DE: Von Anfang starten setzt die Wiedergabeueberwachung fort und speichert die spaetere Resume-Position
 - EN: Restarting from the beginning resumes playback monitoring and saves the later resume position
 v2.3.2 (24.08.26)
