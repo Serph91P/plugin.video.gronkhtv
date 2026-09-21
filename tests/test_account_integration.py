@@ -15,12 +15,27 @@ def test_manifest_declares_twitch_playback_dependency():
     assert imports["plugin.video.twitch"] == "3.0.2"
 
 
-def test_settings_expose_account_and_playback_actions_without_password_storage():
+def test_settings_expose_only_state_appropriate_account_actions_without_secrets():
     settings_path = ROOT / "resources" / "settings.xml"
     root = ET.parse(settings_path).getroot()
     settings = {entry.attrib.get("id"): entry for entry in root.findall(".//setting")}
 
-    assert settings["account_email"].attrib["type"] == "text"
+    assert "account_email" not in settings
+    assert settings["account_logged_in"].attrib == {
+        "id": "account_logged_in",
+        "type": "bool",
+        "default": "false",
+        "visible": "false",
+    }
+    assert settings["account_status"].attrib["visible"] == (
+        "String.IsEqual(Setting(account_logged_in),true)"
+    )
+    assert settings["account_login"].attrib["visible"] == (
+        "String.IsEqual(Setting(account_logged_in),false)"
+    )
+    assert settings["account_logout"].attrib["visible"] == (
+        "String.IsEqual(Setting(account_logged_in),true)"
+    )
     assert settings["account_login"].attrib["action"].endswith("?action=account_login)")
     assert (
         settings["account_logout"].attrib["action"].endswith("?action=account_logout)")
@@ -30,8 +45,20 @@ def test_settings_expose_account_and_playback_actions_without_password_storage()
         "RunPlugin(plugin://$ID/?action=open_twitch_settings)"
     )
     assert all(
-        "password" not in setting_id.lower() for setting_id in settings if setting_id
+        secret not in setting_id.lower()
+        for secret in ("password", "token", "cookie", "2fa")
+        for setting_id in settings
+        if setting_id
     )
+
+
+def test_account_status_logic_updates_hidden_login_state_from_session_validation():
+    source = (ROOT / "resources" / "lib" / "plugin.py").read_text(encoding="utf-8")
+
+    assert '_addon.setSetting("account_logged_in", "true")' in source
+    assert source.count('_addon.setSetting("account_logged_in", "false")') >= 3
+    assert 'saved_login = _addon.getSetting("account_email")' in source
+    assert '_addon.setSetting("account_email", login)' in source
 
 
 def test_plugin_routes_account_actions_and_uses_separate_feature_packages():

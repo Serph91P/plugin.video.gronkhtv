@@ -456,6 +456,7 @@ def list_live_streams():
 
 def _read_account_user():
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         return None
     try:
@@ -463,6 +464,7 @@ def _read_account_user():
     except (AuthenticationError, SessionError):
         _account_session.clear()
         configure_account_session(None)
+        _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30210))
         return None
 
@@ -472,6 +474,7 @@ def _read_account_user():
         if name
         else _addon.getLocalizedString(30211)
     )
+    _addon.setSetting("account_logged_in", "true")
     _set_account_status(status)
     return user
 
@@ -1174,6 +1177,7 @@ def handle_account_login(params=None):
             raise AuthenticationError(_addon.getLocalizedString(30216))
         configure_account_session(_account_session)
         _addon.setSetting("account_email", login)
+        _addon.setSetting("account_logged_in", "true")
         name = _account_name(result.user)
         status = (
             f"{_addon.getLocalizedString(30211)}: {name}"
@@ -1190,6 +1194,7 @@ def handle_account_login(params=None):
     except (AuthenticationError, SessionError, ValueError) as exc:
         _account_session.clear()
         configure_account_session(None)
+        _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         xbmc.log(f"[Gronkh.tv] Account login failed: {exc}", xbmc.LOGWARNING)
         dialog.notification(
@@ -1209,6 +1214,7 @@ def handle_account_logout(params=None):
         xbmc.log(f"[Gronkh.tv] Remote logout failed: {exc}", xbmc.LOGWARNING)
         _account_session.clear()
     configure_account_session(None)
+    _addon.setSetting("account_logged_in", "false")
     _set_account_status(_addon.getLocalizedString(30209))
     dialog.notification(
         _plugin,
