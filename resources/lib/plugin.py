@@ -1232,6 +1232,7 @@ def handle_account_status(params=None):
 
 
 def handle_open_settings(params=None):
+    _read_account_user()
     _addon.openSettings()
 
 
