@@ -109,6 +109,74 @@ def test_episode_routes_reject_non_positive_integers(plugin, handler, parameter,
         getattr(plugin, handler)(params)
 
 
+def test_opening_settings_resets_stale_login_state_when_cookie_is_missing(
+    plugin, monkeypatch
+):
+    calls = []
+
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "openSettings",
+        lambda: calls.append(("openSettings", None)),
+        raising=False,
+    )
+
+    plugin.handle_open_settings()
+
+    assert calls == [
+        ("account_logged_in", "false"),
+        ("account_status", "30209"),
+        ("openSettings", None),
+    ]
+
+
+def test_opening_settings_resets_login_state_when_session_has_expired(
+    plugin, monkeypatch
+):
+    calls = []
+
+    class ExpiredSession:
+        def current_user(self):
+            raise plugin.SessionError("session expired")
+
+        def clear(self):
+            calls.append(("clear", None))
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(plugin, "_account_session", ExpiredSession())
+    monkeypatch.setattr(
+        plugin,
+        "configure_account_session",
+        lambda session: calls.append(("configure", session)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "openSettings",
+        lambda: calls.append(("openSettings", None)),
+        raising=False,
+    )
+
+    plugin.handle_open_settings()
+
+    assert calls == [
+        ("clear", None),
+        ("configure", None),
+        ("account_logged_in", "false"),
+        ("account_status", "30210"),
+        ("openSettings", None),
+    ]
+
+
 @pytest.mark.parametrize(
     ("offset", "expected"),
     [("0", 0.0), ("1.5", 1.5), ("31536000", 31536000.0)],
@@ -400,8 +468,14 @@ def test_chapter_jump_starts_selected_episode_and_monitors_after_seek(
 
 
 class RecordingTag:
+    def __init__(self):
+        self.calls = {}
+
     def __getattr__(self, name):
-        return lambda *args, **kwargs: None
+        def record(*args, **kwargs):
+            self.calls.setdefault(name, []).append((args, kwargs))
+
+        return record
 
 
 class RecordingListItem:
@@ -481,6 +555,35 @@ def test_context_menu_preserves_resume_chapter_action_order_and_urls(
         ),
     ]
     assert "action=add_favorite&episode=1105&video_data=" in items[0].context_menu[3][1]
+
+
+def test_listing_marks_persisted_watched_episode_without_a_resume_point(plugin, monkeypatch):
+    items = []
+    video = {
+        "episode": 1105,
+        "title": "Episode",
+        "video_length": 300,
+        "tags": [],
+    }
+    monkeypatch.setattr(plugin.xbmcgui, "ListItem", RecordingListItem)
+    monkeypatch.setattr(plugin, "get_videos", lambda *args, **kwargs: ([video], ""))
+    monkeypatch.setattr(plugin, "get_chapters", lambda episode: [])
+    monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plugin, "is_watched", lambda episode: True, raising=False)
+    monkeypatch.setattr(plugin, "is_favorite", lambda episode: False)
+    monkeypatch.setattr(
+        plugin.xbmcplugin,
+        "addDirectoryItem",
+        lambda handle, url, list_item, is_folder: items.append(list_item),
+        raising=False,
+    )
+    for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+
+    plugin.list_videos("category")
+
+    assert items[0].tag.calls["setPlaycount"] == [((1,), {})]
+    assert "setResumePoint" not in items[0].tag.calls
 
 
 class PlaybackMonitor:
@@ -645,6 +748,7 @@ def test_completed_resume_record_is_removed_when_read(plugin, monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(plugin, "is_completed", lambda record: True, raising=False)
+    monkeypatch.setattr(plugin, "mark_watched", lambda episode: True, raising=False)
     monkeypatch.setattr(
         plugin,
         "remove_record",
@@ -694,6 +798,7 @@ def test_save_resume_point_removes_completed_state(plugin, monkeypatch):
         plugin, "get_resume_record", lambda *args, **kwargs: None, raising=False
     )
     monkeypatch.setattr(plugin, "is_completed", lambda record: True, raising=False)
+    monkeypatch.setattr(plugin, "mark_watched", lambda episode: True, raising=False)
     monkeypatch.setattr(
         plugin,
         "remove_record",
@@ -709,6 +814,36 @@ def test_save_resume_point_removes_completed_state(plugin, monkeypatch):
 
     assert plugin.save_resume_point(1105, 285, 300) is True
     assert removed == [plugin._resume_path(1105)]
+
+
+def test_completed_playback_marks_episode_watched_before_removing_resume(plugin, monkeypatch):
+    operations = []
+    monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin, "mark_watched", lambda episode: operations.append(("watched", episode)) or True
+    )
+    monkeypatch.setattr(
+        plugin,
+        "remove_record",
+        lambda vfs, path: operations.append(("resume", path)) or True,
+    )
+
+    assert plugin.save_resume_point(1105, 285, 300) is True
+
+    assert operations == [("watched", 1105), ("resume", plugin._resume_path(1105))]
+
+
+def test_play_from_start_clears_watched_state(plugin, monkeypatch):
+    cleared = []
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: True)
+    monkeypatch.setattr(plugin, "clear_watched", lambda episode: cleared.append(episode) or True)
+    monkeypatch.setattr(plugin, "get_playlist_url", lambda episode: "https://media/playlist")
+    monkeypatch.setattr(plugin, "_play_direct", lambda url: None)
+    monkeypatch.setattr(plugin, "monitor_playback", lambda episode: None)
+
+    plugin.handle_play_from_start({"episode": "1105"})
+
+    assert cleared == [1105]
 
 
 def test_save_resume_point_reports_failed_completed_cleanup(plugin, monkeypatch):

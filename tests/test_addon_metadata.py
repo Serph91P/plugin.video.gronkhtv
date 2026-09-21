@@ -10,16 +10,17 @@ def test_addon_news_fits_kodi_metadata_limit():
     news = addon.find("./extension[@point='xbmc.addon.metadata']/news").text
 
     assert len(news) <= 1500
-    assert len(news) == 1196
 
 
-def test_addon_234_documents_chapter_labels_and_keeps_restart_monitoring():
+def test_addon_235_documents_account_menu_state_and_keeps_chapter_history():
     addon = ET.parse(ROOT / "addon.xml").getroot()
     news = addon.find("./extension[@point='xbmc.addon.metadata']/news").text
 
-    assert addon.get("version") == "2.3.4"
+    assert addon.get("version") == "2.3.5"
     assert news.startswith(
-        "v2.3.4 (29.08.26)\n- Klarere Kapitelmenue-Labels mit Titel vor Zeitposition\n"
+        "v2.3.5 (21.09.26)\n"
+        "- DE: Konto-Einstellungen zeigen nur die passende Anmeldeaktion und den sichtbaren Kontonamen\n"
+        "- EN: Account settings show only the matching sign-in action and visible account name\n"
     )
     assert (
         "v2.3.3 (24.08.26)\n"
