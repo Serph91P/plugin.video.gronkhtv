@@ -109,6 +109,74 @@ def test_episode_routes_reject_non_positive_integers(plugin, handler, parameter,
         getattr(plugin, handler)(params)
 
 
+def test_opening_settings_resets_stale_login_state_when_cookie_is_missing(
+    plugin, monkeypatch
+):
+    calls = []
+
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "openSettings",
+        lambda: calls.append(("openSettings", None)),
+        raising=False,
+    )
+
+    plugin.handle_open_settings()
+
+    assert calls == [
+        ("account_logged_in", "false"),
+        ("account_status", "30209"),
+        ("openSettings", None),
+    ]
+
+
+def test_opening_settings_resets_login_state_when_session_has_expired(
+    plugin, monkeypatch
+):
+    calls = []
+
+    class ExpiredSession:
+        def current_user(self):
+            raise plugin.SessionError("session expired")
+
+        def clear(self):
+            calls.append(("clear", None))
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(plugin, "_account_session", ExpiredSession())
+    monkeypatch.setattr(
+        plugin,
+        "configure_account_session",
+        lambda session: calls.append(("configure", session)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "openSettings",
+        lambda: calls.append(("openSettings", None)),
+        raising=False,
+    )
+
+    plugin.handle_open_settings()
+
+    assert calls == [
+        ("clear", None),
+        ("configure", None),
+        ("account_logged_in", "false"),
+        ("account_status", "30210"),
+        ("openSettings", None),
+    ]
+
+
 @pytest.mark.parametrize(
     ("offset", "expected"),
     [("0", 0.0), ("1.5", 1.5), ("31536000", 31536000.0)],
