@@ -34,6 +34,7 @@ from gronkhtv_api import (
 from live import twitch_plugin_entries, twitch_plugin_url
 from playback import configure_authenticated_hls
 from resume_store import is_completed, read_record, remove_record, write_record
+from watched_store import read_marker, remove_marker, write_marker
 
 # Plugin constants
 _URL = sys.argv[0]
@@ -66,6 +67,7 @@ _ADDON_DATA = xbmcvfs.translatePath(
     "special://profile/addon_data/plugin.video.gronkhtv/"
 )
 _RESUME_DIR = os.path.join(_ADDON_DATA, "resume_points")
+_WATCHED_DIR = os.path.join(_ADDON_DATA, "watched_episodes")
 _FAVORITES_FILE = os.path.join(_ADDON_DATA, "favorites.json")
 _ACCOUNT_COOKIE_FILE = os.path.join(_ADDON_DATA, "account", "cookies.txt")
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
@@ -588,6 +590,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         resume_record = get_resume_record(ep, legacy_duration=video_duration)
         resume_point = resume_record["position"] if resume_record else 0
         resume_duration = resume_record["duration"] if resume_record else video_duration
+        watched = is_watched(ep)
         if resume_point > 60:  # Nur anzeigen wenn mehr als 1 Minute geschaut
             cm.insert(
                 0,
@@ -681,7 +684,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         tag.setPremiered(video.get("created_at", ""))
         tag.setFirstAired(video.get("created_at", ""))
         tag.setPlot(plot)
-        tag.setPlaycount(1 if resume_point > 0 else 0)
+        tag.setPlaycount(1 if watched or resume_point > 0 else 0)
 
         # Resume-Fortschritt setzen für Fortschrittsbalken
         if resume_point > 0:
@@ -945,11 +948,52 @@ def _resume_path(episode):
     return os.path.join(_RESUME_DIR, f"{episode}.txt")
 
 
+def _watched_path(episode):
+    episode = _positive_int(episode, "episode")
+    return os.path.join(_WATCHED_DIR, f"{episode}.json")
+
+
+def is_watched(episode):
+    try:
+        return read_marker(xbmcvfs, _watched_path(episode))
+    except Exception as exc:
+        xbmc.log(
+            f"[Gronkh.tv] Error reading watched state for episode {episode}: {exc}",
+            xbmc.LOGERROR,
+        )
+        return False
+
+
+def mark_watched(episode):
+    try:
+        write_marker(xbmcvfs, _WATCHED_DIR, _watched_path(episode))
+        return True
+    except Exception as exc:
+        xbmc.log(
+            f"[Gronkh.tv] Error saving watched state for episode {episode}: {exc}",
+            xbmc.LOGERROR,
+        )
+        return False
+
+
+def clear_watched(episode):
+    try:
+        return remove_marker(xbmcvfs, _watched_path(episode))
+    except Exception as exc:
+        xbmc.log(
+            f"[Gronkh.tv] Error deleting watched state for episode {episode}: {exc}",
+            xbmc.LOGERROR,
+        )
+        return False
+
+
 def get_resume_record(episode, legacy_duration=0):
     path = _resume_path(episode)
     try:
         record = read_record(xbmcvfs, path, legacy_duration=legacy_duration)
         if record and is_completed(record):
+            if not mark_watched(episode):
+                return record
             if not remove_record(xbmcvfs, path):
                 xbmc.log(
                     f"[Gronkh.tv] Could not remove completed resume record: {path}",
@@ -981,7 +1025,7 @@ def save_resume_point(episode, current_time, total_time):
         if existing and existing["position"] > 0 and record["position"] == 0:
             return False
         if is_completed(record):
-            return remove_record(xbmcvfs, path)
+            return mark_watched(episode) and remove_record(xbmcvfs, path)
         write_record(
             xbmcvfs,
             _RESUME_DIR,
@@ -1264,6 +1308,7 @@ def handle_play_from_start(params):
     episode = _positive_int(params.get("episode"), "episode")
     try:
         remove_record(xbmcvfs, _resume_path(episode))
+        clear_watched(episode)
     except Exception as e:
         xbmc.log(f"[Gronkh.tv] Error deleting resume point: {str(e)}", xbmc.LOGERROR)
 
