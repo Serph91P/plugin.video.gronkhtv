@@ -23,6 +23,18 @@ class AuthenticationError(SessionError):
     pass
 
 
+class ValidationError(SessionError):
+    """The authenticated request was understood but rejected (HTTP 422)."""
+
+
+class RateLimitError(SessionError):
+    """The server requested a bounded pause before another attempt."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class LoginResult:
     def __init__(self, authenticated=False, requires_two_factor=False, user=None):
         self.authenticated = authenticated
@@ -74,7 +86,7 @@ class GronkhTVSession:
             return user["data"]
         return user
 
-    def request_json(self, path, method="GET", payload=None):
+    def request_json(self, path, method="GET", payload=None, timeout=None):
         csrf = method.upper() not in ("GET", "HEAD") and bool(
             self._cookie_value("XSRF-TOKEN")
         )
@@ -84,6 +96,7 @@ class GronkhTVSession:
             payload=payload,
             accepted_statuses=(200,),
             csrf=csrf,
+            timeout=timeout,
         )
         try:
             return json.loads(content.decode("utf-8"))
@@ -147,6 +160,7 @@ class GronkhTVSession:
         payload=None,
         accepted_statuses=(200,),
         csrf=False,
+        timeout=None,
     ):
         url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
         headers = {
@@ -167,15 +181,19 @@ class GronkhTVSession:
 
         request = Request(url, data=data, headers=headers, method=method)
         try:
-            with self.opener.open(request, timeout=_TIMEOUT) as response:
+            with self.opener.open(request, timeout=timeout or _TIMEOUT) as response:
                 status = getattr(response, "status", None)
                 if status is None:
                     status = response.getcode()
                 content = response.read()
         except HTTPError as exc:
             message = self._error_message(exc)
-            if exc.code in (401, 403, 419, 422):
+            if exc.code in (401, 403, 419):
                 raise AuthenticationError(message) from exc
+            if exc.code == 422:
+                raise ValidationError(message) from exc
+            if exc.code == 429:
+                raise RateLimitError(message, _retry_after(exc)) from exc
             raise SessionError(message) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise SessionError(f"GronkhTV ist nicht erreichbar: {exc}") from exc
@@ -200,3 +218,15 @@ class GronkhTVSession:
         if isinstance(payload, dict):
             return payload.get("message") or fallback
         return fallback
+
+
+def _retry_after(error):
+    headers = getattr(error, "headers", None)
+    value = headers.get("Retry-After") if headers is not None else None
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
