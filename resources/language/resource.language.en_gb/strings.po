@@ -107,3 +107,35 @@ msgstr "Do you want to sign out?"
 msgctxt "#30218"
 msgid "Signed out"
 msgstr "Signed out"
+
+msgctxt "#30219"
+msgid "Synchronize watch progress"
+msgstr "Synchronize watch progress"
+
+msgctxt "#30220"
+msgid "Progress sync disabled"
+msgstr "Progress sync disabled"
+
+msgctxt "#30221"
+msgid "Progress synchronized"
+msgstr "Progress synchronized"
+
+msgctxt "#30222"
+msgid "Progress pending locally"
+msgstr "Progress pending locally"
+
+msgctxt "#30223"
+msgid "Sign in required for progress sync"
+msgstr "Sign in required for progress sync"
+
+msgctxt "#30224"
+msgid "Progress conflict needs a choice"
+msgstr "Progress conflict needs a choice"
+
+msgctxt "#30225"
+msgid "Keep Kodi progress"
+msgstr "Keep Kodi progress"
+
+msgctxt "#30226"
+msgid "Use account progress"
+msgstr "Use account progress"

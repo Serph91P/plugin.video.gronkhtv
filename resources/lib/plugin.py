@@ -7,6 +7,7 @@ import xbmcplugin
 from urllib.request import build_opener, install_opener
 import json
 import math
+import threading
 from functools import lru_cache
 import time
 import xbmcvfs
@@ -14,6 +15,10 @@ import os
 import inputstreamhelper
 
 from account import AuthenticationError, GronkhTVSession, SessionError
+from account.progress import ProgressClient
+from account.progress_sync import ProgressSync
+from account.resume_start import ResumeStartController
+from account.sync_store import SyncStore
 from context_menu import (
     chapter_label,
     details_label,
@@ -70,6 +75,7 @@ _RESUME_DIR = os.path.join(_ADDON_DATA, "resume_points")
 _WATCHED_DIR = os.path.join(_ADDON_DATA, "watched_episodes")
 _FAVORITES_FILE = os.path.join(_ADDON_DATA, "favorites.json")
 _ACCOUNT_COOKIE_FILE = os.path.join(_ADDON_DATA, "account", "cookies.txt")
+_PROGRESS_SYNC_FILE = os.path.join(_ADDON_DATA, "account", "progress-sync.sqlite3")
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
 configure_account_session(
     _account_session if os.path.exists(_ACCOUNT_COOKIE_FILE) else None
@@ -77,6 +83,8 @@ configure_account_session(
 
 chapter_cache = {}
 video_info_cache = {}
+_PLAYBACK_GENERATION = 0
+_LEGACY_LOOKUP_SEMAPHORE = threading.BoundedSemaphore(value=1)
 
 
 @lru_cache(maxsize=100)
@@ -263,6 +271,216 @@ def _account_name(user):
 
 def _set_account_status(status):
     _addon.setSetting("account_status", status)
+
+
+def _account_progress_sync():
+    """Return a private queue bound to the persisted, stable account context.
+
+    It does not issue HTTP itself.  The playback monitor only writes local
+    snapshots; the bounded POST is started after playback has stopped.
+    """
+    if not _setting_enabled("sync_watch_progress") or not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        return None
+    try:
+        store = SyncStore(_PROGRESS_SYNC_FILE)
+        context = store.context()
+        account_id = context["active_account_id"]
+        if not account_id or not context["sync_enabled"]:
+            return None
+        # A sync job must retain the cookies it was created with.  The global
+        # session is reused by interactive login/logout and may later represent
+        # another account while an old uploader is still running.
+        session_snapshot = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
+        return ProgressSync(store, ProgressClient(session_snapshot), account_id, context["epoch"])
+    except Exception as exc:
+        xbmc.log(f"[Gronkh.tv] Account progress sync unavailable: {exc}", xbmc.LOGWARNING)
+        return None
+
+
+def _activate_account_progress_sync(user):
+    if not _setting_enabled("sync_watch_progress") or not isinstance(user, dict):
+        return None
+    account_id = user.get("id")
+    if not isinstance(account_id, (str, int)) or not str(account_id):
+        return None
+    return SyncStore(_PROGRESS_SYNC_FILE).activate(str(account_id), enabled=True)
+
+
+def _deactivate_account_progress_sync():
+    try:
+        SyncStore(_PROGRESS_SYNC_FILE).deactivate()
+    except Exception as exc:
+        xbmc.log(f"[Gronkh.tv] Could not invalidate progress sync: {exc}", xbmc.LOGWARNING)
+
+
+def _flush_progress_async(progress_sync, video_id):
+    thread = threading.Thread(target=progress_sync.flush, args=(video_id,), daemon=True)
+    thread.start()
+
+
+def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offset=None):
+    """Resolve a normal resume before playback, without a late seek fallback."""
+    if explicit_offset is not None:
+        return explicit_offset
+    controller = ResumeStartController(progress_sync, video_id)
+    result = controller.resolve(
+        local_offset=local_offset,
+        timeout_seconds=3,
+        aborted=xbmc.Monitor().abortRequested,
+    )
+    if result["state"] == "conflict":
+        use_kodi = xbmcgui.Dialog().yesno(
+            _plugin,
+            _addon.getLocalizedString(30224),
+            yeslabel=_addon.getLocalizedString(30225),
+            nolabel=_addon.getLocalizedString(30226),
+        )
+        choice = "kodi" if use_kodi else "account"
+        try:
+            return progress_sync.resolve_conflict(video_id, choice)
+        except Exception as exc:
+            xbmc.log(f"[Gronkh.tv] Could not resolve progress conflict: {exc}", xbmc.LOGWARNING)
+            return local_offset
+    return result["offset"]
+
+
+def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=12):
+    """Fetch a bounded set of private resume values before rendering a list.
+
+    The progress adapter has a per-request timeout; this additional shared
+    deadline prevents a long page from serially blocking Kodi's directory
+    renderer.  Only the authenticated, epoch-fenced coordinator is used here.
+    It performs no upload or playback action; successful reads merely refresh
+    the account-scoped observed cache in ``SyncStore``.
+    """
+    progress_sync = _account_progress_sync()
+    if progress_sync is None:
+        return {}
+    deadline = time.monotonic() + timeout_seconds
+    candidates = []
+    attempted_items = 0
+    for video in videos:
+        if attempted_items >= maximum_reads or time.monotonic() >= deadline:
+            break
+        if not isinstance(video, dict):
+            continue
+        episode = video.get("episode")
+        if episode is None:
+            continue
+        attempted_items += 1
+        video_id = video.get("id")
+        if not video_id:
+            # Legacy metadata has only an episode number.  Keep its lookup out
+            # of the renderer thread, wait no longer than the shared budget,
+            # and permit only one outstanding lookup across list renders.
+            if not _LEGACY_LOOKUP_SEMAPHORE.acquire(blocking=False):
+                break
+            lookup_done = threading.Event()
+            resolved = [None]
+
+            def resolve_legacy_id():
+                try:
+                    info = get_video_info(episode)
+                    if isinstance(info, dict):
+                        resolved[0] = info.get("id")
+                except Exception:
+                    pass
+                finally:
+                    _LEGACY_LOOKUP_SEMAPHORE.release()
+                    lookup_done.set()
+
+            threading.Thread(target=resolve_legacy_id, daemon=True).start()
+            lookup_done.wait(max(0, deadline - time.monotonic()))
+            if not lookup_done.is_set() or time.monotonic() >= deadline:
+                break
+            video_id = resolved[0]
+        if video_id and time.monotonic() < deadline:
+            candidates.append((episode, video_id))
+    results = {}
+    lock = threading.Lock()
+    done = threading.Event()
+    remaining = [len(candidates)]
+
+    def read(episode, video_id):
+        try:
+            if time.monotonic() >= deadline:
+                return
+            result = progress_sync.prepare_playback(video_id)
+            if (
+                time.monotonic() < deadline
+                and result.get("state") == "valid"
+                and result.get("offset") is not None
+            ):
+                with lock:
+                    if time.monotonic() < deadline:
+                        results[episode] = result["offset"]
+        except Exception:
+            pass
+        finally:
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    done.set()
+
+    for episode, video_id in candidates:
+        threading.Thread(target=read, args=(episode, video_id), daemon=True).start()
+    if candidates:
+        done.wait(max(0, deadline - time.monotonic()))
+    return results
+
+
+def _playback_sync_context(episode):
+    """Return the immutable sync queue and backend identifier for one play."""
+    progress_sync = _account_progress_sync()
+    if progress_sync is None:
+        return None, None
+    try:
+        info = get_video_info(episode)
+    except Exception as exc:
+        xbmc.log(f"[Gronkh.tv] Could not resolve backend video for sync: {exc}", xbmc.LOGWARNING)
+        return None, None
+    video_id = info.get("id") if isinstance(info, dict) else None
+    return progress_sync, video_id
+
+
+def _monitor_episode(episode, progress_sync, video_id):
+    """Keep guest playback on its legacy monitor call shape."""
+    if progress_sync is not None and video_id:
+        return monitor_playback(episode, progress_sync=progress_sync, video_id=video_id)
+    return monitor_playback(episode)
+
+
+def _account_playback_event(previous, current, duration, speed):
+    """Classify explicit player state without inventing completion metadata."""
+    if duration > 0 and current >= duration * 0.95:
+        return "end"
+    if speed == 0:
+        return "pause"
+    if previous is not None and abs(current - previous) > 5:
+        return "seek"
+    return "tick"
+
+
+def _player_speed(player):
+    """Kodi versions without getSpeed are treated as normally playing."""
+    getter = getattr(player, "getSpeed", None)
+    if getter is None:
+        return 1
+    try:
+        return getter()
+    except Exception:
+        return 1
+
+
+def _begin_playback_generation():
+    """Invalidate every older monitor before assigning a new media identity."""
+    global _PLAYBACK_GENERATION
+    _PLAYBACK_GENERATION += 1
+    return _PLAYBACK_GENERATION
+
+
+def _is_current_playback_generation(generation):
+    return generation == _PLAYBACK_GENERATION
 
 
 def _page_from_offset(offset):
@@ -551,6 +769,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         return
 
     videos, query = get_videos(category, offset, search_str, game_id)
+    account_progress = _listing_account_progress(videos)
 
     for video in videos:
         list_item = xbmcgui.ListItem(label=video["title"])
@@ -593,6 +812,8 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         resume_record = get_resume_record(ep, legacy_duration=video_duration)
         resume_point = resume_record["position"] if resume_record else 0
         resume_duration = resume_record["duration"] if resume_record else video_duration
+        if not resume_record and ep in account_progress:
+            resume_point = account_progress[ep]
         watched = is_watched(ep)
         if resume_point > 60:  # Nur anzeigen wenn mehr als 1 Minute geschaut
             cm.insert(
@@ -623,6 +844,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
             video_json = quote_plus(
                 json.dumps(
                     {
+                        "id": video.get("id"),
                         "episode": ep,
                         "title": video["title"],
                         "preview_url": preview_url,
@@ -854,6 +1076,10 @@ def play_video(path, episode, start_offset=0):
 
     resume_record = get_resume_record(episode, legacy_duration=video_length)
     resume_point = resume_record["position"] if resume_record else 0
+    progress_sync = _account_progress_sync()
+    backend_video_id = info.get("id") if isinstance(info, dict) else None
+    if start_offset == 0 and progress_sync is not None and backend_video_id:
+        resume_point = _account_resume_offset(progress_sync, backend_video_id, resume_point)
     xbmc.log(f"[Gronkh.tv] Resume point: {resume_point}", xbmc.LOGINFO)
 
     # Start-Offset (für Kapitel-Sprung oder Resume)
@@ -865,11 +1091,25 @@ def play_video(path, episode, start_offset=0):
     xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=play_item)
 
     # Playback überwachen und ggf. nächste Episode starten
-    monitor_playback(episode, next_episode)
+    monitor_playback(
+        episode,
+        next_episode,
+        progress_sync=progress_sync,
+        video_id=backend_video_id,
+    )
 
 
-def monitor_playback(episode, next_episode=None):
+def monitor_playback(
+    episode, next_episode=None, progress_sync=None, video_id=None, generation=None
+):
     """Überwacht die Wiedergabe, speichert Fortschritt und startet ggf. nächste Episode"""
+    global _PLAYBACK_GENERATION
+    if generation is None:
+        generation = _begin_playback_generation()
+    elif generation > _PLAYBACK_GENERATION:
+        _PLAYBACK_GENERATION = generation
+    if not _is_current_playback_generation(generation):
+        return
     player = xbmc.Player()
     monitor = xbmc.Monitor()
 
@@ -884,26 +1124,50 @@ def monitor_playback(episode, next_episode=None):
         return
 
     latest = None
+    previous_position = None
     next_save = time.monotonic() + 5
+    next_account_sync = time.monotonic() + 15
 
     try:
         while player.isPlayingVideo() and not monitor.abortRequested():
+            if not _is_current_playback_generation(generation):
+                return
             try:
                 current_time = _non_negative_finite(player.getTime(), "player time")
                 total_time = _non_negative_finite(
                     player.getTotalTime(), "player duration"
                 )
-                if latest is None or current_time > 0 or latest["position"] == 0:
-                    if latest and total_time == 0 and latest["duration"] > 0:
-                        total_time = latest["duration"]
-                    latest = {"position": current_time, "duration": total_time}
+                if latest and total_time == 0 and latest["duration"] > 0:
+                    total_time = latest["duration"]
+                latest = {"position": current_time, "duration": total_time}
 
+                event = _account_playback_event(
+                    previous_position,
+                    current_time,
+                    total_time,
+                    _player_speed(player),
+                )
+                previous_position = current_time
                 now = time.monotonic()
                 if latest and now >= next_save:
                     save_resume_point(
                         episode, latest["position"], latest["duration"]
                     )
                     next_save = now + 5
+                if (
+                    latest
+                    and progress_sync is not None
+                    and video_id
+                    and (now >= next_account_sync or event != "tick")
+                ):
+                    progress_sync.record_position(
+                        video_id,
+                        latest["position"],
+                        latest["duration"],
+                        event=event,
+                    )
+                    _flush_progress_async(progress_sync, video_id)
+                    next_account_sync = now + 15
             except Exception as exc:
                 xbmc.log(
                     f"[Gronkh.tv] Error in playback monitor: {exc}",
@@ -912,8 +1176,22 @@ def monitor_playback(episode, next_episode=None):
             if monitor.waitForAbort(1):
                 break
     finally:
-        if latest:
+        if latest and _is_current_playback_generation(generation):
             save_resume_point(episode, latest["position"], latest["duration"])
+            if progress_sync is not None and video_id:
+                try:
+                    progress_sync.record_position(
+                        video_id,
+                        latest["position"],
+                        latest["duration"],
+                        event="stop",
+                    )
+                    _flush_progress_async(progress_sync, video_id)
+                except Exception as exc:
+                    xbmc.log(
+                        f"[Gronkh.tv] Could not queue account progress: {exc}",
+                        xbmc.LOGWARNING,
+                    )
             xbmc.log(
                 "[Gronkh.tv] Final resume point saved: "
                 f"{latest['position']}/{latest['duration']}",
@@ -921,7 +1199,12 @@ def monitor_playback(episode, next_episode=None):
             )
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
-    if latest and latest["duration"] > 0 and latest["position"] > 0:
+    if (
+        latest
+        and _is_current_playback_generation(generation)
+        and latest["duration"] > 0
+        and latest["position"] > 0
+    ):
         progress = (latest["position"] / latest["duration"]) * 100
         if progress >= 95 and next_episode and next_episode.get("episode"):
             # Automatisch nächste Episode fragen
@@ -938,12 +1221,32 @@ def monitor_playback(episode, next_episode=None):
                 xbmc.log(
                     f"[Gronkh.tv] Auto-playing next episode: {next_ep}", xbmc.LOGINFO
                 )
+                next_info = get_video_info(next_ep)
+                if not isinstance(next_info, dict):
+                    xbmc.log(
+                        "[Gronkh.tv] Cannot auto-play without backend video metadata",
+                        xbmc.LOGWARNING,
+                    )
+                    return
+                next_video_id = next_info.get("id")
+                if not next_video_id:
+                    xbmc.log(
+                        "[Gronkh.tv] Cannot auto-play without a backend video identity",
+                        xbmc.LOGWARNING,
+                    )
+                    return
                 next_url = get_playlist_url(next_ep)
                 _play_direct(next_url, player)
 
                 # Warten bis nächste Episode startet
                 xbmc.sleep(2000)
-                monitor_playback(next_ep)
+                monitor_playback(
+                    next_ep,
+                    next_info.get("next", {}),
+                    progress_sync=progress_sync,
+                    video_id=next_video_id,
+                    generation=_begin_playback_generation(),
+                )
 
 
 def _resume_path(episode):
@@ -1067,12 +1370,13 @@ def jump_to_chapter(params):
         xbmc.LOGINFO,
     )
     player = xbmc.Player()
+    progress_sync, video_id = _playback_sync_context(episode)
     url = get_playlist_url(episode)
     xbmc.log(f"[Gronkh.tv] Starting playback of {url}", xbmc.LOGINFO)
     _play_direct(url, player)
 
     if _seek_to_offset(player, offset, expected_path=url):
-        monitor_playback(episode)
+        _monitor_episode(episode, progress_sync, video_id)
         return True
     _stop_failed_playback(player)
     _report_seek_failure("Kapitelsprung fehlgeschlagen")
@@ -1220,6 +1524,7 @@ def handle_account_login(params=None):
         if not result.authenticated:
             raise AuthenticationError(_addon.getLocalizedString(30216))
         configure_account_session(_account_session)
+        _activate_account_progress_sync(result.user)
         _addon.setSetting("account_email", login)
         _addon.setSetting("account_logged_in", "true")
         name = _account_name(result.user)
@@ -1258,6 +1563,7 @@ def handle_account_logout(params=None):
         xbmc.log(f"[Gronkh.tv] Remote logout failed: {exc}", xbmc.LOGWARNING)
         _account_session.clear()
     configure_account_session(None)
+    _deactivate_account_progress_sync()
     _addon.setSetting("account_logged_in", "false")
     _set_account_status(_addon.getLocalizedString(30209))
     dialog.notification(
@@ -1270,7 +1576,22 @@ def handle_account_logout(params=None):
 
 def handle_account_status(params=None):
     user = _read_account_user()
-    status = _addon.getSetting("account_status") or _addon.getLocalizedString(30209)
+    if not _setting_enabled("sync_watch_progress"):
+        status = _addon.getLocalizedString(30220)
+    elif not user:
+        status = _addon.getLocalizedString(30223)
+    else:
+        try:
+            state = SyncStore(_PROGRESS_SYNC_FILE).display_status()
+        except Exception:
+            state = "pending"
+        labels = {
+            "synchronized": 30221,
+            "pending": 30222,
+            "authentication_required": 30223,
+            "conflict": 30224,
+        }
+        status = _addon.getLocalizedString(labels.get(state, 30222))
     notification = xbmcgui.NOTIFICATION_INFO if user else xbmcgui.NOTIFICATION_WARNING
     xbmcgui.Dialog().notification(_plugin, status, notification)
 
@@ -1297,13 +1618,16 @@ def handle_play_resume(params):
     episode = _positive_int(params.get("episode"), "episode")
     resume_record = get_resume_record(episode)
     resume_point = resume_record["position"] if resume_record else 0
+    progress_sync, video_id = _playback_sync_context(episode)
+    if resume_record is None and progress_sync is not None and video_id:
+        resume_point = _account_resume_offset(progress_sync, video_id, resume_point)
     url = get_playlist_url(episode)
     player = _play_direct(url)
 
     if resume_point > 0 and _seek_to_offset(
         player, resume_point, expected_path=url
     ):
-        monitor_playback(episode)
+        _monitor_episode(episode, progress_sync, video_id)
         return True
     _stop_failed_playback(player)
     _report_seek_failure("Fortsetzen fehlgeschlagen")
@@ -1321,7 +1645,8 @@ def handle_play_from_start(params):
 
     url = get_playlist_url(episode)
     _play_direct(url)
-    monitor_playback(episode)
+    progress_sync, video_id = _playback_sync_context(episode)
+    _monitor_episode(episode, progress_sync, video_id)
 
 
 def seconds_to_time(s):

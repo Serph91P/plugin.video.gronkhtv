@@ -181,3 +181,11 @@ def test_request_headers_respects_cookie_domain(tmp_path):
 
     assert backend_headers["Cookie"] == "copycat-session=session-value"
     assert "Cookie" not in cdn_headers
+
+
+def test_request_json_accepts_a_bounded_per_request_timeout(tmp_path):
+    session, opener, _ = _session(tmp_path, [FakeResponse(200, b'{"data": {}}')])
+
+    assert session.request_json("/videos/example", timeout=2) == {"data": {}}
+
+    assert opener.requests[0][1] == 2

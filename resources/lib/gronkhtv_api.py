@@ -1,4 +1,5 @@
 import json
+import math
 from uuid import UUID
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode, urlsplit
@@ -69,7 +70,7 @@ def normalize_video(video):
     urls = video.get("urls") or {}
     chapters = video.get("chapters") or []
 
-    return {
+    normalized = {
         "id": video.get("id"),
         "episode": video.get("episode"),
         "title": video.get("title", ""),
@@ -87,6 +88,10 @@ def normalize_video(video):
         "previous": _normalize_related_video(video.get("previous")),
         "next": _normalize_related_video(video.get("next")),
     }
+    progress = _normalize_watch_progress(video.get("watch_progress"))
+    if progress is not None:
+        normalized["watch_progress"] = progress
+    return normalized
 
 
 def normalize_chapter(chapter):
@@ -345,6 +350,21 @@ def _thumbnail_from_stream(stream):
     if isinstance(thumbnail_urls, str):
         return thumbnail_urls
     return ""
+
+
+def _normalize_watch_progress(progress):
+    if not isinstance(progress, dict):
+        return None
+    offset = progress.get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, (int, float)):
+        return None
+    if not math.isfinite(offset) or offset < 0:
+        return None
+    normalized = {"offset": offset}
+    for field in ("updated_at", "marked_as_watched", "percentage"):
+        if field in progress:
+            normalized[field] = progress[field]
+    return normalized
 
 
 def _as_int(value, default):

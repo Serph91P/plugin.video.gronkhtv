@@ -107,3 +107,35 @@ msgstr "Möchtest du dich abmelden?"
 msgctxt "#30218"
 msgid "Signed out"
 msgstr "Abgemeldet"
+
+msgctxt "#30219"
+msgid "Synchronize watch progress"
+msgstr "Wiedergabefortschritt synchronisieren"
+
+msgctxt "#30220"
+msgid "Progress sync disabled"
+msgstr "Fortschrittssynchronisierung deaktiviert"
+
+msgctxt "#30221"
+msgid "Progress synchronized"
+msgstr "Fortschritt synchronisiert"
+
+msgctxt "#30222"
+msgid "Progress pending locally"
+msgstr "Fortschritt lokal ausstehend"
+
+msgctxt "#30223"
+msgid "Sign in required for progress sync"
+msgstr "Anmeldung für Fortschrittssynchronisierung erforderlich"
+
+msgctxt "#30224"
+msgid "Progress conflict needs a choice"
+msgstr "Fortschrittskonflikt benötigt eine Auswahl"
+
+msgctxt "#30225"
+msgid "Keep Kodi progress"
+msgstr "Kodi-Fortschritt behalten"
+
+msgctxt "#30226"
+msgid "Use account progress"
+msgstr "Konto-Fortschritt verwenden"
