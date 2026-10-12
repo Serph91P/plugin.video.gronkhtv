@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _addon_version(addon):
     version = addon.get("version")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version or ""):
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version or ""):
         raise ValueError("invalid Kodi add-on version")
     return tuple(map(int, version.split(".")))
 
@@ -40,7 +40,7 @@ def test_addon_version_is_valid_and_news_keeps_account_and_chapter_history():
     )
 
 
-@pytest.mark.parametrize("version", ["2.3", "v2.3.6", "2.3.6rc1", "2.-1.0", ""])
+@pytest.mark.parametrize("version", ["2.3", "v2.3.6", "2.3.6rc1", "2.-1.0", "01.2.3", ""])
 def test_addon_version_rejects_invalid_metadata(version, tmp_path):
     addon = tmp_path / "addon.xml"
     addon.write_text(f'<addon id="plugin.video.gronkhtv" version="{version}"/>\n', encoding="utf-8")
