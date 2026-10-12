@@ -1,0 +1,88 @@
+name: Allocate Release Version
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'addon.py'
+      - 'resources/**'
+  workflow_dispatch:
+
+concurrency:
+  group: gronkhtv-version-allocation
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  allocate:
+    if: github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact main commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+
+      - name: Allocate candidate version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          released_tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          output=$(python scripts/release_version.py --released-ref "$released_tag" --apply)
+          printf '%s\n' "$output"
+          if ! grep -q '^runtime_changed=true$' <<<"$output"; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(sed -n 's/^version=//p' <<<"$output")
+          test -n "$version"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Commit immutable candidate
+        if: steps.version.outputs.needed == 'true'
+        id: candidate
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="release/v${VERSION}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "$branch"
+            git diff --quiet FETCH_HEAD -- addon.xml || {
+              echo "Existing candidate branch has different version bytes" >&2
+              exit 1
+            }
+            candidate_sha=$(git rev-parse FETCH_HEAD)
+          else
+            git switch -c "$branch"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add addon.xml
+            git commit -m "Prepare release v${VERSION}"
+            candidate_sha=$(git rev-parse HEAD)
+            git push origin "$branch"
+          fi
+          gh workflow run addon-validations.yml --ref "$branch" -f candidate_sha="$candidate_sha"
+          existing_pr=$(gh pr list --base main --head "$branch" --state open --json url --jq '.[0].url // empty')
+          if [ -z "$existing_pr" ]; then
+            gh pr create --base main --head "$branch" \
+              --title "Prepare release v${VERSION}" \
+              --body "Automated version candidate for runtime changes since the latest immutable release. Merge only after Add-on Validations and GitGuardian pass on the exact candidate commit.\n\nRefs #33"
+          fi
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
