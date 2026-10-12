@@ -83,6 +83,24 @@ def test_addon_validations_has_minimal_workflow_permissions():
     assert "permissions:\n  contents: read\n\njobs:" in addon_validations
 
 
+def test_version_allocator_dispatch_guard_rejects_untrusted_refs_and_bot_recursion():
+    workflow = load_workflow(WORKFLOWS / "allocate-release-version.yml")
+    guard = workflow["jobs"]["allocate"]["if"]
+
+    def allows(ref, actor):
+        expression = guard.replace("github.ref", repr(ref)).replace(
+            "github.actor", repr(actor)
+        )
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        return bool(eval(expression, {"__builtins__": {}}, {}))
+
+    assert allows("refs/heads/main", "release-operator")
+    assert not allows("refs/heads/feature/untrusted", "release-operator")
+    assert not allows("refs/heads/release/v2.3.6", "release-operator")
+    assert not allows("refs/tags/v2.3.6", "release-operator")
+    assert not allows("refs/heads/main", "github-actions[bot]")
+
+
 def test_version_allocator_is_serialized_retry_safe_and_explicitly_dispatches_checks():
     workflow = load_workflow(WORKFLOWS / "allocate-release-version.yml")
     text = (WORKFLOWS / "allocate-release-version.yml").read_text(encoding="utf-8")
@@ -95,7 +113,10 @@ def test_version_allocator_is_serialized_retry_safe_and_explicitly_dispatches_ch
         "group": "gronkhtv-version-allocation",
         "cancel-in-progress": "false",
     }
-    assert workflow["jobs"]["allocate"]["if"] == "github.actor != 'github-actions[bot]'"
+    assert workflow["jobs"]["allocate"]["if"] == (
+        "github.ref == 'refs/heads/main' && "
+        "github.actor != 'github-actions[bot]'"
+    )
     assert workflow["permissions"] == {
         "actions": "write",
         "contents": "write",

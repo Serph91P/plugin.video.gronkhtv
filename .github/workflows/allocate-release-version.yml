@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   allocate:
-    if: github.actor != 'github-actions[bot]'
+    if: github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout exact main commit
