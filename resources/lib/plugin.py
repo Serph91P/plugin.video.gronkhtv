@@ -66,6 +66,7 @@ _CATEGORIES = [
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _SEARCH_PAGE_SIZE = 20
 _MAX_CHAPTER_ROUTE_OFFSET = 31536000
+_CHAPTER_SEEK_TOLERANCE = 5
 
 # Addon data paths
 _ADDON_DATA = xbmcvfs.translatePath(
@@ -1375,7 +1376,12 @@ def jump_to_chapter(params):
     xbmc.log(f"[Gronkh.tv] Starting playback of {url}", xbmc.LOGINFO)
     _play_direct(url, player)
 
-    if _seek_to_offset(player, offset, expected_path=url):
+    if _seek_to_offset(
+        player,
+        offset,
+        tolerance=_CHAPTER_SEEK_TOLERANCE,
+        expected_path=url,
+    ):
         _monitor_episode(episode, progress_sync, video_id)
         return True
     _stop_failed_playback(player)

@@ -310,10 +310,12 @@ class FakeSeekPlayer:
         ready_after=0,
         seek_succeeds=True,
         playing_files=None,
+        corrected_position=None,
     ):
         self.ready_after = ready_after
         self.seek_succeeds = seek_succeeds
         self.playing_files = list(playing_files or ["https://media/playlist"])
+        self.corrected_position = corrected_position
         self.reads = 0
         self.position = 0.0
         self.seek_calls = []
@@ -337,7 +339,9 @@ class FakeSeekPlayer:
     def seekTime(self, offset):
         self.seek_calls.append(offset)
         if self.seek_succeeds:
-            self.position = offset
+            self.position = (
+                offset if self.corrected_position is None else self.corrected_position
+            )
 
     def stop(self):
         self.stopped = True
@@ -389,6 +393,52 @@ def test_verified_seek_performs_only_one_bounded_retry(plugin, monkeypatch):
     assert plugin._seek_to_offset(player, 120, timeout=1, tolerance=2) is False
 
     assert player.seek_calls == [120.0, 120.0]
+
+
+def test_chapter_jump_accepts_bounded_timestamp_correction_for_guest_playback(
+    plugin, monkeypatch
+):
+    """A chapter seek may verify Kodi's bounded corrected position without login."""
+    _install_clock(plugin, monkeypatch)
+    player = FakeSeekPlayer(corrected_position=104.0)
+    monitors = []
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: player)
+    monkeypatch.setattr(plugin, "get_playlist_url", lambda episode: "https://media/playlist")
+    monkeypatch.setattr(plugin, "_play_direct", lambda url, actual_player: actual_player)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: None)
+    monkeypatch.setattr(
+        plugin,
+        "monitor_playback",
+        lambda *args, **kwargs: monitors.append((args, kwargs)),
+    )
+
+    assert plugin.jump_to_chapter({"episode": "1105", "offset": "100"}) is True
+
+    assert player.seek_calls == [100.0]
+    assert monitors == [((1105,), {})]
+
+
+def test_default_seek_still_rejects_four_second_position_correction(plugin, monkeypatch):
+    _install_clock(plugin, monkeypatch)
+    player = FakeSeekPlayer(corrected_position=104.0)
+
+    assert plugin._seek_to_offset(player, 100, timeout=1) is False
+
+    assert player.seek_calls == [100.0, 100.0]
+
+
+def test_chapter_jump_rejects_materially_wrong_corrected_position(plugin, monkeypatch):
+    _install_clock(plugin, monkeypatch)
+    player = FakeSeekPlayer(corrected_position=110.0)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: player)
+    monkeypatch.setattr(plugin, "get_playlist_url", lambda episode: "https://media/playlist")
+    monkeypatch.setattr(plugin, "_play_direct", lambda url, actual_player: actual_player)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: None)
+
+    assert plugin.jump_to_chapter({"episode": "1105", "offset": "100"}) is False
+
+    assert player.seek_calls == [100.0, 100.0]
+    assert player.stopped is True
 
 
 def test_verified_seek_rejects_offset_beyond_known_duration_before_seek(plugin, monkeypatch):
