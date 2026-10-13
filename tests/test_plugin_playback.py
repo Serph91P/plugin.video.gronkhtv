@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import types
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,25 @@ ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "resources" / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
+
+
+def _visible_account_actions(settings):
+    category = ET.parse(ROOT / "resources" / "settings.xml").find("category")
+    assert category is not None
+    elements = category.findall("setting")
+    visible = []
+    for index, element in enumerate(elements):
+        condition = element.attrib.get("visible")
+        if condition == "false":
+            continue
+        if condition:
+            offset, expected = condition.removeprefix("eq(").removesuffix(")").split(",")
+            referenced = elements[index + int(offset)].attrib["id"]
+            if settings.get(referenced, "false") != expected:
+                continue
+        if element.attrib.get("type") == "action":
+            visible.append(element.attrib["id"])
+    return visible
 
 
 class FakeAddon:
@@ -131,16 +151,16 @@ def test_opening_settings_resets_stale_login_state_when_cookie_is_missing(
     plugin.handle_open_settings()
 
     assert calls == [
+        ("account_session_present", "false"),
         ("account_logged_in", "false"),
         ("account_status", "30209"),
         ("openSettings", None),
     ]
 
 
-def test_opening_settings_resets_login_state_when_session_has_expired(
-    plugin, monkeypatch
-):
+def test_opening_settings_keeps_stale_session_controls_reachable(plugin, monkeypatch):
     calls = []
+    settings = {"account_session_present": "true", "account_logged_in": "true"}
 
     class ExpiredSession:
         def current_user(self):
@@ -161,11 +181,12 @@ def test_opening_settings_resets_login_state_when_session_has_expired(
         "_deactivate_account_progress_sync",
         lambda: calls.append(("deactivate", None)),
     )
-    monkeypatch.setattr(
-        plugin._addon,
-        "setSetting",
-        lambda setting_id, value: calls.append((setting_id, value)),
-    )
+
+    def set_setting(setting_id, value):
+        settings[setting_id] = value
+        calls.append((setting_id, value))
+
+    monkeypatch.setattr(plugin._addon, "setSetting", set_setting)
     monkeypatch.setattr(
         plugin._addon,
         "openSettings",
@@ -178,9 +199,52 @@ def test_opening_settings_resets_login_state_when_session_has_expired(
     assert calls == [
         ("configure", None),
         ("deactivate", None),
+        ("account_session_present", "true"),
         ("account_logged_in", "false"),
         ("account_status", "30210"),
         ("openSettings", None),
+    ]
+    assert _visible_account_actions(settings) == ["account_retry", "account_logout"]
+
+
+def test_account_listing_keeps_retry_and_logout_reachable_for_expired_session(
+    plugin, monkeypatch
+):
+    actions = []
+
+    class ExpiredSession:
+        def current_user(self):
+            raise plugin.AuthenticationError("expired")
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(plugin, "_account_session", ExpiredSession())
+    monkeypatch.setattr(plugin, "configure_account_session", lambda session: None)
+    monkeypatch.setattr(plugin, "_deactivate_account_progress_sync", lambda: None)
+    monkeypatch.setattr(plugin, "_set_account_status", lambda status: None)
+    monkeypatch.setattr(plugin._addon, "setSetting", lambda setting_id, value: None)
+    monkeypatch.setattr(plugin._addon, "getSetting", lambda setting_id: "expired")
+    monkeypatch.setattr(
+        plugin, "_add_account_entry", lambda label, action, icon: actions.append(action)
+    )
+    monkeypatch.setattr(
+        plugin.xbmcplugin, "setPluginCategory", lambda *args: None, raising=False
+    )
+    monkeypatch.setattr(plugin.xbmcplugin, "setContent", lambda *args: None, raising=False)
+    monkeypatch.setattr(
+        plugin.xbmcplugin, "addSortMethod", lambda *args: None, raising=False
+    )
+    monkeypatch.setattr(
+        plugin.xbmcplugin, "endOfDirectory", lambda *args: None, raising=False
+    )
+
+    plugin.list_account()
+
+    assert actions == [
+        "account_status",
+        "account_login",
+        "account_logout",
+        "open_settings",
+        "open_twitch_settings",
     ]
 
 
@@ -209,15 +273,18 @@ def test_opening_settings_reconciles_valid_session_before_rendering(plugin, monk
     plugin.handle_open_settings()
 
     assert calls == [
+        ("account_session_present", "true"),
         ("account_logged_in", "true"),
         ("account_status", "30211: Tester"),
         ("openSettings", None),
     ]
 
 
-@pytest.mark.parametrize(("cookie_exists", "expected"), [(False, "false"), (True, "true")])
+@pytest.mark.parametrize(
+    ("cookie_exists", "session_present"), [(False, "false"), (True, "true")]
+)
 def test_account_indicator_is_initialized_from_persisted_session(
-    plugin, monkeypatch, cookie_exists, expected
+    plugin, monkeypatch, cookie_exists, session_present
 ):
     calls = []
     monkeypatch.setattr(plugin.os.path, "exists", lambda path: cookie_exists)
@@ -229,7 +296,10 @@ def test_account_indicator_is_initialized_from_persisted_session(
 
     plugin._sync_account_indicator_from_storage()
 
-    assert calls == [("account_logged_in", expected)]
+    assert calls == [
+        ("account_session_present", session_present),
+        ("account_logged_in", "false"),
+    ]
 
 
 def test_login_reuses_already_authenticated_session_without_prompting(plugin, monkeypatch):
@@ -267,6 +337,7 @@ def test_login_reuses_already_authenticated_session_without_prompting(plugin, mo
     plugin.handle_account_login()
 
     assert calls == [
+        ("account_session_present", "true"),
         ("account_logged_in", "true"),
         ("account_status", "30211: Tester"),
         ("activate", user),
@@ -329,6 +400,117 @@ def test_login_routes_server_challenge_through_same_session(plugin, monkeypatch)
     ]
     assert not any(call[0] == "clear" for call in calls)
     assert ("account_logged_in", "true") in calls
+
+
+def test_rejected_credentials_clear_controller_auth_state(plugin, monkeypatch):
+    calls = []
+
+    class RejectedSession:
+        def current_user(self):
+            raise plugin.AuthenticationError("stale")
+
+        def login(self, login, password, two_factor_code=None):
+            calls.append(("login", login, password, two_factor_code))
+            raise plugin.AuthenticationError("rejected")
+
+        def clear(self):
+            calls.append(("clear", None))
+
+    answers = iter(["tester@example.com", "password"])
+
+    class Dialog:
+        def input(self, *args, **kwargs):
+            return next(answers)
+
+        def notification(self, *args):
+            calls.append(("notification", args[1]))
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(plugin, "_account_session", RejectedSession())
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin._addon, "getSetting", lambda setting_id: "")
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "configure_account_session",
+        lambda session: calls.append(("configure", session)),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_deactivate_account_progress_sync",
+        lambda: calls.append(("deactivate", None)),
+    )
+
+    plugin.handle_account_login()
+
+    assert ("login", "tester@example.com", "password", None) in calls
+    assert ("clear", None) in calls
+    assert ("configure", None) in calls
+    assert ("deactivate", None) in calls
+    assert ("account_session_present", "false") in calls
+    assert ("account_logged_in", "false") in calls
+    assert not any(call == ("account_logged_in", "true") for call in calls)
+
+
+def test_cancelled_two_factor_clears_challenge_and_controller_auth_state(
+    plugin, monkeypatch
+):
+    calls = []
+
+    class ChallengeSession:
+        def login(self, login, password, two_factor_code=None):
+            calls.append(("login", login, password, two_factor_code))
+            return types.SimpleNamespace(
+                authenticated=False, requires_two_factor=True, user=None
+            )
+
+        def clear(self):
+            calls.append(("clear", None))
+
+    answers = iter(["tester@example.com", "password", ""])
+
+    class Dialog:
+        def input(self, *args, **kwargs):
+            return next(answers)
+
+        def notification(self, *args):
+            calls.append(("notification", args[1]))
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(plugin, "_account_session", ChallengeSession())
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin._addon, "getSetting", lambda setting_id: "")
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "configure_account_session",
+        lambda session: calls.append(("configure", session)),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_deactivate_account_progress_sync",
+        lambda: calls.append(("deactivate", None)),
+    )
+
+    plugin.handle_account_login()
+
+    assert [call for call in calls if call[0] == "login"] == [
+        ("login", "tester@example.com", "password", None)
+    ]
+    assert ("clear", None) in calls
+    assert ("configure", None) in calls
+    assert ("deactivate", None) in calls
+    assert ("account_session_present", "false") in calls
+    assert ("account_logged_in", "false") in calls
+    assert not any(call == ("account_logged_in", "true") for call in calls)
 
 
 @pytest.mark.parametrize(

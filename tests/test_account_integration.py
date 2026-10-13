@@ -31,17 +31,23 @@ def test_settings_expose_only_state_appropriate_account_actions_without_secrets(
     assert account_category is not None
     account_settings = account_category.findall("setting")
     assert [setting.attrib["id"] for setting in account_settings] == [
+        "account_session_present",
         "account_logged_in",
         "account_status",
         "account_login",
+        "account_retry",
         "account_logout",
     ]
-    assert settings["account_status"].attrib["visible"] == "eq(-1,true)"
-    assert settings["account_login"].attrib["visible"] == "eq(-2,false)"
-    assert settings["account_logout"].attrib["visible"] == "eq(-3,true)"
+    assert settings["account_status"].attrib["visible"] == "eq(-2,true)"
+    assert settings["account_login"].attrib["visible"] == "eq(-3,false)"
+    assert settings["account_retry"].attrib["visible"] == "eq(-4,true)"
+    assert settings["account_logout"].attrib["visible"] == "eq(-5,true)"
 
-    def visible_setting_ids(logged_in):
-        values = {"account_logged_in": logged_in}
+    def visible_setting_ids(session_present, logged_in):
+        values = {
+            "account_session_present": session_present,
+            "account_logged_in": logged_in,
+        }
         visible = []
         for index, setting in enumerate(account_settings):
             condition = setting.attrib["visible"]
@@ -55,9 +61,19 @@ def test_settings_expose_only_state_appropriate_account_actions_without_secrets(
             visible.append(setting.attrib["id"])
         return visible
 
-    assert visible_setting_ids(False) == ["account_login"]
-    assert visible_setting_ids(True) == ["account_status", "account_logout"]
+    assert visible_setting_ids(False, False) == ["account_login"]
+    assert visible_setting_ids(True, False) == [
+        "account_status",
+        "account_retry",
+        "account_logout",
+    ]
+    assert visible_setting_ids(True, True) == [
+        "account_status",
+        "account_retry",
+        "account_logout",
+    ]
     assert settings["account_login"].attrib["action"].endswith("?action=account_login)")
+    assert settings["account_retry"].attrib["action"].endswith("?action=account_login)")
     assert (
         settings["account_logout"].attrib["action"].endswith("?action=account_logout)")
     )
