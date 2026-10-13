@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <settings>
     <category label="30200">
-        <setting id="account_session_present" type="bool" default="false" visible="false"/>
+        <!-- Conservative until plugin.py can reconcile cookie storage. Kodi may
+             open this dialog directly while upgrading from a version that did
+             not persist account_session_present. This is not an auth flag. -->
+        <setting id="account_session_present" type="bool" default="true" visible="false"/>
         <setting id="account_logged_in" type="bool" default="false" visible="false"/>
         <setting id="account_status" type="text" label="30202" default="" enable="false" visible="eq(-2,true)"/>
         <setting id="account_login" type="action" label="30203" action="RunPlugin(plugin://$ID/?action=account_login)" option="close" visible="eq(-3,false)"/>
