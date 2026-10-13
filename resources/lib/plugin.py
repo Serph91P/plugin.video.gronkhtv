@@ -76,10 +76,25 @@ _WATCHED_DIR = os.path.join(_ADDON_DATA, "watched_episodes")
 _FAVORITES_FILE = os.path.join(_ADDON_DATA, "favorites.json")
 _ACCOUNT_COOKIE_FILE = os.path.join(_ADDON_DATA, "account", "cookies.txt")
 _PROGRESS_SYNC_FILE = os.path.join(_ADDON_DATA, "account", "progress-sync.sqlite3")
+
+
+def _sync_account_indicator_from_storage():
+    """Initialize the settings UI from the persisted session marker.
+
+    Kodi may open add-on settings without routing through ``handle_open_settings``.
+    A cookie file is therefore the only local, non-blocking startup signal that
+    can keep Logout reachable until the session is validated by a controller.
+    """
+    _addon.setSetting(
+        "account_logged_in", "true" if os.path.exists(_ACCOUNT_COOKIE_FILE) else "false"
+    )
+
+
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
 configure_account_session(
     _account_session if os.path.exists(_ACCOUNT_COOKIE_FILE) else None
 )
+_sync_account_indicator_from_storage()
 
 chapter_cache = {}
 video_info_cache = {}
@@ -682,8 +697,10 @@ def _read_account_user():
     try:
         user = _account_session.current_user()
     except (AuthenticationError, SessionError):
-        _account_session.clear()
+        # Keep persisted credentials available for an explicit retry or Logout.
+        # Rendering/opening account controls must never destroy session data.
         configure_account_session(None)
+        _deactivate_account_progress_sync()
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30210))
         return None
@@ -1481,6 +1498,12 @@ def handle_show_live_stream(params):
 
 
 def handle_account_login(params=None):
+    existing_user = _read_account_user()
+    if existing_user:
+        _activate_account_progress_sync(existing_user)
+        xbmc.executebuiltin("Container.Refresh")
+        return
+
     dialog = xbmcgui.Dialog()
     saved_login = _addon.getSetting("account_email")
     login = dialog.input(
