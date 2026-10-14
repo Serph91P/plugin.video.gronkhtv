@@ -76,10 +76,27 @@ _WATCHED_DIR = os.path.join(_ADDON_DATA, "watched_episodes")
 _FAVORITES_FILE = os.path.join(_ADDON_DATA, "favorites.json")
 _ACCOUNT_COOKIE_FILE = os.path.join(_ADDON_DATA, "account", "cookies.txt")
 _PROGRESS_SYNC_FILE = os.path.join(_ADDON_DATA, "account", "progress-sync.sqlite3")
+
+
+def _sync_account_indicator_from_storage():
+    """Initialize the settings UI from the persisted session marker.
+
+    Kodi may open add-on settings without routing through ``handle_open_settings``.
+    A cookie file is therefore the only local, non-blocking startup signal that
+    can keep Logout reachable until the session is validated by a controller.
+    """
+    session_present = os.path.exists(_ACCOUNT_COOKIE_FILE)
+    _addon.setSetting("account_session_present", "true" if session_present else "false")
+    # A persisted cookie makes account controls available, but is not proof that
+    # the backend still accepts the session.
+    _addon.setSetting("account_logged_in", "false")
+
+
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
 configure_account_session(
     _account_session if os.path.exists(_ACCOUNT_COOKIE_FILE) else None
 )
+_sync_account_indicator_from_storage()
 
 chapter_cache = {}
 video_info_cache = {}
@@ -676,14 +693,18 @@ def list_live_streams():
 
 def _read_account_user():
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         return None
     try:
         user = _account_session.current_user()
     except (AuthenticationError, SessionError):
-        _account_session.clear()
+        # Keep persisted credentials available for an explicit retry or Logout.
+        # Rendering/opening account controls must never destroy session data.
         configure_account_session(None)
+        _deactivate_account_progress_sync()
+        _addon.setSetting("account_session_present", "true")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30210))
         return None
@@ -694,6 +715,7 @@ def _read_account_user():
         if name
         else _addon.getLocalizedString(30211)
     )
+    _addon.setSetting("account_session_present", "true")
     _addon.setSetting("account_logged_in", "true")
     _set_account_status(status)
     return user
@@ -736,6 +758,12 @@ def list_account():
             "account_login",
             "DefaultAddonService.png",
         )
+        if os.path.exists(_ACCOUNT_COOKIE_FILE):
+            _add_account_entry(
+                _addon.getLocalizedString(30205),
+                "account_logout",
+                "DefaultAddonService.png",
+            )
     _add_account_entry(
         _addon.getLocalizedString(30212),
         "open_settings",
@@ -1481,6 +1509,12 @@ def handle_show_live_stream(params):
 
 
 def handle_account_login(params=None):
+    existing_user = _read_account_user()
+    if existing_user:
+        _activate_account_progress_sync(existing_user)
+        xbmc.executebuiltin("Container.Refresh")
+        return
+
     dialog = xbmcgui.Dialog()
     saved_login = _addon.getSetting("account_email")
     login = dialog.input(
@@ -1509,6 +1543,10 @@ def handle_account_login(params=None):
             if not code:
                 _account_session.clear()
                 configure_account_session(None)
+                _deactivate_account_progress_sync()
+                _addon.setSetting("account_session_present", "false")
+                _addon.setSetting("account_logged_in", "false")
+                _set_account_status(_addon.getLocalizedString(30209))
                 dialog.notification(
                     _plugin,
                     _addon.getLocalizedString(30215),
@@ -1526,6 +1564,7 @@ def handle_account_login(params=None):
         configure_account_session(_account_session)
         _activate_account_progress_sync(result.user)
         _addon.setSetting("account_email", login)
+        _addon.setSetting("account_session_present", "true")
         _addon.setSetting("account_logged_in", "true")
         name = _account_name(result.user)
         status = (
@@ -1543,6 +1582,8 @@ def handle_account_login(params=None):
     except (AuthenticationError, SessionError, ValueError) as exc:
         _account_session.clear()
         configure_account_session(None)
+        _deactivate_account_progress_sync()
+        _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         xbmc.log(f"[Gronkh.tv] Account login failed: {exc}", xbmc.LOGWARNING)
@@ -1564,6 +1605,7 @@ def handle_account_logout(params=None):
         _account_session.clear()
     configure_account_session(None)
     _deactivate_account_progress_sync()
+    _addon.setSetting("account_session_present", "false")
     _addon.setSetting("account_logged_in", "false")
     _set_account_status(_addon.getLocalizedString(30209))
     dialog.notification(

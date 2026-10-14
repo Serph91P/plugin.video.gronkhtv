@@ -5,6 +5,44 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _visible_account_setting_ids(persisted_settings):
+    """Evaluate Kodi's relative visibility rules from persisted/default values."""
+    root = ET.parse(ROOT / "resources" / "settings.xml").getroot()
+    account_settings = root.findall("./category[@label='30200']/setting")
+    values = {
+        setting.attrib["id"]: persisted_settings.get(
+            setting.attrib["id"], setting.attrib.get("default", "")
+        )
+        for setting in account_settings
+    }
+    visible = []
+    for index, setting in enumerate(account_settings):
+        condition = setting.attrib["visible"]
+        if condition == "false":
+            continue
+        if condition.startswith("eq("):
+            relative_index, expected = condition[3:-1].split(",")
+            target = account_settings[index + int(relative_index)]
+            if values[target.attrib["id"]] != expected:
+                continue
+        visible.append(setting.attrib["id"])
+    return visible
+
+
+def test_direct_settings_upgrade_without_new_marker_keeps_retry_and_logout_reachable():
+    """Kodi can open add-on settings before importing the plugin controller."""
+    assert _visible_account_setting_ids({"account_logged_in": "false"}) == [
+        "account_status",
+        "account_retry",
+        "account_logout",
+    ]
+    assert _visible_account_setting_ids({"account_logged_in": "true"}) == [
+        "account_status",
+        "account_retry",
+        "account_logout",
+    ]
+
+
 def test_manifest_declares_twitch_playback_dependency():
     root = ET.parse(ROOT / "addon.xml").getroot()
     imports = {
@@ -27,21 +65,28 @@ def test_settings_expose_only_state_appropriate_account_actions_without_secrets(
         "default": "false",
         "visible": "false",
     }
+    assert settings["account_session_present"].attrib["default"] == "true"
     account_category = root.find("./category[@label='30200']")
     assert account_category is not None
     account_settings = account_category.findall("setting")
     assert [setting.attrib["id"] for setting in account_settings] == [
+        "account_session_present",
         "account_logged_in",
         "account_status",
         "account_login",
+        "account_retry",
         "account_logout",
     ]
-    assert settings["account_status"].attrib["visible"] == "eq(-1,true)"
-    assert settings["account_login"].attrib["visible"] == "eq(-2,false)"
-    assert settings["account_logout"].attrib["visible"] == "eq(-3,true)"
+    assert settings["account_status"].attrib["visible"] == "eq(-2,true)"
+    assert settings["account_login"].attrib["visible"] == "eq(-3,false)"
+    assert settings["account_retry"].attrib["visible"] == "eq(-4,true)"
+    assert settings["account_logout"].attrib["visible"] == "eq(-5,true)"
 
-    def visible_setting_ids(logged_in):
-        values = {"account_logged_in": logged_in}
+    def visible_setting_ids(session_present, logged_in):
+        values = {
+            "account_session_present": session_present,
+            "account_logged_in": logged_in,
+        }
         visible = []
         for index, setting in enumerate(account_settings):
             condition = setting.attrib["visible"]
@@ -55,9 +100,19 @@ def test_settings_expose_only_state_appropriate_account_actions_without_secrets(
             visible.append(setting.attrib["id"])
         return visible
 
-    assert visible_setting_ids(False) == ["account_login"]
-    assert visible_setting_ids(True) == ["account_status", "account_logout"]
+    assert visible_setting_ids(False, False) == ["account_login"]
+    assert visible_setting_ids(True, False) == [
+        "account_status",
+        "account_retry",
+        "account_logout",
+    ]
+    assert visible_setting_ids(True, True) == [
+        "account_status",
+        "account_retry",
+        "account_logout",
+    ]
     assert settings["account_login"].attrib["action"].endswith("?action=account_login)")
+    assert settings["account_retry"].attrib["action"].endswith("?action=account_login)")
     assert (
         settings["account_logout"].attrib["action"].endswith("?action=account_logout)")
     )
