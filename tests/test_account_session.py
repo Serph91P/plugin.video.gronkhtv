@@ -169,6 +169,37 @@ def test_two_factor_submission_reuses_existing_challenge_session(tmp_path):
     assert json.loads(opener.requests[2][0].data)["2fa_code"] == "123456"
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_logout_clears_before_remote_dispatch_and_keeps_a_new_session(tmp_path, failed):
+    session, opener, cookie_path = _session(tmp_path, [])
+    session.cookie_jar.set_cookie(_cookie("XSRF-TOKEN", "synthetic-csrf"))
+    session.cookie_jar.set_cookie(_cookie("copycat-session", "synthetic-old"))
+    session.save()
+
+    def remote(request, timeout=None):
+        assert not cookie_path.exists(), "local logout must precede a slow response"
+        assert "synthetic-old" in request.get_header("Cookie")
+        assert request.get_header("X-xsrf-token") == "synthetic-csrf"
+        from urllib.request import HTTPCookieProcessor
+        assert HTTPCookieProcessor(session.cookie_jar).http_request(request).get_header("Cookie") == request.get_header("Cookie")
+        replacement = GronkhTVSession(cookie_path)
+        replacement.cookie_jar.set_cookie(_cookie("copycat-session", "synthetic-new"))
+        replacement.save()
+        if failed:
+            raise SessionError("synthetic transport unavailable")
+        return FakeResponse(204)
+
+    opener.open = remote
+    if failed:
+        with pytest.raises(SessionError):
+            session.logout()
+    else:
+        session.logout()
+    assert cookie_path.exists()
+    assert GronkhTVSession(cookie_path)._cookie_value("copycat-session") == "synthetic-new"
+    assert list(session.cookie_jar) == []
+
+
 def test_logout_revokes_remote_session_and_removes_local_cookie_file(tmp_path):
     session, opener, cookie_path = _session(tmp_path, [FakeResponse(204)])
     session.cookie_jar.set_cookie(_cookie("XSRF-TOKEN", "csrf-token"))

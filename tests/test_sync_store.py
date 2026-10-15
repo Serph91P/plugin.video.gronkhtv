@@ -18,7 +18,7 @@ def _claim(db_path, account_id, output):
 def test_account_epoch_and_pending_records_are_isolated_and_zero_is_a_real_value(tmp_path):
     store = SyncStore(tmp_path / "progress.sqlite3")
     epoch_a = store.activate("account-a", enabled=True)
-    record_a = store.record_local("account-a", "video-a", 0, 120)
+    record_a = store.record_local("account-a", epoch_a, "video-a", 0, 120)
     epoch_b = store.activate("account-b", enabled=True)
 
     assert epoch_b > epoch_a
@@ -30,9 +30,9 @@ def test_account_epoch_and_pending_records_are_isolated_and_zero_is_a_real_value
 def test_stale_ack_cannot_clear_newer_revision_or_another_epoch(tmp_path):
     store = SyncStore(tmp_path / "progress.sqlite3")
     epoch_a = store.activate("account-a", enabled=True)
-    first = store.record_local("account-a", "video-a", 10, 100)
+    first = store.record_local("account-a", epoch_a, "video-a", 10, 100)
     lease = store.claim_upload("account-a", lease_seconds=30)
-    second = store.record_local("account-a", "video-a", 2, 100)
+    second = store.record_local("account-a", epoch_a, "video-a", 2, 100)
 
     assert not store.confirm_upload("account-a", epoch_a, lease, "video-a", first["revision"])
     assert store.pending("account-a", "video-a")["revision"] == second["revision"]
@@ -65,7 +65,7 @@ def test_two_processes_receive_monotonic_fencing_tokens(tmp_path):
 def test_logout_or_switch_invalidates_old_upload_lease_without_deleting_pending(tmp_path):
     store = SyncStore(tmp_path / "progress.sqlite3")
     epoch_a = store.activate("account-a", enabled=True)
-    item = store.record_local("account-a", "video-a", 30, 100)
+    item = store.record_local("account-a", epoch_a, "video-a", 30, 100)
     lease = store.claim_upload("account-a", lease_seconds=30)
 
     store.deactivate()
@@ -80,7 +80,7 @@ def test_logout_or_switch_invalidates_old_upload_lease_without_deleting_pending(
 def test_observe_remote_rejects_a_same_account_stale_epoch_without_mutation(tmp_path):
     store = SyncStore(tmp_path / "progress.sqlite3")
     old_epoch = store.activate("account-a", enabled=True)
-    store.record_local("account-a", "video-a", 12, 100)
+    store.record_local("account-a", old_epoch, "video-a", 12, 100)
     baseline = {"status": "valid", "offset": 7, "updated_at": "before"}
     store.observe_remote("account-a", old_epoch, "video-a", baseline)
     pending_before = store.pending("account-a", "video-a")

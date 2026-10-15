@@ -16,7 +16,7 @@ import inputstreamhelper
 
 from account import AuthenticationError, GronkhTVSession, SessionError
 from account.progress import ProgressClient
-from account.progress_sync import ProgressSync
+from account.progress_sync import ProgressSync, ValidatedProgressContext
 from account.resume_start import ResumeStartController
 from account.sync_store import SyncStore
 from context_menu import (
@@ -102,6 +102,8 @@ chapter_cache = {}
 video_info_cache = {}
 _PLAYBACK_GENERATION = 0
 _LEGACY_LOOKUP_SEMAPHORE = threading.BoundedSemaphore(value=1)
+_CONTEXT_SEMAPHORE = threading.BoundedSemaphore(value=1)
+_UPLOAD_SEMAPHORE = threading.BoundedSemaphore(value=1)
 
 
 @lru_cache(maxsize=100)
@@ -290,32 +292,77 @@ def _set_account_status(status):
     _addon.setSetting("account_status", status)
 
 
-def _account_progress_sync():
-    """Return a private queue bound to the persisted, stable account context.
+def _account_progress_sync(timeout_seconds=2.25):
+    """Build/validate the entire optional context off the UI thread, bounded.
 
-    It does not issue HTTP itself.  The playback monitor only writes local
-    snapshots; the bounded POST is started after playback has stopped.
+    One outstanding initializer per invoker, including SQLite lock waits. A late
+    users/self response cannot reactivate a context or schedule progress reads.
     """
-    if not _setting_enabled("sync_watch_progress") or not os.path.exists(_ACCOUNT_COOKIE_FILE):
+    if not _CONTEXT_SEMAPHORE.acquire(blocking=False):
         return None
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    done = threading.Event()
+    result: list = [None]
+
+    def build():
+        try:
+            result[0] = _build_account_progress_sync(deadline)
+        except Exception:
+            xbmc.log("[Gronkh.tv] Account progress context unavailable", xbmc.LOGWARNING)
+        finally:
+            _CONTEXT_SEMAPHORE.release()
+            done.set()
+
     try:
-        store = SyncStore(_PROGRESS_SYNC_FILE)
-        context = store.context()
-        account_id = context["active_account_id"]
-        if not account_id or not context["sync_enabled"]:
-            _read_account_user(expected_sync_epoch=context["epoch"], timeout=2.25)
-            context = store.context()
-            account_id = context["active_account_id"]
-            if not account_id or not context["sync_enabled"]:
-                return None
-        # A sync job must retain the cookies it was created with.  The global
-        # session is reused by interactive login/logout and may later represent
-        # another account while an old uploader is still running.
-        session_snapshot = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
-        return ProgressSync(store, ProgressClient(session_snapshot), account_id, context["epoch"])
-    except Exception as exc:
-        xbmc.log(f"[Gronkh.tv] Account progress sync unavailable: {exc}", xbmc.LOGWARNING)
+        threading.Thread(target=build, daemon=True).start()
+    except RuntimeError:
+        _CONTEXT_SEMAPHORE.release()
         return None
+    done.wait(max(0, deadline - time.monotonic()))
+    return result[0] if done.is_set() and time.monotonic() < deadline else None
+
+
+def _observe_progress_opt_in(store):
+    # Read at each boundary, not just when creating a coordinator. Kodi's
+    # observed setting is the cutoff; requests already dispatched may finish.
+    if not _setting_enabled("sync_watch_progress"):
+        store.disable()
+        return False
+    return True
+
+
+def _build_account_progress_sync(deadline):
+    store = SyncStore(_PROGRESS_SYNC_FILE)
+    if not _observe_progress_opt_in(store) or not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        return None
+    context = store.context()
+    if time.monotonic() >= deadline:
+        return None
+    snapshot = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
+    # Validate the actual private transport, even when SQLite already has A.
+    # Login can save B's cookies before it activates B in another process.
+    try:
+        user = snapshot.current_user(timeout=max(0.001, deadline - time.monotonic()))
+    except AuthenticationError:
+        store.deactivate_if_epoch(context["epoch"])
+        return None
+    except SessionError:
+        return None
+    account_id = _account_id(user)
+    if account_id is None or time.monotonic() >= deadline or not _observe_progress_opt_in(store):
+        return None
+    epoch = store.reconcile(
+        account_id, context["epoch"],
+        allowed=lambda: time.monotonic() < deadline and _setting_enabled("sync_watch_progress"),
+    )
+    if not _observe_progress_opt_in(store) or epoch is None or time.monotonic() >= deadline:
+        return None
+    bound = ValidatedProgressContext(account_id, epoch, snapshot)
+    sync = ProgressSync(
+        store, ProgressClient(bound.session_snapshot), bound.account_id, bound.epoch,
+        enabled=lambda: _setting_enabled("sync_watch_progress"), context=bound,
+    )
+    return sync
 
 
 def _activate_account_progress_sync(user):
@@ -351,24 +398,40 @@ def _reconcile_account_progress_sync(user, expected_epoch):
 
 def _deactivate_account_progress_sync():
     try:
-        SyncStore(_PROGRESS_SYNC_FILE).deactivate()
+        return SyncStore(_PROGRESS_SYNC_FILE).deactivate()
     except Exception as exc:
         xbmc.log(f"[Gronkh.tv] Could not invalidate progress sync: {exc}", xbmc.LOGWARNING)
 
 
 def _flush_progress_async(progress_sync, video_id):
-    thread = threading.Thread(target=progress_sync.flush, args=(video_id,), daemon=True)
-    thread.start()
+    if not _UPLOAD_SEMAPHORE.acquire(blocking=False):
+        return
+
+    def flush():
+        try:
+            progress_sync.flush(video_id)
+        except Exception:
+            xbmc.log("[Gronkh.tv] Background progress flush unavailable", xbmc.LOGWARNING)
+        finally:
+            _UPLOAD_SEMAPHORE.release()
+
+    try:
+        threading.Thread(target=flush, daemon=True).start()
+    except RuntimeError:
+        _UPLOAD_SEMAPHORE.release()
 
 
-def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offset=None):
+def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offset=None, deadline=None):
     """Resolve a normal resume before playback, without a late seek fallback."""
     if explicit_offset is not None:
         return explicit_offset
+    timeout = 3 if deadline is None else max(0, deadline - time.monotonic())
+    if timeout <= 0:
+        return local_offset
     controller = ResumeStartController(progress_sync, video_id)
     result = controller.resolve(
         local_offset=local_offset,
-        timeout_seconds=3,
+        timeout_seconds=timeout,
         aborted=xbmc.Monitor().abortRequested,
     )
     if result["state"] == "conflict":
@@ -397,7 +460,7 @@ def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=12):
     the account-scoped observed cache in ``SyncStore``.
     """
     deadline = time.monotonic() + timeout_seconds
-    progress_sync = _account_progress_sync()
+    progress_sync = _account_progress_sync(timeout_seconds=max(0, deadline - time.monotonic()))
     if progress_sync is None:
         return {}
     candidates = []
@@ -723,32 +786,41 @@ def _read_account_user(expected_sync_epoch=None, timeout=None):
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         return None
-    if expected_sync_epoch is None and _setting_enabled("sync_watch_progress"):
+    if expected_sync_epoch is None:
         try:
             expected_sync_epoch = SyncStore(_PROGRESS_SYNC_FILE).context()["epoch"]
         except Exception as exc:
             xbmc.log(f"[Gronkh.tv] Account progress sync unavailable: {exc}", xbmc.LOGWARNING)
+            return None  # No unfenced user response may change account state.
     try:
         user = (
             _account_session.current_user(timeout=timeout)
             if timeout is not None
             else _account_session.current_user()
         )
-    except (AuthenticationError, SessionError):
+    except (AuthenticationError, SessionError) as exc:
         # Keep persisted credentials available for an explicit retry or Logout.
         # Rendering/opening account controls must never destroy session data.
+        if expected_sync_epoch is not None:
+            store = SyncStore(_PROGRESS_SYNC_FILE)
+            if isinstance(exc, AuthenticationError):
+                if store.deactivate_if_epoch(expected_sync_epoch) is None:
+                    return None
+            elif store.context()["epoch"] != expected_sync_epoch:
+                return None
         configure_account_session(None)
-        _deactivate_account_progress_sync()
         _addon.setSetting("account_session_present", "true")
         _addon.setSetting("account_logged_in", "false")
-        _set_account_status(_addon.getLocalizedString(30210))
+        _set_account_status(_addon.getLocalizedString(30210 if isinstance(exc, AuthenticationError) else 30227))
         return None
 
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
         return None
     account_id = _account_id(user)
-    if account_id is not None and expected_sync_epoch is not None:
-        if _reconcile_account_progress_sync(user, expected_sync_epoch) is None:
+    if expected_sync_epoch is not None:
+        if SyncStore(_PROGRESS_SYNC_FILE).context()["epoch"] != expected_sync_epoch:
+            return None
+        if account_id is not None and _setting_enabled("sync_watch_progress") and _reconcile_account_progress_sync(user, expected_sync_epoch) is None:
             return None
 
     name = _account_name(user)
@@ -1145,10 +1217,11 @@ def play_video(path, episode, start_offset=0):
 
     resume_record = get_resume_record(episode, legacy_duration=video_length)
     resume_point = resume_record["position"] if resume_record else 0
+    sync_deadline = time.monotonic() + 3
     progress_sync = _account_progress_sync()
     backend_video_id = info.get("id") if isinstance(info, dict) else None
     if start_offset == 0 and progress_sync is not None and backend_video_id:
-        resume_point = _account_resume_offset(progress_sync, backend_video_id, resume_point)
+        resume_point = _account_resume_offset(progress_sync, backend_video_id, resume_point, deadline=sync_deadline)
     xbmc.log(f"[Gronkh.tv] Resume point: {resume_point}", xbmc.LOGINFO)
 
     # Start-Offset (für Kapitel-Sprung oder Resume)
@@ -1201,6 +1274,8 @@ def monitor_playback(
         while player.isPlayingVideo() and not monitor.abortRequested():
             if not _is_current_playback_generation(generation):
                 return
+            if isinstance(progress_sync, ProgressSync) and not _observe_progress_opt_in(progress_sync._store):
+                progress_sync = None
             try:
                 current_time = _non_negative_finite(player.getTime(), "player time")
                 total_time = _non_negative_finite(
@@ -1247,6 +1322,8 @@ def monitor_playback(
     finally:
         if latest and _is_current_playback_generation(generation):
             save_resume_point(episode, latest["position"], latest["duration"])
+            if isinstance(progress_sync, ProgressSync) and not _observe_progress_opt_in(progress_sync._store):
+                progress_sync = None
             if progress_sync is not None and video_id:
                 try:
                     progress_sync.record_position(
@@ -1649,13 +1726,19 @@ def handle_account_logout(params=None):
     dialog = xbmcgui.Dialog()
     if not dialog.yesno(_plugin, _addon.getLocalizedString(30217)):
         return
+    # Invalidate queued workers before the remote logout can block. If the
+    # durable fence cannot be written, do not pretend local logout succeeded.
+    logout_epoch = _deactivate_account_progress_sync()
+    if logout_epoch is None:
+        dialog.notification(_plugin, _addon.getLocalizedString(30227), xbmcgui.NOTIFICATION_ERROR)
+        return
     try:
         _account_session.logout()
     except SessionError:
         xbmc.log("[Gronkh.tv] Remote logout failed", xbmc.LOGWARNING)
-        _account_session.clear()
+    if SyncStore(_PROGRESS_SYNC_FILE).context()["epoch"] != logout_epoch:
+        return
     configure_account_session(None)
-    _deactivate_account_progress_sync()
     _addon.setSetting("account_session_present", "false")
     _addon.setSetting("account_logged_in", "false")
     _set_account_status(_addon.getLocalizedString(30209))
@@ -1711,9 +1794,10 @@ def handle_play_resume(params):
     episode = _positive_int(params.get("episode"), "episode")
     resume_record = get_resume_record(episode)
     resume_point = resume_record["position"] if resume_record else 0
+    sync_deadline = time.monotonic() + 3
     progress_sync, video_id = _playback_sync_context(episode)
     if resume_record is None and progress_sync is not None and video_id:
-        resume_point = _account_resume_offset(progress_sync, video_id, resume_point)
+        resume_point = _account_resume_offset(progress_sync, video_id, resume_point, deadline=sync_deadline)
     url = get_playlist_url(episode)
     player = _play_direct(url)
 
@@ -1844,6 +1928,9 @@ def _report_seek_failure(message):
 
 def run():
     """Main entry point, sets up opener and runs router."""
+    if not _setting_enabled("sync_watch_progress"):
+        # Persist opt-out at every normal entry, without an unbounded DB wait.
+        _account_progress_sync(timeout_seconds=0.05)
     opener = build_opener()
     opener.addheaders = [
         ("User-Agent", _UA),

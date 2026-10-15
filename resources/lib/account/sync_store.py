@@ -1,5 +1,6 @@
 """Process-safe, account-isolated persistent queue for progress snapshots."""
 
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -24,7 +25,7 @@ class SyncStore:
         return connection
 
     def _initialize(self):
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA foreign_keys=ON")
             db.executescript(
@@ -57,7 +58,7 @@ class SyncStore:
     def activate(self, account_id, enabled):
         if not isinstance(account_id, str) or not account_id:
             raise ValueError("account id is required")
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
             epoch = db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0] + 1
             db.execute(
@@ -68,16 +69,16 @@ class SyncStore:
             db.execute("COMMIT")
             return epoch
 
-    def reconcile(self, account_id, expected_epoch):
+    def reconcile(self, account_id, expected_epoch, allowed=None):
         """Restore a validated account only if no newer auth event won the race."""
         if not isinstance(account_id, str) or not account_id:
             raise ValueError("account id is required")
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
             control = db.execute(
                 "SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1"
             ).fetchone()
-            if control["epoch"] != expected_epoch:
+            if control["epoch"] != expected_epoch or (allowed is not None and not allowed()):
                 db.execute("ROLLBACK")
                 return None
             if control["active_account_id"] == account_id and control["sync_enabled"]:
@@ -92,10 +93,25 @@ class SyncStore:
             db.execute("COMMIT")
             return epoch
 
+    def disable(self):
+        """Persist observed opt-out, idempotently, without deleting pending data."""
+        return self._deactivate(only_enabled=True)
+
+    def deactivate_if_epoch(self, expected_epoch):
+        return self._deactivate(expected_epoch=expected_epoch)
+
     def deactivate(self):
-        with self._connection() as db:
+        return self._deactivate()
+
+    def _deactivate(self, expected_epoch=None, only_enabled=False):
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
-            epoch = db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0] + 1
+            control = db.execute("SELECT epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
+            if ((expected_epoch is not None and control["epoch"] != expected_epoch)
+                    or (only_enabled and not control["sync_enabled"])):
+                db.execute("ROLLBACK")
+                return None
+            epoch = control["epoch"] + 1
             db.execute(
                 """UPDATE control SET active_account_id=NULL, epoch=?, sync_enabled=0,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
@@ -105,13 +121,13 @@ class SyncStore:
             return epoch
 
     def context(self):
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             row = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
             return dict(row)
 
     def is_active_context(self, account_id, epoch):
         """Check a job's immutable identity immediately before network I/O."""
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             row = db.execute(
                 "SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1"
             ).fetchone()
@@ -127,7 +143,7 @@ class SyncStore:
         account_id = context["active_account_id"]
         if not account_id or not context["sync_enabled"]:
             return "authentication_required"
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             rows = db.execute(
                 "SELECT confirmed_json, observed_json FROM progress WHERE account_id=? AND pending=1",
                 (account_id,),
@@ -147,15 +163,15 @@ class SyncStore:
                 return "conflict"
         return "pending" if rows else "synchronized"
 
-    def record_local(self, account_id, video_id, offset, duration=0):
+    def record_local(self, account_id, epoch, video_id, offset, duration=0):
         _non_negative(offset, "offset")
         _non_negative(duration, "duration")
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
-            control = db.execute("SELECT active_account_id, sync_enabled FROM control WHERE singleton=1").fetchone()
-            if control["active_account_id"] != account_id or not control["sync_enabled"]:
+            control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
+            if control["active_account_id"] != account_id or control["epoch"] != epoch or not control["sync_enabled"]:
                 db.execute("ROLLBACK")
-                raise RuntimeError("account is not the active sync context")
+                raise ContextLostError("account is not the active sync context")
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
             revision = (row["revision"] if row else 0) + 1
             db.execute(
@@ -170,7 +186,7 @@ class SyncStore:
             return {"account_id": account_id, "video_id": video_id, "offset": offset, "duration": duration, "revision": revision}
 
     def pending(self, account_id, video_id):
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             row = db.execute("SELECT * FROM progress WHERE account_id=? AND video_id=? AND pending=1", (account_id, video_id)).fetchone()
             return dict(row) if row else None
 
@@ -178,7 +194,7 @@ class SyncStore:
         """Persist only a successful remote read; failures must not look absent."""
         if not isinstance(remote, dict) or remote.get("status") not in {"valid", "absent"}:
             raise ValueError("only successful remote observations are persistable")
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
             control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
             if (
@@ -203,23 +219,24 @@ class SyncStore:
             db.execute("COMMIT")
 
     def observed_remote(self, account_id, video_id):
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             row = db.execute("SELECT observed_json FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
             if not row or row["observed_json"] is None:
                 return None
             return json.loads(row["observed_json"])
 
-    def rebase_pending_on_observed_remote(self, account_id, video_id):
+    def rebase_pending_on_observed_remote(self, account_id, epoch, video_id):
         """Record an explicit Kodi-choice against the current cloud baseline."""
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
-            control = db.execute("SELECT active_account_id, sync_enabled FROM control WHERE singleton=1").fetchone()
+            control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
             row = db.execute(
                 "SELECT offset, pending, observed_json FROM progress WHERE account_id=? AND video_id=?",
                 (account_id, video_id),
             ).fetchone()
             if (
                 control["active_account_id"] != account_id
+                or control["epoch"] != epoch
                 or not control["sync_enabled"]
                 or row is None
                 or not row["pending"]
@@ -238,17 +255,18 @@ class SyncStore:
             db.execute("COMMIT")
             return row["offset"]
 
-    def accept_observed_remote(self, account_id, video_id):
+    def accept_observed_remote(self, account_id, epoch, video_id):
         """Discard a pending Kodi choice only after the user selects account."""
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
-            control = db.execute("SELECT active_account_id, sync_enabled FROM control WHERE singleton=1").fetchone()
+            control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
             row = db.execute(
                 "SELECT pending, observed_json FROM progress WHERE account_id=? AND video_id=?",
                 (account_id, video_id),
             ).fetchone()
             if (
                 control["active_account_id"] != account_id
+                or control["epoch"] != epoch
                 or not control["sync_enabled"]
                 or row is None
                 or not row["pending"]
@@ -273,14 +291,15 @@ class SyncStore:
             db.execute("COMMIT")
             return observed["offset"]
 
-    def claim_upload(self, account_id, lease_seconds):
+    def claim_upload(self, account_id, lease_seconds, epoch=None):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        now = self._clock()
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
+            now = self._clock()
             control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
-            if control["active_account_id"] != account_id or not control["sync_enabled"]:
+            if (control["active_account_id"] != account_id or not control["sync_enabled"]
+                    or (epoch is not None and control["epoch"] != epoch)):
                 db.execute("ROLLBACK")
                 return None
             if control["lease_expires"] is not None and control["lease_expires"] > now:
@@ -294,15 +313,10 @@ class SyncStore:
     def confirm_upload(self, account_id, epoch, lease, video_id, revision, confirmed=None):
         if not lease:
             return False
-        with self._connection() as db:
+        with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
             control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
-            valid = (
-                control["active_account_id"] == account_id
-                and control["epoch"] == epoch
-                and control["lease_account_id"] == account_id
-                and control["lease_fence"] == lease.get("fence")
-            )
+            valid = self._owns_lease(control, account_id, epoch, lease)
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
             if not valid or not row or row["revision"] != revision:
                 db.execute("ROLLBACK")
@@ -318,6 +332,25 @@ class SyncStore:
             )
             db.execute("COMMIT")
             return True
+
+    def owns_lease(self, account_id, epoch, lease):
+        with closing(self._connection()) as db:
+            control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
+            return self._owns_lease(control, account_id, epoch, lease)
+
+    def _owns_lease(self, control, account_id, epoch, lease):
+        return bool(
+            lease
+            and lease.get("account_id") == account_id
+            and lease.get("epoch") == epoch
+            and control["active_account_id"] == account_id
+            and control["epoch"] == epoch
+            and control["sync_enabled"]
+            and control["lease_account_id"] == account_id
+            and control["lease_fence"] == lease.get("fence")
+            and control["lease_expires"] is not None
+            and control["lease_expires"] > self._clock()
+        )
 
 
 def _non_negative(value, name):

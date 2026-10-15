@@ -124,8 +124,8 @@ def test_auth_failure_never_clears_pending_or_invalidates_another_account(tmp_pa
 
 def test_account_switch_after_lease_fences_the_write_before_http(tmp_path):
     class FenceStore(SyncStore):
-        def claim_upload(self, account_id, lease_seconds):
-            lease = super().claim_upload(account_id, lease_seconds)
+        def claim_upload(self, account_id, lease_seconds, epoch=None):
+            lease = super().claim_upload(account_id, lease_seconds, epoch=epoch)
             self.activate("account-b", enabled=True)
             return lease
 
