@@ -68,6 +68,30 @@ class SyncStore:
             db.execute("COMMIT")
             return epoch
 
+    def reconcile(self, account_id, expected_epoch):
+        """Restore a validated account only if no newer auth event won the race."""
+        if not isinstance(account_id, str) or not account_id:
+            raise ValueError("account id is required")
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            control = db.execute(
+                "SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1"
+            ).fetchone()
+            if control["epoch"] != expected_epoch:
+                db.execute("ROLLBACK")
+                return None
+            if control["active_account_id"] == account_id and control["sync_enabled"]:
+                db.execute("ROLLBACK")
+                return control["epoch"]
+            epoch = control["epoch"] + 1
+            db.execute(
+                """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=1,
+                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
+                (account_id, epoch),
+            )
+            db.execute("COMMIT")
+            return epoch
+
     def deactivate(self):
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")

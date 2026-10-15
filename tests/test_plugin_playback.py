@@ -427,7 +427,6 @@ def test_login_reuses_already_authenticated_session_without_prompting(plugin, mo
         ("account_session_present", "true"),
         ("account_logged_in", "true"),
         ("account_status", "30211: Tester"),
-        ("activate", user),
         ("builtin", "Container.Refresh"),
     ]
 
@@ -1203,6 +1202,181 @@ def test_listing_uses_authenticated_remote_progress_before_playback(plugin, monk
         "Fortsetzen bei 0:01:15",
         "RunPlugin(plugin://plugin.video.gronkhtv/?action=play_resume&episode=1105)",
     )
+
+
+def test_latest_uploads_recovers_missing_sqlite_context_from_one_validated_session(
+    plugin, monkeypatch, tmp_path
+):
+    """A normal second listing repairs context without reopening the account folder."""
+    from account.sync_store import SyncStore
+
+    items = []
+    reads = []
+    session_reads = []
+    settings = {"sync_watch_progress": "true"}
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("synthetic-session", encoding="utf-8")
+    missing_epoch = SyncStore(progress_path).deactivate()
+    video = {
+        "id": "synthetic-video-id",
+        "episode": 1105,
+        "title": "Latest upload",
+        "video_length": 300,
+        "tags": [],
+    }
+
+    class Session:
+        def current_user(self, timeout=None):
+            session_reads.append(timeout)
+            return {"id": "account-1", "displayname": "Tester"}
+
+    class API:
+        def read(self, video_id):
+            reads.append(video_id)
+            return types.SimpleNamespace(
+                status="valid", offset=75, updated_at="synthetic", marked_as_watched=False
+            )
+
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(plugin, "_account_session", Session())
+    monkeypatch.setattr(plugin, "ProgressClient", lambda session: API())
+    monkeypatch.setattr(plugin._addon, "getSetting", lambda key: settings.get(key, ""))
+    monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
+    monkeypatch.setattr(plugin.xbmcgui, "ListItem", RecordingListItem)
+    monkeypatch.setattr(plugin, "get_videos", lambda *args, **kwargs: ([video], ""))
+    monkeypatch.setattr(plugin, "get_chapters", lambda episode: [])
+    monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plugin, "is_watched", lambda episode: False, raising=False)
+    monkeypatch.setattr(plugin, "is_favorite", lambda episode: False)
+    monkeypatch.setattr(
+        plugin.xbmcplugin,
+        "addDirectoryItem",
+        lambda handle, url, list_item, is_folder: items.append(list_item),
+        raising=False,
+    )
+    for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+
+    plugin.list_videos(plugin._CATEGORIES[0])
+    restored = SyncStore(progress_path).context()
+    plugin.list_videos(plugin._CATEGORIES[0])
+    repeated = SyncStore(progress_path).context()
+
+    assert missing_epoch < restored["epoch"]
+    assert restored == repeated
+    assert restored["active_account_id"] == "account-1"
+    assert restored["sync_enabled"] == 1
+    assert session_reads == [2.25]
+    assert reads == [video["id"], video["id"]]
+    assert items[0].tag.calls["setResumePoint"] == [((75, 300), {})]
+
+
+@pytest.mark.parametrize("account_id", [True, False, "", "   ", None, [], {}])
+def test_validated_session_with_invalid_flat_id_does_not_restore_context(
+    plugin, monkeypatch, tmp_path, account_id
+):
+    from account.sync_store import SyncStore
+
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("synthetic-session", encoding="utf-8")
+    initial = SyncStore(progress_path).context()
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(
+        plugin,
+        "_account_session",
+        types.SimpleNamespace(current_user=lambda timeout=None: {"id": account_id}),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "getSetting",
+        lambda key: "true" if key == "sync_watch_progress" else "",
+    )
+    monkeypatch.setattr(plugin._addon, "setSetting", lambda *args: None)
+
+    assert plugin._account_progress_sync() is None
+    assert SyncStore(progress_path).context() == initial
+
+
+@pytest.mark.parametrize(
+    ("sync_enabled", "cookie_present"), [(False, True), (True, False)]
+)
+def test_context_recovery_never_validates_a_session_when_sync_or_cookie_gate_is_closed(
+    plugin, monkeypatch, tmp_path, sync_enabled, cookie_present
+):
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    if cookie_present:
+        cookie_path.write_text("synthetic-session", encoding="utf-8")
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(
+        plugin,
+        "_account_session",
+        types.SimpleNamespace(
+            current_user=lambda: pytest.fail("closed recovery gate performed a session read")
+        ),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "getSetting",
+        lambda key: "true" if key == "sync_watch_progress" and sync_enabled else "false",
+    )
+
+    assert plugin._account_progress_sync() is None
+
+
+def test_logout_during_session_reconciliation_cannot_reactivate_sqlite_context(
+    plugin, monkeypatch, tmp_path
+):
+    from account.sync_store import SyncStore
+
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("synthetic-session", encoding="utf-8")
+    store = SyncStore(progress_path)
+    store.activate("account-1", enabled=True)
+    store.deactivate()
+    expected_epoch = store.context()["epoch"]
+    read_started = threading.Event()
+    read_finished = threading.Event()
+    result = []
+
+    class Session:
+        def current_user(self):
+            read_started.set()
+            assert read_finished.wait(2)
+            return {"id": "account-1"}
+
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(plugin, "_account_session", Session())
+    monkeypatch.setattr(
+        plugin._addon,
+        "getSetting",
+        lambda key: "true" if key == "sync_watch_progress" else "",
+    )
+    monkeypatch.setattr(plugin._addon, "setSetting", lambda *args: None)
+
+    worker = threading.Thread(
+        target=lambda: result.append(plugin._read_account_user(expected_epoch)), daemon=True
+    )
+    worker.start()
+    assert read_started.wait(2)
+    logout_epoch = SyncStore(progress_path).deactivate()
+    cookie_path.unlink()
+    read_finished.set()
+    worker.join(2)
+
+    assert result == [None]
+    assert SyncStore(progress_path).context() == {
+        "active_account_id": None,
+        "epoch": logout_epoch,
+        "sync_enabled": 0,
+    }
 
 
 def test_remote_only_list_resume_context_seeks_the_account_offset(plugin, monkeypatch):

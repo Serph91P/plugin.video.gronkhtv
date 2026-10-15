@@ -95,3 +95,32 @@ def test_observe_remote_rejects_a_same_account_stale_epoch_without_mutation(tmp_
     assert new_epoch > old_epoch
     assert store.observed_remote("account-a", "video-a") == baseline
     assert store.pending("account-a", "video-a") == pending_before
+
+
+def test_reconcile_restores_a_missing_context_without_churning_a_stable_epoch(tmp_path):
+    store = SyncStore(tmp_path / "progress.sqlite3")
+    missing_epoch = store.deactivate()
+
+    restored_epoch = store.reconcile("account-a", expected_epoch=missing_epoch)
+    repeated_epoch = store.reconcile("account-a", expected_epoch=restored_epoch)
+
+    assert restored_epoch > missing_epoch
+    assert repeated_epoch == restored_epoch
+    assert store.context() == {
+        "active_account_id": "account-a",
+        "epoch": restored_epoch,
+        "sync_enabled": 1,
+    }
+
+
+def test_reconcile_cannot_reactivate_after_a_concurrent_logout(tmp_path):
+    store = SyncStore(tmp_path / "progress.sqlite3")
+    expected_epoch = store.activate("account-a", enabled=True)
+    logout_epoch = store.deactivate()
+
+    assert store.reconcile("account-a", expected_epoch=expected_epoch) is None
+    assert store.context() == {
+        "active_account_id": None,
+        "epoch": logout_epoch,
+        "sync_enabled": 0,
+    }
