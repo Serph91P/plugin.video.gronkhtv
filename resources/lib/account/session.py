@@ -16,7 +16,28 @@ _USER_AGENT = (
 
 
 class SessionError(RuntimeError):
-    pass
+    """A safe public error with optional allowlisted request diagnostics."""
+
+    _AUTH_PHASES = frozenset(("csrf", "auth", "2fa", "current_user"))
+
+    def __init__(self, message="GronkhTV request failed", phase=None, status=None):
+        super().__init__(message)
+        self.phase = phase if phase in self._AUTH_PHASES else None
+        self.status = (
+            status
+            if isinstance(status, int)
+            and not isinstance(status, bool)
+            and 100 <= status <= 599
+            else None
+        )
+
+    def auth_diagnostic(self):
+        fields = []
+        if self.phase is not None:
+            fields.append(f"phase={self.phase}")
+        if self.status is not None:
+            fields.append(f"status={self.status}")
+        return " ".join(fields) or "unavailable"
 
 
 class AuthenticationError(SessionError):
@@ -30,8 +51,8 @@ class ValidationError(SessionError):
 class RateLimitError(SessionError):
     """The server requested a bounded pause before another attempt."""
 
-    def __init__(self, message, retry_after=None):
-        super().__init__(message)
+    def __init__(self, message, retry_after=None, phase=None, status=None):
+        super().__init__(message, phase=phase, status=status)
         self.retry_after = retry_after
 
 
@@ -60,7 +81,7 @@ class GronkhTVSession:
         if two_factor_code is None:
             self._prepare_csrf()
         elif not self._cookie_value("XSRF-TOKEN"):
-            raise AuthenticationError("Die Zwei-Faktor-Sitzung ist abgelaufen")
+            raise AuthenticationError("GronkhTV authentication failed", phase="2fa")
 
         payload = {"login": login, "password": password}
         if two_factor_code:
@@ -72,6 +93,7 @@ class GronkhTVSession:
             payload=payload,
             accepted_statuses=(202, 204),
             csrf=True,
+            phase="2fa" if two_factor_code is not None else "auth",
         )
         self.save()
         if status == 202:
@@ -81,12 +103,12 @@ class GronkhTVSession:
         return LoginResult(authenticated=True, user=user)
 
     def current_user(self):
-        user = self.request_json("/users/self")
+        user = self.request_json("/users/self", phase="current_user")
         if isinstance(user, dict) and "data" in user:
             return user["data"]
         return user
 
-    def request_json(self, path, method="GET", payload=None, timeout=None):
+    def request_json(self, path, method="GET", payload=None, timeout=None, phase=None):
         csrf = method.upper() not in ("GET", "HEAD") and bool(
             self._cookie_value("XSRF-TOKEN")
         )
@@ -97,11 +119,17 @@ class GronkhTVSession:
             accepted_statuses=(200,),
             csrf=csrf,
             timeout=timeout,
+            phase=phase,
         )
         try:
             return json.loads(content.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SessionError("GronkhTV hat ungueltiges JSON geliefert") from exc
+            message = (
+                "GronkhTV response could not be decoded"
+                if phase in SessionError._AUTH_PHASES
+                else "GronkhTV hat ungueltiges JSON geliefert"
+            )
+            raise SessionError(message, phase=phase) from exc
 
     def request_bytes(self, path):
         _, content = self._request(path, accepted_statuses=(200,))
@@ -148,9 +176,9 @@ class GronkhTVSession:
             self.cookie_jar.clear()
 
     def _prepare_csrf(self):
-        self._request("/csrf-cookie", accepted_statuses=(204,))
+        self._request("/csrf-cookie", accepted_statuses=(204,), phase="csrf")
         if not self._cookie_value("XSRF-TOKEN"):
-            raise AuthenticationError("GronkhTV hat kein CSRF-Cookie geliefert")
+            raise AuthenticationError("GronkhTV authentication failed", phase="csrf")
         self.save()
 
     def _request(
@@ -161,6 +189,7 @@ class GronkhTVSession:
         accepted_statuses=(200,),
         csrf=False,
         timeout=None,
+        phase=None,
     ):
         url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
         headers = {
@@ -176,7 +205,12 @@ class GronkhTVSession:
         if csrf:
             csrf_token = self._cookie_value("XSRF-TOKEN")
             if not csrf_token:
-                raise AuthenticationError("Die GronkhTV-Sitzung ist nicht vorbereitet")
+                message = (
+                    "GronkhTV authentication failed"
+                    if phase in SessionError._AUTH_PHASES
+                    else "Die GronkhTV-Sitzung ist nicht vorbereitet"
+                )
+                raise AuthenticationError(message, phase=phase)
             headers["X-XSRF-TOKEN"] = unquote(csrf_token)
 
         request = Request(url, data=data, headers=headers, method=method)
@@ -187,25 +221,52 @@ class GronkhTVSession:
                     status = response.getcode()
                 content = response.read()
         except HTTPError as exc:
-            message = self._error_message(exc)
+            status = self._safe_status(exc.code)
+            message = (
+                "GronkhTV request failed"
+                if phase in SessionError._AUTH_PHASES
+                else self._error_message(exc)
+            )
             if exc.code in (401, 403, 419):
-                raise AuthenticationError(message) from exc
+                raise AuthenticationError(message, phase=phase, status=status) from exc
             if exc.code == 422:
-                raise ValidationError(message) from exc
+                raise ValidationError(message, phase=phase, status=status) from exc
             if exc.code == 429:
-                raise RateLimitError(message, _retry_after(exc)) from exc
-            raise SessionError(message) from exc
+                raise RateLimitError(
+                    message, _retry_after(exc), phase=phase, status=status
+                ) from exc
+            raise SessionError(message, phase=phase, status=status) from exc
         except (URLError, TimeoutError, OSError) as exc:
-            raise SessionError(f"GronkhTV ist nicht erreichbar: {exc}") from exc
+            message = (
+                "GronkhTV request failed"
+                if phase in SessionError._AUTH_PHASES
+                else f"GronkhTV ist nicht erreichbar: {exc}"
+            )
+            raise SessionError(message, phase=phase) from exc
 
         if status not in accepted_statuses:
-            raise SessionError(f"Unerwartete GronkhTV-Antwort: HTTP {status}")
+            message = (
+                "GronkhTV request failed"
+                if phase in SessionError._AUTH_PHASES
+                else f"Unerwartete GronkhTV-Antwort: HTTP {status}"
+            )
+            raise SessionError(
+                message,
+                phase=phase,
+                status=self._safe_status(status),
+            )
         return status, content
 
     def _cookie_value(self, name):
         for cookie in self.cookie_jar:
             if cookie.name == name:
                 return cookie.value
+        return None
+
+    @staticmethod
+    def _safe_status(status):
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            return status
         return None
 
     @staticmethod
