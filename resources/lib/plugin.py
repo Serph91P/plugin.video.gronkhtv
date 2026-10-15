@@ -298,6 +298,7 @@ def _account_progress_sync(timeout_seconds=2.25):
     One outstanding initializer per invoker, including SQLite lock waits. A late
     users/self response cannot reactivate a context or schedule progress reads.
     """
+    _observe_progress_opt_in()
     if not _CONTEXT_SEMAPHORE.acquire(blocking=False):
         return None
     deadline = time.monotonic() + max(0, timeout_seconds)
@@ -322,11 +323,15 @@ def _account_progress_sync(timeout_seconds=2.25):
     return result[0] if done.is_set() and time.monotonic() < deadline else None
 
 
-def _observe_progress_opt_in(store):
-    # Read at each boundary, not just when creating a coordinator. Kodi's
-    # observed setting is the cutoff; requests already dispatched may finish.
+def _observe_progress_opt_in(store=None):
+    # Observe before the optional initializer permit. Persist an epoch cutoff
+    # even when its SQLite writer is busy; never wait for that writer here.
     if not _setting_enabled("sync_watch_progress"):
-        store.disable()
+        try:
+            store = store or SyncStore(_PROGRESS_SYNC_FILE, timeout=0, initialize=False)
+            store.observe_opt_out()
+        except Exception:
+            xbmc.log("[Gronkh.tv] Progress opt-out persistence unavailable", xbmc.LOGWARNING)
         return False
     return True
 
@@ -1275,6 +1280,7 @@ def monitor_playback(
             if not _is_current_playback_generation(generation):
                 return
             if isinstance(progress_sync, ProgressSync) and not _observe_progress_opt_in(progress_sync._store):
+                progress_sync.invalidate()
                 progress_sync = None
             try:
                 current_time = _non_negative_finite(player.getTime(), "player time")
@@ -1323,6 +1329,7 @@ def monitor_playback(
         if latest and _is_current_playback_generation(generation):
             save_resume_point(episode, latest["position"], latest["duration"])
             if isinstance(progress_sync, ProgressSync) and not _observe_progress_opt_in(progress_sync._store):
+                progress_sync.invalidate()
                 progress_sync = None
             if progress_sync is not None and video_id:
                 try:

@@ -36,6 +36,7 @@ class ProgressSync:
         self._lease_seconds = lease_seconds
         self._max_write_attempts = max_write_attempts
         self._enabled = enabled or (lambda: True)
+        self._revoked = False
         if context is not None and (context.account_id != account_id or context.epoch != epoch):
             raise ValueError("validated context identity mismatch")
         self._context = context
@@ -44,9 +45,19 @@ class ProgressSync:
     def context(self):
         return self._context
 
+    def invalidate(self):
+        """Revoke this job even if optional durable persistence fails."""
+        self._revoked = True
+        try:
+            self._store.observe_opt_out()
+        except Exception:
+            pass  # Optional sync must not break local playback on DB/I/O failure.
+
     def _active(self):
+        if self._revoked:
+            return False
         if not self._enabled():
-            self._store.disable()
+            self.invalidate()
             return False
         return self._store.is_active_context(self._account_id, self._epoch)
 

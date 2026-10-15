@@ -13,14 +13,58 @@ class ContextLostError(RuntimeError):
 
 
 class SyncStore:
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, timeout=3, initialize=True):
         self.path = str(path)
         self._clock = clock
+        self._timeout = timeout
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        if initialize:
+            self._initialize()
+            self.apply_observed_opt_out()
+
+    def _opt_out_epoch(self):
+        # Append-only invalidation journal: an observed off event must survive
+        # a busy SQLite writer AND a subsequent process exit/re-enable. Entries
+        # contain epochs only, never account/session/progress data.
+        try:
+            with open(self.path + ".optout", encoding="ascii") as journal:
+                return max((int(line) for line in journal), default=-1)
+        except FileNotFoundError:
+            return -1
+
+    def observe_opt_out(self):
+        """Journal the cutoff without waiting for a SQLite writer."""
+        fast = SyncStore(self.path, self._clock, timeout=0, initialize=False)
+        epoch = fast.context()["epoch"]
+        if fast._opt_out_epoch() < epoch:
+            fd = os.open(self.path + ".optout", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, (str(epoch) + "\n").encode("ascii"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        try:
+            fast.apply_observed_opt_out()
+        except sqlite3.Error:
+            # Durable cutoff already fences all old jobs. Materialize the DB
+            # epoch when the writer releases it, in the optional initializer.
+            pass
+
+    def apply_observed_opt_out(self):
+        cutoff = self._opt_out_epoch()
+        if cutoff < 0:
+            return
+        with closing(self._connection()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE control SET active_account_id=NULL, epoch=epoch+1, sync_enabled=0,
+                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL
+                   WHERE singleton=1 AND epoch<=? AND sync_enabled=1""", (cutoff,),
+            )
+            db.execute("COMMIT")
 
     def _connection(self):
-        connection = sqlite3.connect(self.path, timeout=3, isolation_level=None)
+        connection = sqlite3.connect(self.path, timeout=self._timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -60,7 +104,7 @@ class SyncStore:
             raise ValueError("account id is required")
         with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
-            epoch = db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0] + 1
+            epoch = max(db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0], self._opt_out_epoch()) + 1
             db.execute(
                 """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=?,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
@@ -81,10 +125,13 @@ class SyncStore:
             if control["epoch"] != expected_epoch or (allowed is not None and not allowed()):
                 db.execute("ROLLBACK")
                 return None
+            if control["sync_enabled"] and control["epoch"] <= self._opt_out_epoch():
+                db.execute("ROLLBACK")
+                return None
             if control["active_account_id"] == account_id and control["sync_enabled"]:
                 db.execute("ROLLBACK")
                 return control["epoch"]
-            epoch = control["epoch"] + 1
+            epoch = max(control["epoch"], self._opt_out_epoch()) + 1
             db.execute(
                 """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=1,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
@@ -135,6 +182,7 @@ class SyncStore:
                 row["active_account_id"] == account_id
                 and row["epoch"] == epoch
                 and bool(row["sync_enabled"])
+                and epoch > self._opt_out_epoch()
             )
 
     def display_status(self):
@@ -169,7 +217,8 @@ class SyncStore:
         with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
             control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
-            if control["active_account_id"] != account_id or control["epoch"] != epoch or not control["sync_enabled"]:
+            if (control["active_account_id"] != account_id or control["epoch"] != epoch
+                    or not control["sync_enabled"] or epoch <= self._opt_out_epoch()):
                 db.execute("ROLLBACK")
                 raise ContextLostError("account is not the active sync context")
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
@@ -201,6 +250,7 @@ class SyncStore:
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
                 or not control["sync_enabled"]
+                or epoch <= self._opt_out_epoch()
             ):
                 db.execute("ROLLBACK")
                 raise ContextLostError("account is not the active sync context")
@@ -238,6 +288,7 @@ class SyncStore:
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
                 or not control["sync_enabled"]
+                or epoch <= self._opt_out_epoch()
                 or row is None
                 or not row["pending"]
                 or row["observed_json"] is None
@@ -268,6 +319,7 @@ class SyncStore:
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
                 or not control["sync_enabled"]
+                or epoch <= self._opt_out_epoch()
                 or row is None
                 or not row["pending"]
                 or row["observed_json"] is None
@@ -299,6 +351,7 @@ class SyncStore:
             now = self._clock()
             control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
             if (control["active_account_id"] != account_id or not control["sync_enabled"]
+                    or control["epoch"] <= self._opt_out_epoch()
                     or (epoch is not None and control["epoch"] != epoch)):
                 db.execute("ROLLBACK")
                 return None
@@ -346,6 +399,7 @@ class SyncStore:
             and control["active_account_id"] == account_id
             and control["epoch"] == epoch
             and control["sync_enabled"]
+            and epoch > self._opt_out_epoch()
             and control["lease_account_id"] == account_id
             and control["lease_fence"] == lease.get("fence")
             and control["lease_expires"] is not None
