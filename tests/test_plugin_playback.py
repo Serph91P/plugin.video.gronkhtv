@@ -24,7 +24,7 @@ def _visible_account_actions(settings):
         condition = element.attrib.get("visible")
         if condition == "false":
             continue
-        if condition:
+        if condition and condition.startswith("eq("):
             offset, expected = condition.removeprefix("eq(").removesuffix(")").split(",")
             referenced = elements[index + int(offset)].attrib["id"]
             if settings.get(referenced, "false") != expected:
@@ -156,6 +156,9 @@ def test_opening_settings_resets_stale_login_state_when_cookie_is_missing(
         ("account_status", "30209"),
         ("openSettings", None),
     ]
+    assert _visible_account_actions(
+        {"account_session_present": "false", "account_logged_in": "false"}
+    ) == ["account_login", "account_logout"]
 
 
 def test_opening_settings_keeps_stale_session_controls_reachable(plugin, monkeypatch):
@@ -246,6 +249,90 @@ def test_account_listing_keeps_retry_and_logout_reachable_for_expired_session(
         "open_settings",
         "open_twitch_settings",
     ]
+
+
+def test_account_listing_keeps_login_and_recovery_reachable_without_cookie(
+    plugin, monkeypatch
+):
+    actions = []
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(plugin, "_set_account_status", lambda status: None)
+    monkeypatch.setattr(plugin._addon, "setSetting", lambda *args: None)
+    monkeypatch.setattr(plugin._addon, "getSetting", lambda setting_id: "")
+    monkeypatch.setattr(
+        plugin, "_add_account_entry", lambda label, action, icon: actions.append(action)
+    )
+    monkeypatch.setattr(
+        plugin.xbmcplugin, "setPluginCategory", lambda *args: None, raising=False
+    )
+    monkeypatch.setattr(plugin.xbmcplugin, "setContent", lambda *args: None, raising=False)
+    monkeypatch.setattr(
+        plugin.xbmcplugin, "addSortMethod", lambda *args: None, raising=False
+    )
+    monkeypatch.setattr(
+        plugin.xbmcplugin, "endOfDirectory", lambda *args: None, raising=False
+    )
+
+    plugin.list_account()
+
+    assert actions == [
+        "account_status",
+        "account_login",
+        "account_logout",
+        "open_settings",
+        "open_twitch_settings",
+    ]
+
+
+def test_confirmed_logout_without_cookie_performs_safe_local_cleanup(plugin, monkeypatch):
+    calls = []
+
+    class Session:
+        def logout(self):
+            calls.append(("logout", None))
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            calls.append(("notification", args[1]))
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(plugin, "_account_session", Session())
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(
+        plugin,
+        "configure_account_session",
+        lambda session: calls.append(("configure", session)),
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_deactivate_account_progress_sync",
+        lambda: calls.append(("deactivate", None)),
+    )
+    monkeypatch.setattr(
+        plugin._addon,
+        "setSetting",
+        lambda setting_id, value: calls.append((setting_id, value)),
+    )
+    monkeypatch.setattr(
+        plugin, "_set_account_status", lambda status: calls.append(("status", status))
+    )
+    monkeypatch.setattr(
+        plugin.xbmc,
+        "executebuiltin",
+        lambda command: calls.append(("builtin", command)),
+        raising=False,
+    )
+
+    plugin.handle_account_logout()
+
+    assert ("logout", None) in calls
+    assert ("configure", None) in calls
+    assert ("deactivate", None) in calls
+    assert ("account_session_present", "false") in calls
+    assert ("account_logged_in", "false") in calls
 
 
 def test_opening_settings_reconciles_valid_session_before_rendering(plugin, monkeypatch):
@@ -404,6 +491,7 @@ def test_login_routes_server_challenge_through_same_session(plugin, monkeypatch)
 
 def test_rejected_credentials_clear_controller_auth_state(plugin, monkeypatch):
     calls = []
+    logs = []
 
     class RejectedSession:
         def current_user(self):
@@ -411,7 +499,9 @@ def test_rejected_credentials_clear_controller_auth_state(plugin, monkeypatch):
 
         def login(self, login, password, two_factor_code=None):
             calls.append(("login", login, password, two_factor_code))
-            raise plugin.AuthenticationError("rejected")
+            raise plugin.AuthenticationError(
+                "secret-backend-message", phase="auth", status=401
+            )
 
         def clear(self):
             calls.append(("clear", None))
@@ -428,6 +518,7 @@ def test_rejected_credentials_clear_controller_auth_state(plugin, monkeypatch):
     monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
     monkeypatch.setattr(plugin, "_account_session", RejectedSession())
     monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "log", lambda message, level: logs.append(message))
     monkeypatch.setattr(plugin._addon, "getSetting", lambda setting_id: "")
     monkeypatch.setattr(
         plugin._addon,
@@ -454,6 +545,9 @@ def test_rejected_credentials_clear_controller_auth_state(plugin, monkeypatch):
     assert ("account_session_present", "false") in calls
     assert ("account_logged_in", "false") in calls
     assert not any(call == ("account_logged_in", "true") for call in calls)
+    assert ("notification", "30216 (phase=auth status=401)") in calls
+    assert logs == ["[Gronkh.tv] Account login failed: phase=auth status=401"]
+    assert "secret" not in " ".join(logs + [str(call) for call in calls])
 
 
 def test_cancelled_two_factor_clears_challenge_and_controller_auth_state(

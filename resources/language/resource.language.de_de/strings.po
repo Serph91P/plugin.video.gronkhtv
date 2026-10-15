@@ -54,7 +54,7 @@ msgstr "Anmelden"
 
 msgctxt "#30205"
 msgid "Sign out"
-msgstr "Abmelden"
+msgstr "Abmelden / Sitzung zurücksetzen"
 
 msgctxt "#30206"
 msgid "Playback"

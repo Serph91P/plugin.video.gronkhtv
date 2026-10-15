@@ -2,8 +2,10 @@ import json
 import os
 import stat
 import sys
+from io import BytesIO
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -12,7 +14,13 @@ LIB = ROOT / "resources" / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
-from account.session import GronkhTVSession  # noqa: E402
+from account.session import (  # noqa: E402
+    AuthenticationError,
+    GronkhTVSession,
+    RateLimitError,
+    SessionError,
+    ValidationError,
+)
 
 
 class FakeResponse:
@@ -41,7 +49,10 @@ class FakeOpener:
         if request.full_url.endswith("/csrf-cookie"):
             self.cookie_jar.set_cookie(_cookie("XSRF-TOKEN", "csrf%3Dvalue"))
             self.cookie_jar.set_cookie(_cookie("copycat-session", "session-value"))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def _cookie(name, value):
@@ -76,6 +87,16 @@ def _session(tmp_path, responses):
         opener=opener,
     )
     return session, opener, cookie_path
+
+
+def _http_error(status, body=b'{"message":"secret-response-marker"}', headers=None):
+    return HTTPError(
+        "https://backend.gronkh.tv/v3/auth",
+        status,
+        "secret-reason-marker",
+        headers or {},
+        BytesIO(body),
+    )
 
 
 def test_login_uses_csrf_cookie_and_persists_only_session_data(tmp_path):
@@ -161,6 +182,16 @@ def test_logout_revokes_remote_session_and_removes_local_cookie_file(tmp_path):
     assert list(session.cookie_jar) == []
 
 
+def test_logout_without_cookie_is_local_noop_cleanup(tmp_path):
+    session, opener, cookie_path = _session(tmp_path, [])
+
+    session.logout()
+
+    assert opener.requests == []
+    assert not cookie_path.exists()
+    assert list(session.cookie_jar) == []
+
+
 def test_login_rejects_empty_credentials_without_network_request(tmp_path):
     session, opener, _ = _session(tmp_path, [])
 
@@ -189,3 +220,78 @@ def test_request_json_accepts_a_bounded_per_request_timeout(tmp_path):
     assert session.request_json("/videos/example", timeout=2) == {"data": {}}
 
     assert opener.requests[0][1] == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (401, AuthenticationError),
+        (403, AuthenticationError),
+        (419, AuthenticationError),
+        (422, ValidationError),
+        (429, RateLimitError),
+        (500, SessionError),
+    ],
+)
+def test_auth_http_errors_expose_only_allowlisted_phase_and_status(
+    tmp_path, status, error_type
+):
+    headers = {"Retry-After": "7"} if status == 429 else {}
+    session, _, _ = _session(tmp_path, [FakeResponse(204), _http_error(status, headers=headers)])
+
+    with pytest.raises(error_type) as caught:
+        session.login("secret-login-marker", "secret-password-marker")
+
+    error = caught.value
+    assert error.auth_diagnostic() == f"phase=auth status={status}"
+    assert "secret" not in f"{error} {error.auth_diagnostic()}"
+    if status == 429:
+        assert error.retry_after == 7.0
+
+
+def test_csrf_http_error_reports_csrf_phase(tmp_path):
+    session, _, _ = _session(tmp_path, [_http_error(500)])
+
+    with pytest.raises(SessionError) as caught:
+        session.login("login", "password")
+
+    assert caught.value.auth_diagnostic() == "phase=csrf status=500"
+
+
+def test_auth_diagnostics_use_actual_2fa_and_current_user_callsites(tmp_path):
+    session, opener, _ = _session(
+        tmp_path,
+        [FakeResponse(204), FakeResponse(202), _http_error(403)],
+    )
+    session.login("login", "password")
+
+    with pytest.raises(AuthenticationError) as two_factor:
+        session.login("login", "password", two_factor_code="123456")
+    assert two_factor.value.auth_diagnostic() == "phase=2fa status=403"
+
+    opener.responses.append(_http_error(401))
+    with pytest.raises(AuthenticationError) as current_user:
+        session.current_user()
+    assert current_user.value.auth_diagnostic() == "phase=current_user status=401"
+
+
+def test_transport_and_decode_failures_do_not_expose_exception_or_payload(tmp_path):
+    session, opener, _ = _session(
+        tmp_path,
+        [FakeResponse(204), URLError("secret-transport-marker")],
+    )
+    with pytest.raises(SessionError) as transport:
+        session.login("login", "password")
+    assert transport.value.auth_diagnostic() == "phase=auth"
+    assert "secret" not in str(transport.value)
+
+    opener.responses.append(FakeResponse(200, b"secret-invalid-json-marker"))
+    with pytest.raises(SessionError) as decode:
+        session.current_user()
+    assert decode.value.auth_diagnostic() == "phase=current_user"
+    assert "secret" not in str(decode.value)
+
+
+def test_diagnostic_rejects_unknown_phase_and_invalid_status():
+    error = SessionError("safe", phase="password", status=True)
+    assert error.auth_diagnostic() == "unavailable"

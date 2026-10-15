@@ -80,7 +80,7 @@ def test_settings_expose_only_state_appropriate_account_actions_without_secrets(
     assert settings["account_status"].attrib["visible"] == "eq(-2,true)"
     assert settings["account_login"].attrib["visible"] == "eq(-3,false)"
     assert settings["account_retry"].attrib["visible"] == "eq(-4,true)"
-    assert settings["account_logout"].attrib["visible"] == "eq(-5,true)"
+    assert settings["account_logout"].attrib["visible"] == "true"
 
     def visible_setting_ids(session_present, logged_in):
         values = {
@@ -100,7 +100,7 @@ def test_settings_expose_only_state_appropriate_account_actions_without_secrets(
             visible.append(setting.attrib["id"])
         return visible
 
-    assert visible_setting_ids(False, False) == ["account_login"]
+    assert visible_setting_ids(False, False) == ["account_login", "account_logout"]
     assert visible_setting_ids(True, False) == [
         "account_status",
         "account_retry",

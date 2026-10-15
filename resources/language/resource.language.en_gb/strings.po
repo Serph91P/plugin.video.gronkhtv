@@ -54,7 +54,7 @@ msgstr "Sign in"
 
 msgctxt "#30205"
 msgid "Sign out"
-msgstr "Sign out"
+msgstr "Sign out / reset session"
 
 msgctxt "#30206"
 msgid "Playback"

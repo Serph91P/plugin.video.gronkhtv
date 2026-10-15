@@ -758,12 +758,11 @@ def list_account():
             "account_login",
             "DefaultAddonService.png",
         )
-        if os.path.exists(_ACCOUNT_COOKIE_FILE):
-            _add_account_entry(
-                _addon.getLocalizedString(30205),
-                "account_logout",
-                "DefaultAddonService.png",
-            )
+        _add_account_entry(
+            _addon.getLocalizedString(30205),
+            "account_logout",
+            "DefaultAddonService.png",
+        )
     _add_account_entry(
         _addon.getLocalizedString(30212),
         "open_settings",
@@ -1586,10 +1585,21 @@ def handle_account_login(params=None):
         _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
-        xbmc.log(f"[Gronkh.tv] Account login failed: {exc}", xbmc.LOGWARNING)
+        diagnostic = (
+            exc.auth_diagnostic()
+            if isinstance(exc, SessionError)
+            else "unavailable"
+        )
+        xbmc.log(
+            f"[Gronkh.tv] Account login failed: {diagnostic}",
+            xbmc.LOGWARNING,
+        )
+        message = _addon.getLocalizedString(30216)
+        if diagnostic != "unavailable":
+            message = f"{message} ({diagnostic})"
         dialog.notification(
             _plugin,
-            _addon.getLocalizedString(30216),
+            message,
             xbmcgui.NOTIFICATION_ERROR,
         )
 
@@ -1600,8 +1610,8 @@ def handle_account_logout(params=None):
         return
     try:
         _account_session.logout()
-    except SessionError as exc:
-        xbmc.log(f"[Gronkh.tv] Remote logout failed: {exc}", xbmc.LOGWARNING)
+    except SessionError:
+        xbmc.log("[Gronkh.tv] Remote logout failed", xbmc.LOGWARNING)
         _account_session.clear()
     configure_account_session(None)
     _deactivate_account_progress_sync()
