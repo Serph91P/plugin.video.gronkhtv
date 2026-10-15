@@ -102,8 +102,8 @@ class GronkhTVSession:
         user = self.current_user()
         return LoginResult(authenticated=True, user=user)
 
-    def current_user(self):
-        user = self.request_json("/users/self", phase="current_user")
+    def current_user(self, timeout=None):
+        user = self.request_json("/users/self", timeout=timeout, phase="current_user")
         if isinstance(user, dict) and "data" in user:
             return user["data"]
         return user

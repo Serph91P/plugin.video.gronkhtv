@@ -303,7 +303,11 @@ def _account_progress_sync():
         context = store.context()
         account_id = context["active_account_id"]
         if not account_id or not context["sync_enabled"]:
-            return None
+            _read_account_user(expected_sync_epoch=context["epoch"], timeout=2.25)
+            context = store.context()
+            account_id = context["active_account_id"]
+            if not account_id or not context["sync_enabled"]:
+                return None
         # A sync job must retain the cookies it was created with.  The global
         # session is reused by interactive login/logout and may later represent
         # another account while an old uploader is still running.
@@ -317,10 +321,32 @@ def _account_progress_sync():
 def _activate_account_progress_sync(user):
     if not _setting_enabled("sync_watch_progress") or not isinstance(user, dict):
         return None
-    account_id = user.get("id")
-    if not isinstance(account_id, (str, int)) or not str(account_id):
+    account_id = _account_id(user)
+    if account_id is None:
         return None
-    return SyncStore(_PROGRESS_SYNC_FILE).activate(str(account_id), enabled=True)
+    return SyncStore(_PROGRESS_SYNC_FILE).activate(account_id, enabled=True)
+
+
+def _account_id(user):
+    if not isinstance(user, dict):
+        return None
+    account_id = user.get("id")
+    if isinstance(account_id, bool):
+        return None
+    if isinstance(account_id, int):
+        return str(account_id)
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id
+    return None
+
+
+def _reconcile_account_progress_sync(user, expected_epoch):
+    if not _setting_enabled("sync_watch_progress"):
+        return None
+    account_id = _account_id(user)
+    if account_id is None:
+        return None
+    return SyncStore(_PROGRESS_SYNC_FILE).reconcile(account_id, expected_epoch)
 
 
 def _deactivate_account_progress_sync():
@@ -370,10 +396,10 @@ def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=12):
     It performs no upload or playback action; successful reads merely refresh
     the account-scoped observed cache in ``SyncStore``.
     """
+    deadline = time.monotonic() + timeout_seconds
     progress_sync = _account_progress_sync()
     if progress_sync is None:
         return {}
-    deadline = time.monotonic() + timeout_seconds
     candidates = []
     attempted_items = 0
     for video in videos:
@@ -691,14 +717,23 @@ def list_live_streams():
     xbmcplugin.endOfDirectory(_HANDLE)
 
 
-def _read_account_user():
+def _read_account_user(expected_sync_epoch=None, timeout=None):
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
         _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         return None
+    if expected_sync_epoch is None and _setting_enabled("sync_watch_progress"):
+        try:
+            expected_sync_epoch = SyncStore(_PROGRESS_SYNC_FILE).context()["epoch"]
+        except Exception as exc:
+            xbmc.log(f"[Gronkh.tv] Account progress sync unavailable: {exc}", xbmc.LOGWARNING)
     try:
-        user = _account_session.current_user()
+        user = (
+            _account_session.current_user(timeout=timeout)
+            if timeout is not None
+            else _account_session.current_user()
+        )
     except (AuthenticationError, SessionError):
         # Keep persisted credentials available for an explicit retry or Logout.
         # Rendering/opening account controls must never destroy session data.
@@ -708,6 +743,13 @@ def _read_account_user():
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30210))
         return None
+
+    if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        return None
+    account_id = _account_id(user)
+    if account_id is not None and expected_sync_epoch is not None:
+        if _reconcile_account_progress_sync(user, expected_sync_epoch) is None:
+            return None
 
     name = _account_name(user)
     status = (
@@ -1510,7 +1552,6 @@ def handle_show_live_stream(params):
 def handle_account_login(params=None):
     existing_user = _read_account_user()
     if existing_user:
-        _activate_account_progress_sync(existing_user)
         xbmc.executebuiltin("Container.Refresh")
         return
 
