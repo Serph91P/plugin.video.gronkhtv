@@ -59,7 +59,7 @@ class SyncStore:
             db.execute(
                 """UPDATE control SET active_account_id=NULL, epoch=epoch+1, sync_enabled=0,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL
-                   WHERE singleton=1 AND epoch<=? AND sync_enabled=1""", (cutoff,),
+                   WHERE singleton=1 AND epoch<=?""", (cutoff,),
             )
             db.execute("COMMIT")
 
@@ -125,7 +125,8 @@ class SyncStore:
             if control["epoch"] != expected_epoch or (allowed is not None and not allowed()):
                 db.execute("ROLLBACK")
                 return None
-            if control["sync_enabled"] and control["epoch"] <= self._opt_out_epoch():
+            # A cutoff invalidates in-flight validation even when already disabled.
+            if control["epoch"] <= self._opt_out_epoch():
                 db.execute("ROLLBACK")
                 return None
             if control["active_account_id"] == account_id and control["sync_enabled"]:

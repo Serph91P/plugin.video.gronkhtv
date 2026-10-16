@@ -201,3 +201,90 @@ def test_durable_optout_survives_observer_exit_under_another_process_writer(tmp_
     assert restarted.pending('a', VIDEO)['offset'] == 12
     assert restarted.reconcile('a', restarted.context()['epoch']) > epoch
     assert not store.is_active_context('a', epoch)
+
+
+@pytest.mark.parametrize('observe_again', [False, True, 'process'])
+def test_disabled_validation_is_fenced_by_next_optout(bound, monkeypatch, observe_again):
+    plugin, settings, store, calls, old, block, started, release, finished = bound
+    settings['sync_watch_progress'] = 'false'
+    assert not plugin._observe_progress_opt_in(store)
+    disabled = store.context()
+    assert disabled['sync_enabled'] == 0
+    settings['sync_watch_progress'] = 'true'
+    original = plugin.GronkhTVSession.current_user
+
+    def delayed_response(self, timeout=None):
+        user = original(self, timeout=timeout)
+        started.set()
+        assert release.wait(3)
+        return user
+
+    monkeypatch.setattr(plugin.GronkhTVSession, 'current_user', delayed_response)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(plugin._account_progress_sync(timeout_seconds=2)))
+    worker.start()
+    try:
+        assert started.wait(1)
+        if observe_again:
+            settings['sync_watch_progress'] = 'false'
+            if observe_again == 'process':
+                ctx = multiprocessing.get_context('spawn')
+                observed = ctx.Event()
+                observer = ctx.Process(target=_observe_in_process, args=(store.path, observed))
+                observer.start()
+                observer.join(1)
+                assert observer.exitcode == 0
+            else:
+                plugin.run()
+        settings['sync_watch_progress'] = 'true'
+        release.set()
+        worker.join(3)
+        assert not worker.is_alive()
+        sync = results[0]
+        count = len(calls)
+        if sync is not None:
+            sync.prepare_playback(VIDEO)
+        if observe_again:
+            assert sync is None
+            assert store.context()['sync_enabled'] == 0
+            assert len(calls) == count
+            # Replaying the SAME journal entry is idempotent. Only a fresh
+            # snapshot validation after the event may restore the binding.
+            context = store.context()
+            store.apply_observed_opt_out()
+            store.apply_observed_opt_out()
+            assert store.context() == context
+            fresh = plugin._account_progress_sync()
+            assert fresh is not None
+            assert fresh.context.epoch > disabled['epoch']
+            assert sum(call[2] == '/users/self' for call in calls) == 3
+        else:
+            assert sync is not None
+            assert store.context()['sync_enabled'] == 1
+            assert len(calls) == count + 1
+        assert store.pending('a', VIDEO)['offset'] == 12
+    finally:
+        release.set()
+        worker.join(3)
+
+
+def test_disabled_cutoff_rejects_validation_before_sqlite_materialization(tmp_path):
+    store = SyncStore(tmp_path / 'sync.sqlite3')
+    store.activate('a', True)
+    store.observe_opt_out()
+    epoch = store.context()['epoch']
+    db = sqlite3.connect(store.path)
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        store.observe_opt_out()
+        assert store.context()['epoch'] == epoch
+    finally:
+        db.rollback()
+        db.close()
+    assert store.reconcile('a', epoch) is None
+    store.apply_observed_opt_out()
+    current = store.context()
+    assert current['epoch'] > epoch and current['sync_enabled'] == 0
+    store.apply_observed_opt_out()
+    assert store.context() == current
+    assert store.reconcile('a', current['epoch']) > current['epoch']
