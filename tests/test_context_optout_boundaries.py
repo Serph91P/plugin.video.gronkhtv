@@ -294,3 +294,111 @@ def test_disabled_cutoff_rejects_validation_before_sqlite_materialization(tmp_pa
     store.apply_observed_opt_out()
     assert store.context() == current
     assert store.reconcile('a', current['epoch']) > current['epoch']
+
+
+def _overlap_cutoff_observer(path, ready, begin, captured, publish):
+    """Publish an opt-out only after it has captured the pre-bind epoch."""
+    original_context = SyncStore.context
+
+    def context(self):
+        result = original_context(self)
+        captured.set()
+        assert publish.wait(5)
+        return result
+
+    SyncStore.context = context
+    ready.set()
+    assert begin.wait(5)
+    SyncStore(path, timeout=0, initialize=False).observe_opt_out()
+
+
+@pytest.mark.parametrize('observer_kind', ['thread', 'process'])
+@pytest.mark.parametrize('overlap', [False, True])
+def test_completed_optout_fences_validation_overlapping_journal_publication(
+    bound, monkeypatch, overlap, observer_kind
+):
+    plugin, settings, store, calls, _, _, started, release, _ = bound
+    settings['sync_watch_progress'] = 'false'
+    assert not plugin._observe_progress_opt_in(store)
+    settings['sync_watch_progress'] = 'true'
+    original_user = plugin.GronkhTVSession.current_user
+
+    def delayed_user(self, timeout=None):
+        user = original_user(self, timeout=timeout)
+        started.set()
+        assert release.wait(3)
+        return user
+
+    monkeypatch.setattr(plugin.GronkhTVSession, 'current_user', delayed_user)
+    ctx = multiprocessing.get_context('spawn')
+    captured, publish, ready, begin = (ctx.Event() for _ in range(4))
+    original_context = SyncStore.context
+
+    def context(self):
+        result = original_context(self)
+        if threading.current_thread().name == 'overlap-cutoff-observer':
+            captured.set()
+            assert publish.wait(3)
+        return result
+
+    monkeypatch.setattr(SyncStore, 'context', context)
+    results, observer_results = [], []
+    builder = threading.Thread(
+        target=lambda: results.append(plugin._account_progress_sync(timeout_seconds=2))
+    )
+    if observer_kind == 'process':
+        observer = ctx.Process(
+            target=_overlap_cutoff_observer,
+            args=(store.path, ready, begin, captured, publish),
+        )
+        observer.start()
+        assert ready.wait(3)
+    else:
+        observer = threading.Thread(
+            name='overlap-cutoff-observer',
+            target=lambda: observer_results.append(plugin._observe_progress_opt_in(store)),
+        )
+    builder.start()
+    try:
+        assert started.wait(1)
+        settings['sync_watch_progress'] = 'false'
+        if observer_kind == 'process':
+            begin.set()
+        else:
+            observer.start()
+        assert captured.wait(1)
+        if not overlap:
+            publish.set()
+            observer.join(1)
+            assert not observer.is_alive()
+        settings['sync_watch_progress'] = 'true'
+        release.set()
+        builder.join(2)
+        assert not builder.is_alive()
+        if overlap:
+            publish.set()
+            observer.join(1)
+        assert not observer.is_alive()
+        if observer_kind == 'process':
+            assert observer.exitcode == 0
+        else:
+            assert observer_results == [False]
+        after = store.context()
+        count = len(calls)
+        sync = results[0]
+        if sync is not None:
+            sync.prepare_playback(VIDEO)
+        assert store.pending('a', VIDEO)['offset'] == 12
+        assert after['sync_enabled'] == 0
+        assert len(calls) == count
+    finally:
+        publish.set()
+        release.set()
+        builder.join(3)
+        if observer.ident is not None:
+            observer.join(3)
+            if observer_kind == 'process':
+                if observer.is_alive():
+                    observer.terminate()
+                    observer.join(3)
+                observer.close()

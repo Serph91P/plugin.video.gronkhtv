@@ -56,10 +56,14 @@ class SyncStore:
             return
         with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
+            # A validation may bind the next epoch after this observer read the
+            # disabled context but before the cutoff reached the journal. Fence
+            # that one successor too; a completed cutoff advances past it so a
+            # genuinely fresh validation may reconcile afterwards.
             db.execute(
-                """UPDATE control SET active_account_id=NULL, epoch=epoch+1, sync_enabled=0,
+                """UPDATE control SET active_account_id=NULL, epoch=MAX(epoch+1, ?), sync_enabled=0,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL
-                   WHERE singleton=1 AND epoch<=?""", (cutoff,),
+                   WHERE singleton=1 AND epoch<=?""", (cutoff + 2, cutoff + 1),
             )
             db.execute("COMMIT")
 
