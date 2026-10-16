@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import sys
+from email.message import Message
 from io import BytesIO
 from http.cookiejar import Cookie, MozillaCookieJar
 from pathlib import Path
@@ -278,6 +279,23 @@ def test_auth_http_errors_expose_only_allowlisted_phase_and_status(
     assert "secret" not in f"{error} {error.auth_diagnostic()}"
     if status == 429:
         assert error.retry_after == 7.0
+
+
+def test_http_error_response_body_is_closed_after_error_mapping(tmp_path):
+    response_body = BytesIO(b'{"message":"secret-response-marker"}')
+    error = HTTPError(
+        "https://backend.gronkh.tv/v3/auth",
+        500,
+        "secret-reason-marker",
+        Message(),
+        response_body,
+    )
+    session, _, _ = _session(tmp_path, [FakeResponse(204), error])
+
+    with pytest.raises(SessionError):
+        session.login("secret-login-marker", "secret-password-marker")
+
+    assert response_body.closed
 
 
 def test_csrf_http_error_reports_csrf_phase(tmp_path):

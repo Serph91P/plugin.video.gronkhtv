@@ -222,6 +222,7 @@ def test_disabled_validation_is_fenced_by_next_optout(bound, monkeypatch, observ
     monkeypatch.setattr(plugin.GronkhTVSession, 'current_user', delayed_response)
     results = []
     worker = threading.Thread(target=lambda: results.append(plugin._account_progress_sync(timeout_seconds=2)))
+    observer = None
     worker.start()
     try:
         assert started.wait(1)
@@ -232,6 +233,7 @@ def test_disabled_validation_is_fenced_by_next_optout(bound, monkeypatch, observ
                 observed = ctx.Event()
                 observer = ctx.Process(target=_observe_in_process, args=(store.path, observed))
                 observer.start()
+                assert observed.wait(3)
                 observer.join(1)
                 assert observer.exitcode == 0
             else:
@@ -266,6 +268,10 @@ def test_disabled_validation_is_fenced_by_next_optout(bound, monkeypatch, observ
     finally:
         release.set()
         worker.join(3)
+        if observer is not None and observer.is_alive():
+            observer.terminate()
+        if observer is not None:
+            observer.join(3)
 
 
 def test_disabled_cutoff_rejects_validation_before_sqlite_materialization(tmp_path):

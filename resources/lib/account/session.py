@@ -230,21 +230,24 @@ class GronkhTVSession:
                     status = response.getcode()
                 content = response.read()
         except HTTPError as exc:
-            status = self._safe_status(exc.code)
-            message = (
-                "GronkhTV request failed"
-                if phase in SessionError._AUTH_PHASES
-                else self._error_message(exc)
-            )
-            if exc.code in (401, 403, 419):
-                raise AuthenticationError(message, phase=phase, status=status) from exc
-            if exc.code == 422:
-                raise ValidationError(message, phase=phase, status=status) from exc
-            if exc.code == 429:
-                raise RateLimitError(
-                    message, _retry_after(exc), phase=phase, status=status
-                ) from exc
-            raise SessionError(message, phase=phase, status=status) from exc
+            try:
+                status = self._safe_status(exc.code)
+                message = (
+                    "GronkhTV request failed"
+                    if phase in SessionError._AUTH_PHASES
+                    else self._error_message(exc)
+                )
+                if exc.code in (401, 403, 419):
+                    raise AuthenticationError(message, phase=phase, status=status) from exc
+                if exc.code == 422:
+                    raise ValidationError(message, phase=phase, status=status) from exc
+                if exc.code == 429:
+                    raise RateLimitError(
+                        message, _retry_after(exc), phase=phase, status=status
+                    ) from exc
+                raise SessionError(message, phase=phase, status=status) from exc
+            finally:
+                exc.close()
         except (URLError, TimeoutError, OSError) as exc:
             message = (
                 "GronkhTV request failed"
