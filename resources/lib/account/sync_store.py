@@ -32,6 +32,13 @@ class SyncStore:
         except FileNotFoundError:
             return -1
 
+    def _is_opted_out_epoch(self, epoch):
+        """Return whether a journaled off event fences this context generation."""
+        # One successor can bind after an observer reads its cutoff and before
+        # its append is durable, so the journal must fence both generations.
+        cutoff = self._opt_out_epoch()
+        return cutoff >= 0 and epoch <= cutoff + 1
+
     def observe_opt_out(self):
         """Journal the cutoff without waiting for a SQLite writer."""
         fast = SyncStore(self.path, self._clock, timeout=0, initialize=False)
@@ -46,8 +53,8 @@ class SyncStore:
         try:
             fast.apply_observed_opt_out()
         except sqlite3.Error:
-            # Durable cutoff already fences all old jobs. Materialize the DB
-            # epoch when the writer releases it, in the optional initializer.
+            # The journal fences the captured generation and its successor
+            # before SQLite can materialize the disabled state.
             pass
 
     def apply_observed_opt_out(self):
@@ -130,7 +137,7 @@ class SyncStore:
                 db.execute("ROLLBACK")
                 return None
             # A cutoff invalidates in-flight validation even when already disabled.
-            if control["epoch"] <= self._opt_out_epoch():
+            if self._is_opted_out_epoch(control["epoch"]):
                 db.execute("ROLLBACK")
                 return None
             if control["active_account_id"] == account_id and control["sync_enabled"]:
@@ -187,7 +194,7 @@ class SyncStore:
                 row["active_account_id"] == account_id
                 and row["epoch"] == epoch
                 and bool(row["sync_enabled"])
-                and epoch > self._opt_out_epoch()
+                and not self._is_opted_out_epoch(epoch)
             )
 
     def display_status(self):
@@ -223,7 +230,7 @@ class SyncStore:
             db.execute("BEGIN IMMEDIATE")
             control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
             if (control["active_account_id"] != account_id or control["epoch"] != epoch
-                    or not control["sync_enabled"] or epoch <= self._opt_out_epoch()):
+                    or not control["sync_enabled"] or self._is_opted_out_epoch(epoch)):
                 db.execute("ROLLBACK")
                 raise ContextLostError("account is not the active sync context")
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
@@ -255,7 +262,7 @@ class SyncStore:
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
                 or not control["sync_enabled"]
-                or epoch <= self._opt_out_epoch()
+                or self._is_opted_out_epoch(epoch)
             ):
                 db.execute("ROLLBACK")
                 raise ContextLostError("account is not the active sync context")
@@ -293,7 +300,7 @@ class SyncStore:
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
                 or not control["sync_enabled"]
-                or epoch <= self._opt_out_epoch()
+                or self._is_opted_out_epoch(epoch)
                 or row is None
                 or not row["pending"]
                 or row["observed_json"] is None
@@ -324,7 +331,7 @@ class SyncStore:
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
                 or not control["sync_enabled"]
-                or epoch <= self._opt_out_epoch()
+                or self._is_opted_out_epoch(epoch)
                 or row is None
                 or not row["pending"]
                 or row["observed_json"] is None
@@ -356,7 +363,7 @@ class SyncStore:
             now = self._clock()
             control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
             if (control["active_account_id"] != account_id or not control["sync_enabled"]
-                    or control["epoch"] <= self._opt_out_epoch()
+                    or self._is_opted_out_epoch(control["epoch"])
                     or (epoch is not None and control["epoch"] != epoch)):
                 db.execute("ROLLBACK")
                 return None
@@ -404,7 +411,7 @@ class SyncStore:
             and control["active_account_id"] == account_id
             and control["epoch"] == epoch
             and control["sync_enabled"]
-            and epoch > self._opt_out_epoch()
+            and not self._is_opted_out_epoch(epoch)
             and control["lease_account_id"] == account_id
             and control["lease_fence"] == lease.get("fence")
             and control["lease_expires"] is not None

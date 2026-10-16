@@ -314,8 +314,9 @@ def _overlap_cutoff_observer(path, ready, begin, captured, publish):
 
 @pytest.mark.parametrize('observer_kind', ['thread', 'process'])
 @pytest.mark.parametrize('overlap', [False, True])
+@pytest.mark.parametrize('sqlite_busy', [False, True])
 def test_completed_optout_fences_validation_overlapping_journal_publication(
-    bound, monkeypatch, overlap, observer_kind
+    bound, monkeypatch, overlap, observer_kind, sqlite_busy
 ):
     plugin, settings, store, calls, _, _, started, release, _ = bound
     settings['sync_watch_progress'] = 'false'
@@ -358,6 +359,7 @@ def test_completed_optout_fences_validation_overlapping_journal_publication(
             name='overlap-cutoff-observer',
             target=lambda: observer_results.append(plugin._observe_progress_opt_in(store)),
         )
+    writer = None
     builder.start()
     try:
         assert started.wait(1)
@@ -376,6 +378,9 @@ def test_completed_optout_fences_validation_overlapping_journal_publication(
         builder.join(2)
         assert not builder.is_alive()
         if overlap:
+            if sqlite_busy:
+                writer = sqlite3.connect(store.path, timeout=0)
+                writer.execute('BEGIN IMMEDIATE')
             publish.set()
             observer.join(1)
         assert not observer.is_alive()
@@ -384,16 +389,26 @@ def test_completed_optout_fences_validation_overlapping_journal_publication(
         else:
             assert observer_results == [False]
         after = store.context()
-        count = len(calls)
         sync = results[0]
+        if overlap and sqlite_busy:
+            assert sync is not None
+            assert not store.is_active_context('a', sync.context.epoch)
+        if writer is not None:
+            writer.rollback()
+            writer.close()
+            writer = None
+        count = len(calls)
         if sync is not None:
             sync.prepare_playback(VIDEO)
         assert store.pending('a', VIDEO)['offset'] == 12
-        assert after['sync_enabled'] == 0
+        assert after['sync_enabled'] == int(overlap and sqlite_busy)
         assert len(calls) == count
     finally:
         publish.set()
         release.set()
+        if writer is not None:
+            writer.rollback()
+            writer.close()
         builder.join(3)
         if observer.ident is not None:
             observer.join(3)
