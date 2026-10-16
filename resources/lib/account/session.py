@@ -152,10 +152,12 @@ class GronkhTVSession:
                     method="POST",
                     accepted_statuses=(204,),
                     csrf=True,
+                    clear_before_dispatch=True,
                 )
             except AuthenticationError:
                 pass
-        self.clear()
+        else:
+            self.clear()
 
     def save(self):
         self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +192,7 @@ class GronkhTVSession:
         csrf=False,
         timeout=None,
         phase=None,
+        clear_before_dispatch=False,
     ):
         url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
         headers = {
@@ -214,6 +217,12 @@ class GronkhTVSession:
             headers["X-XSRF-TOKEN"] = unquote(csrf_token)
 
         request = Request(url, data=data, headers=headers, method=method)
+        if clear_before_dispatch:
+            # Freeze the outgoing logout credentials before clearing local
+            # state. A slow response must never unlink a later login's file.
+            # HTTPCookieProcessor preserves an already attached Cookie header.
+            self.cookie_jar.add_cookie_header(request)
+            self.clear()
         try:
             with self.opener.open(request, timeout=timeout or _TIMEOUT) as response:
                 status = getattr(response, "status", None)
@@ -221,21 +230,24 @@ class GronkhTVSession:
                     status = response.getcode()
                 content = response.read()
         except HTTPError as exc:
-            status = self._safe_status(exc.code)
-            message = (
-                "GronkhTV request failed"
-                if phase in SessionError._AUTH_PHASES
-                else self._error_message(exc)
-            )
-            if exc.code in (401, 403, 419):
-                raise AuthenticationError(message, phase=phase, status=status) from exc
-            if exc.code == 422:
-                raise ValidationError(message, phase=phase, status=status) from exc
-            if exc.code == 429:
-                raise RateLimitError(
-                    message, _retry_after(exc), phase=phase, status=status
-                ) from exc
-            raise SessionError(message, phase=phase, status=status) from exc
+            try:
+                status = self._safe_status(exc.code)
+                message = (
+                    "GronkhTV request failed"
+                    if phase in SessionError._AUTH_PHASES
+                    else self._error_message(exc)
+                )
+                if exc.code in (401, 403, 419):
+                    raise AuthenticationError(message, phase=phase, status=status) from exc
+                if exc.code == 422:
+                    raise ValidationError(message, phase=phase, status=status) from exc
+                if exc.code == 429:
+                    raise RateLimitError(
+                        message, _retry_after(exc), phase=phase, status=status
+                    ) from exc
+                raise SessionError(message, phase=phase, status=status) from exc
+            finally:
+                exc.close()
         except (URLError, TimeoutError, OSError) as exc:
             message = (
                 "GronkhTV request failed"

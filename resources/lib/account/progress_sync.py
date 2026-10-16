@@ -5,6 +5,7 @@ Network work is deliberately separate from Kodi playback hooks: hooks call
 """
 
 import json
+from dataclasses import dataclass, field
 
 from account.session import AuthenticationError, RateLimitError, SessionError, ValidationError
 from account.sync_store import ContextLostError
@@ -14,19 +15,56 @@ class _ContextLostError(Exception):
     """The immutable account/epoch no longer owns this queued job."""
 
 
+@dataclass(frozen=True)
+class ValidatedProgressContext:
+    """One users/self-validated cookie snapshot; never reload it from disk."""
+
+    account_id: str
+    epoch: int
+    session_snapshot: object = field(repr=False, compare=False)
+
+
 class ProgressSync:
-    def __init__(self, store, api, account_id, epoch, lease_seconds=5, max_write_attempts=2):
+    def __init__(
+        self, store, api, account_id, epoch, lease_seconds=5,
+        max_write_attempts=2, enabled=None, context=None,
+    ):
         self._store = store
         self._api = api
         self._account_id = account_id
         self._epoch = epoch
         self._lease_seconds = lease_seconds
         self._max_write_attempts = max_write_attempts
+        self._enabled = enabled or (lambda: True)
+        self._revoked = False
+        if context is not None and (context.account_id != account_id or context.epoch != epoch):
+            raise ValueError("validated context identity mismatch")
+        self._context = context
+
+    @property
+    def context(self):
+        return self._context
+
+    def invalidate(self):
+        """Revoke this job even if optional durable persistence fails."""
+        self._revoked = True
+        try:
+            self._store.observe_opt_out()
+        except Exception:
+            pass  # Optional sync must not break local playback on DB/I/O failure.
+
+    def _active(self):
+        if self._revoked:
+            return False
+        if not self._enabled():
+            self.invalidate()
+            return False
+        return self._store.is_active_context(self._account_id, self._epoch)
 
     def prepare_playback(self, video_id):
         # Fence before the GET as well as the upload: a stale background job
         # must not even read account A progress after a logout/account switch.
-        if not self._store.is_active_context(self._account_id, self._epoch):
+        if not self._active():
             return {"state": "pending", "offset": None}
         try:
             remote = self._api.read(video_id)
@@ -36,7 +74,7 @@ class ProgressSync:
             return {"state": "unavailable", "offset": None}
         # Do not persist or act on a response received after the context was
         # invalidated.  Keep its durable local snapshot pending instead.
-        if not self._store.is_active_context(self._account_id, self._epoch):
+        if not self._active():
             return {"state": "pending", "offset": None}
         if remote.status == "absent":
             try:
@@ -69,14 +107,18 @@ class ProgressSync:
     def record_position(self, video_id, offset, duration, event="tick"):
         # Event is retained at the boundary to make callers explicit; the store
         # coalesces by account/video and accepts legitimate reverse seeks and 0.
-        return self._store.record_local(self._account_id, video_id, offset, duration)
+        if not self._active():
+            raise ContextLostError("account is not the active sync context")
+        return self._store.record_local(self._account_id, self._epoch, video_id, offset, duration)
 
     def resolve_conflict(self, video_id, choice):
         """Apply a foreground user's conflict choice without a network call."""
+        if not self._active():
+            raise ContextLostError("account is not the active sync context")
         if choice == "kodi":
-            offset = self._store.rebase_pending_on_observed_remote(self._account_id, video_id)
+            offset = self._store.rebase_pending_on_observed_remote(self._account_id, self._epoch, video_id)
         elif choice == "account":
-            offset = self._store.accept_observed_remote(self._account_id, video_id)
+            offset = self._store.accept_observed_remote(self._account_id, self._epoch, video_id)
         else:
             raise ValueError("conflict choice must be kodi or account")
         if offset is None:
@@ -100,15 +142,15 @@ class ProgressSync:
             return "conflict"
         if _remote_changed_since_confirmed(snapshot, preflight):
             return "conflict"
-        lease = self._store.claim_upload(self._account_id, self._lease_seconds)
+        lease = self._store.claim_upload(self._account_id, self._lease_seconds, epoch=self._epoch)
         if lease is None or lease["epoch"] != self._epoch:
             return "pending"
         # An epoch change between lease acquisition and request dispatch fences
         # the job before it can send account A's record with a newer session.
-        if not self._store.is_active_context(self._account_id, self._epoch):
+        if not self._active():
             return "pending"
         try:
-            self._write_bounded(video_id, snapshot["offset"])
+            self._write_bounded(video_id, snapshot["offset"], lease)
         except _ContextLostError:
             return "pending"
         except AuthenticationError:
@@ -118,6 +160,8 @@ class ProgressSync:
         except RateLimitError:
             return "rate_limited"
         except Exception:
+            return "pending"
+        if not self._active():
             return "pending"
         if self._store.confirm_upload(
             self._account_id,
@@ -130,12 +174,12 @@ class ProgressSync:
             return "synchronized"
         return "pending"
 
-    def _write_bounded(self, video_id, offset):
+    def _write_bounded(self, video_id, offset, lease):
         """Retry only transient session failures; never sleep or loop in Kodi UI."""
         attempts = max(1, self._max_write_attempts)
         last_error = None
         for _ in range(attempts):
-            if not self._store.is_active_context(self._account_id, self._epoch):
+            if not self._active() or not self._store.owns_lease(self._account_id, self._epoch, lease):
                 raise _ContextLostError()
             try:
                 return self._api.write(video_id, offset)

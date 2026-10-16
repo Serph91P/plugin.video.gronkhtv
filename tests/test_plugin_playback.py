@@ -57,6 +57,9 @@ class FakeDialog:
 
 @pytest.fixture
 def plugin(monkeypatch, tmp_path):
+    # No test may accidentally cross a real private HTTP boundary.
+    from urllib.request import OpenerDirector
+    monkeypatch.setattr(OpenerDirector, "open", lambda *args, **kwargs: pytest.fail("unexpected real network"))
     FakeDialog.notifications = []
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGINFO = 1
@@ -201,10 +204,9 @@ def test_opening_settings_keeps_stale_session_controls_reachable(plugin, monkeyp
 
     assert calls == [
         ("configure", None),
-        ("deactivate", None),
         ("account_session_present", "true"),
         ("account_logged_in", "false"),
-        ("account_status", "30210"),
+        ("account_status", "30227"),
         ("openSettings", None),
     ]
     assert _visible_account_actions(settings) == ["account_retry", "account_logout"]
@@ -306,10 +308,11 @@ def test_confirmed_logout_without_cookie_performs_safe_local_cleanup(plugin, mon
         "configure_account_session",
         lambda session: calls.append(("configure", session)),
     )
+    deactivate = plugin._deactivate_account_progress_sync
     monkeypatch.setattr(
         plugin,
         "_deactivate_account_progress_sync",
-        lambda: calls.append(("deactivate", None)),
+        lambda: (calls.append(("deactivate", None)), deactivate())[1],
     )
     monkeypatch.setattr(
         plugin._addon,
@@ -965,6 +968,9 @@ def test_account_progress_sync_uses_an_immutable_session_snapshot(plugin, monkey
         def __init__(self, path):
             self.identity = mutable.identity
 
+        def current_user(self, timeout=None):
+            return {"id": self.identity}
+
         def request_json(self, path, method="GET", payload=None, timeout=None):
             if method == "GET":
                 return {"data": {"watch_progress": None}}
@@ -1001,8 +1007,8 @@ def test_play_video_uses_bounded_account_resume_for_normal_start(plugin, monkeyp
         lambda episode: {"id": "backend-video", "source_length": 300, "next": {}},
     )
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: {"position": 12, "duration": 300})
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: object())
-    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *args: 42)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: object())
+    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *args, **kwargs: 42)
     monkeypatch.setattr(plugin, "_configure_authenticated_playback", lambda *args: True)
     monkeypatch.setattr(plugin.xbmcplugin, "setResolvedUrl", lambda *args, **kwargs: resolved.append(args), raising=False)
     monkeypatch.setattr(plugin, "monitor_playback", lambda *args, **kwargs: monitor_calls.append((args, kwargs)))
@@ -1184,7 +1190,7 @@ def test_listing_uses_authenticated_remote_progress_before_playback(plugin, monk
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(plugin, "is_watched", lambda episode: False, raising=False)
     monkeypatch.setattr(plugin, "is_favorite", lambda episode: False)
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: sync)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: sync)
     monkeypatch.setattr(
         plugin.xbmcplugin,
         "addDirectoryItem",
@@ -1241,6 +1247,7 @@ def test_latest_uploads_recovers_missing_sqlite_context_from_one_validated_sessi
     monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
     monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
     monkeypatch.setattr(plugin, "_account_session", Session())
+    monkeypatch.setattr(plugin, "GronkhTVSession", lambda path: Session())
     monkeypatch.setattr(plugin, "ProgressClient", lambda session: API())
     monkeypatch.setattr(plugin._addon, "getSetting", lambda key: settings.get(key, ""))
     monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
@@ -1268,7 +1275,8 @@ def test_latest_uploads_recovers_missing_sqlite_context_from_one_validated_sessi
     assert restored == repeated
     assert restored["active_account_id"] == "account-1"
     assert restored["sync_enabled"] == 1
-    assert session_reads == [2.25]
+    assert len(session_reads) == 2  # Each actual snapshot must be validated.
+    assert all(0 < timeout <= 2.25 for timeout in session_reads)
     assert reads == [video["id"], video["id"]]
     assert items[0].tag.calls["setResumePoint"] == [((75, 300), {})]
 
@@ -1287,8 +1295,8 @@ def test_validated_session_with_invalid_flat_id_does_not_restore_context(
     monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
     monkeypatch.setattr(
         plugin,
-        "_account_session",
-        types.SimpleNamespace(current_user=lambda timeout=None: {"id": account_id}),
+        "GronkhTVSession",
+        lambda path: types.SimpleNamespace(current_user=lambda timeout=None: {"id": account_id}),
     )
     monkeypatch.setattr(
         plugin._addon,
@@ -1407,7 +1415,7 @@ def test_remote_only_list_resume_context_seeks_the_account_offset(plugin, monkey
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(plugin, "is_watched", lambda episode: False, raising=False)
     monkeypatch.setattr(plugin, "is_favorite", lambda episode: False)
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: sync)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: sync)
     monkeypatch.setattr(plugin, "get_video_info", lambda episode: {"id": "synthetic-backend-id"})
     monkeypatch.setattr(plugin, "get_playlist_url", lambda episode: "https://media/playlist")
     monkeypatch.setattr(plugin, "_play_direct", lambda url: player)
@@ -1461,7 +1469,7 @@ def test_favorite_without_backend_id_uses_episode_lookup_for_account_progress(
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(plugin, "is_watched", lambda episode: False, raising=False)
     monkeypatch.setattr(plugin, "is_favorite", lambda episode: True)
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: sync)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: sync)
     monkeypatch.setattr(
         plugin.xbmcplugin,
         "addDirectoryItem",
@@ -1485,7 +1493,7 @@ def test_listing_limits_unresolved_legacy_favorite_lookups(plugin, monkeypatch):
     ]
     lookups = []
 
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: object())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: object())
     monkeypatch.setattr(
         plugin,
         "get_video_info",
@@ -1510,7 +1518,7 @@ def test_listing_stops_legacy_id_resolution_after_shared_deadline(plugin, monkey
         clock[0] += 3
         return None
 
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: object())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: object())
     monkeypatch.setattr(plugin, "get_video_info", resolve)
     monkeypatch.setattr(plugin.time, "monotonic", lambda: clock[0])
 
@@ -1530,7 +1538,7 @@ def test_listing_returns_by_deadline_while_legacy_lookup_is_still_blocked(
         release.wait(1)
         return None
 
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: object())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: object())
     monkeypatch.setattr(plugin, "get_video_info", resolve)
 
     started_at = time.monotonic()
@@ -1562,7 +1570,7 @@ def test_listing_does_not_start_progress_read_after_late_legacy_lookup(
         time.sleep(0.10)
         return {"id": "late-backend-id"}
 
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: Sync())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: Sync())
     monkeypatch.setattr(plugin, "get_video_info", resolve)
 
     assert plugin._listing_account_progress(
@@ -1753,6 +1761,7 @@ def test_monitor_records_the_latest_account_snapshot_without_network_work(plugin
         def record_position(self, video_id, offset, duration, event):
             calls.append((video_id, offset, duration, event))
 
+    monkeypatch.setattr(plugin, "_flush_progress_async", lambda *args: None)
     monkeypatch.setattr(plugin.xbmc, "Player", lambda: player)
     monkeypatch.setattr(plugin.xbmc, "Monitor", lambda: monitor)
     monkeypatch.setattr(plugin.time, "monotonic", lambda: monitor.now)
@@ -1897,7 +1906,7 @@ def test_explicit_playback_paths_bind_account_sync_and_backend_video_id(
     monkeypatch.setattr(plugin.xbmc, "Player", lambda: player)
     monkeypatch.setattr(plugin, "get_playlist_url", lambda episode: "https://media/playlist")
     monkeypatch.setattr(plugin, "get_video_info", lambda episode: {"id": "backend-video"})
-    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: sync)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda **kwargs: sync)
     monkeypatch.setattr(plugin, "_play_direct", lambda *args: player)
     monkeypatch.setattr(plugin, "_seek_to_offset", lambda *args, **kwargs: True)
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: {"position": 10, "duration": 300})
