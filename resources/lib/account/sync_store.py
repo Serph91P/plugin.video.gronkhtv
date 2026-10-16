@@ -1,6 +1,7 @@
 """Process-safe, account-isolated persistent queue for progress snapshots."""
 
 from contextlib import closing
+import fcntl
 import json
 import os
 import sqlite3
@@ -32,29 +33,85 @@ class SyncStore:
         except FileNotFoundError:
             return -1
 
+    def _opt_out_pending_path(self):
+        return self.path + ".optout.pending"
+
+    def _begin_opt_out_publication(self):
+        """Start a durable publication barrier without waiting for SQLite."""
+        try:
+            fd = os.open(self._opt_out_pending_path(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+
+    def _register_pending_opt_out_binding(self, epoch):
+        """Record a bind that overlaps a durable off publication barrier.
+
+        The shared file lock serializes this record with the observer's final
+        append.  If the observer closed the barrier first, this binding began
+        before the off completed but did not become part of its cutoff, so its
+        caller must abandon the bind and validate again afterwards.
+        """
+        try:
+            fd = os.open(self._opt_out_pending_path(), os.O_WRONLY | os.O_APPEND)
+        except FileNotFoundError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            if not os.path.exists(self._opt_out_pending_path()):
+                return False
+            os.write(fd, (str(epoch) + "\n").encode("ascii"))
+            os.fsync(fd)
+            return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _complete_opt_out_publication(self, cutoff):
+        """Publish every generation bound while this off event was in flight."""
+        pending = self._opt_out_pending_path()
+        with open(pending, "a+", encoding="ascii") as marker:
+            fcntl.flock(marker.fileno(), fcntl.LOCK_EX)
+            marker.seek(0)
+            overlap = max((int(line) for line in marker), default=-1)
+            cutoff = max(cutoff, overlap)
+            if self._opt_out_epoch() < cutoff:
+                fd = os.open(self.path + ".optout", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try:
+                    os.write(fd, (str(cutoff) + "\n").encode("ascii"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            fcntl.flock(marker.fileno(), fcntl.LOCK_UN)
+        os.unlink(pending)
+        return cutoff
+
     def _is_opted_out_epoch(self, epoch):
         """Return whether a journaled off event fences this context generation."""
-        # One successor can bind after an observer reads its cutoff and before
-        # its append is durable, so the journal must fence both generations.
         cutoff = self._opt_out_epoch()
-        return cutoff >= 0 and epoch <= cutoff + 1
+        return cutoff >= 0 and epoch <= cutoff
 
     def observe_opt_out(self):
         """Journal the cutoff without waiting for a SQLite writer."""
+        if not self._begin_opt_out_publication():
+            return
         fast = SyncStore(self.path, self._clock, timeout=0, initialize=False)
-        epoch = fast.context()["epoch"]
-        if fast._opt_out_epoch() < epoch:
-            fd = os.open(self.path + ".optout", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            try:
-                os.write(fd, (str(epoch) + "\n").encode("ascii"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        try:
+            epoch = fast.context()["epoch"]
+            self._complete_opt_out_publication(epoch)
+        except Exception:
+            # Leave the durable barrier in place if publication was interrupted:
+            # failure must be fail-closed, never permit an overlapping binding.
+            raise
         try:
             fast.apply_observed_opt_out()
         except sqlite3.Error:
-            # The journal fences the captured generation and its successor
-            # before SQLite can materialize the disabled state.
+            # The journal fences every registered overlapping generation before
+            # SQLite can materialize the disabled state.
             pass
 
     def apply_observed_opt_out(self):
@@ -63,14 +120,10 @@ class SyncStore:
             return
         with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
-            # A validation may bind the next epoch after this observer read the
-            # disabled context but before the cutoff reached the journal. Fence
-            # that one successor too; a completed cutoff advances past it so a
-            # genuinely fresh validation may reconcile afterwards.
             db.execute(
                 """UPDATE control SET active_account_id=NULL, epoch=MAX(epoch+1, ?), sync_enabled=0,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL
-                   WHERE singleton=1 AND epoch<=?""", (cutoff + 2, cutoff + 1),
+                   WHERE singleton=1 AND epoch<=?""", (cutoff + 1, cutoff),
             )
             db.execute("COMMIT")
 
@@ -116,6 +169,10 @@ class SyncStore:
         with closing(self._connection()) as db:
             db.execute("BEGIN IMMEDIATE")
             epoch = max(db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0], self._opt_out_epoch()) + 1
+            pending = self._register_pending_opt_out_binding(epoch)
+            if pending is False:
+                db.execute("ROLLBACK")
+                return None
             db.execute(
                 """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=?,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
@@ -140,10 +197,18 @@ class SyncStore:
             if self._is_opted_out_epoch(control["epoch"]):
                 db.execute("ROLLBACK")
                 return None
+            epoch = (
+                control["epoch"]
+                if control["active_account_id"] == account_id and control["sync_enabled"]
+                else max(control["epoch"], self._opt_out_epoch()) + 1
+            )
+            pending = self._register_pending_opt_out_binding(epoch)
+            if pending is False:
+                db.execute("ROLLBACK")
+                return None
             if control["active_account_id"] == account_id and control["sync_enabled"]:
                 db.execute("ROLLBACK")
                 return control["epoch"]
-            epoch = max(control["epoch"], self._opt_out_epoch()) + 1
             db.execute(
                 """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=1,
                    lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",

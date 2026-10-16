@@ -3,6 +3,7 @@ import multiprocessing
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -417,3 +418,129 @@ def test_completed_optout_fences_validation_overlapping_journal_publication(
                     observer.terminate()
                     observer.join(3)
                 observer.close()
+
+
+def _auth_overlap_observer_process(path, ready, begin, captured, publish):
+    """Hold an observer after its read, before durable journal publication."""
+    original = SyncStore.context
+
+    def context(self):
+        result = original(self)
+        captured.set()
+        assert publish.wait(5)
+        return result
+
+    SyncStore.context = context
+    ready.set()
+    assert begin.wait(5)
+    SyncStore(path, timeout=0, initialize=False).observe_opt_out()
+
+
+@pytest.mark.parametrize('observer_kind', ['thread', 'process'])
+@pytest.mark.parametrize('busy', [False, True])
+@pytest.mark.parametrize('publish_before_auth', [False, True])
+@pytest.mark.parametrize('identity', ['a', 'b'])
+def test_completed_optout_fences_auth_rebound_before_journal_publication(
+    bound, monkeypatch, observer_kind, busy, publish_before_auth, identity
+):
+    """An off event fences logout/login bindings begun before its publication."""
+    plugin, settings, store, calls, _, _, _, _, _ = bound
+    settings['sync_watch_progress'] = 'false'
+    assert not plugin._observe_progress_opt_in(store)
+    disabled = store.context()
+    ctx = multiprocessing.get_context('spawn')
+    captured, publish, ready, begin = (ctx.Event() for _ in range(4))
+    original_context = SyncStore.context
+
+    def context(self):
+        result = original_context(self)
+        if threading.current_thread().name == 'auth-overlap-observer':
+            captured.set()
+            assert publish.wait(5)
+        return result
+
+    monkeypatch.setattr(SyncStore, 'context', context)
+    observations = []
+    if observer_kind == 'process':
+        observer = ctx.Process(
+            target=_auth_overlap_observer_process,
+            args=(store.path, ready, begin, captured, publish),
+        )
+        observer.start()
+        assert ready.wait(3)
+        begin.set()
+    else:
+        observer = threading.Thread(
+            name='auth-overlap-observer',
+            target=lambda: observations.append(plugin._observe_progress_opt_in(store)),
+        )
+        observer.start()
+    writer = None
+    try:
+        assert captured.wait(2)
+        if publish_before_auth:
+            publish.set()
+            observer.join(2)
+            assert not observer.is_alive()
+        settings['sync_watch_progress'] = 'true'
+        session = GronkhTVSession(plugin._ACCOUNT_COOKIE_FILE)
+
+        class LoginTransport(SyntheticTransport):
+            def open(self, request, timeout):
+                response = super().open(request, timeout)
+                if request.full_url.endswith('/auth'):
+                    self.jar.set_cookie(cookie('synthetic-session', identity))
+                return response
+
+        session.opener = LoginTransport(session.cookie_jar, calls)
+        monkeypatch.setattr(plugin, '_account_session', session)
+        inputs = iter(['synthetic-login', 'synthetic-password'])
+        monkeypatch.setattr(plugin.xbmcgui, 'Dialog', lambda: type('Dialog', (), {
+            'yesno': lambda *args: True,
+            'input': lambda *args, **kwargs: next(inputs),
+            'notification': lambda *args: None,
+        })())
+        monkeypatch.setattr(plugin.xbmc, 'executebuiltin', lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin, 'configure_account_session', lambda *args: None)
+        plugin.handle_account_logout()
+        assert not Path(plugin._ACCOUNT_COOKIE_FILE).exists()
+        plugin.handle_account_login()
+        sync = plugin._account_progress_sync()
+        assert sync is not None
+        assert sync.context.account_id == identity
+        assert sync.context.epoch > disabled['epoch'] + 1
+        if not publish_before_auth:
+            if busy:
+                writer = sqlite3.connect(store.path, timeout=0)
+                writer.execute('BEGIN IMMEDIATE')
+            publish.set()
+            observer.join(2)
+        assert not observer.is_alive()
+        if observer_kind == 'process':
+            assert getattr(observer, 'exitcode') == 0
+        else:
+            assert observations == [False]
+        active = store.is_active_context(identity, sync.context.epoch)
+        if writer is not None:
+            writer.rollback()
+            writer.close()
+            writer = None
+        count = len(calls)
+        validations = sum(call[2] == '/users/self' for call in calls)
+        sync.prepare_playback(VIDEO)
+        new_gets = len(calls) - count
+        assert sum(call[2] == '/users/self' for call in calls) == validations
+        assert store.pending('a', VIDEO)['offset'] == 12
+        assert new_gets == int(publish_before_auth)
+        assert active == publish_before_auth
+    finally:
+        publish.set()
+        if writer is not None:
+            writer.rollback()
+            writer.close()
+        observer.join(3)
+        if observer_kind == 'process':
+            if observer.is_alive():
+                getattr(observer, 'terminate')()
+                observer.join(3)
+            getattr(observer, 'close')()
