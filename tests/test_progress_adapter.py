@@ -46,13 +46,13 @@ def test_read_distinguishes_explicitly_absent_from_malformed_response():
         ProgressClient(Session([{"data": {}}])).read("b0b3d510-1da2-4bcb-9d6c-9d13d23b38b1")
 
 
-def test_write_posts_only_real_finite_nonnegative_offset():
+def test_write_posts_validated_integer_wire_offset():
     session = Session([{"data": {}}])
 
     ProgressClient(session).write("b0b3d510-1da2-4bcb-9d6c-9d13d23b38b1", 12.5)
 
     assert session.calls == [
-        ("/watched/progress/b0b3d510-1da2-4bcb-9d6c-9d13d23b38b1", "POST", {"offset": 12.5}, 2)
+        ("/watched/progress/b0b3d510-1da2-4bcb-9d6c-9d13d23b38b1", "POST", {"offset": 12}, 2)
     ]
 
 
