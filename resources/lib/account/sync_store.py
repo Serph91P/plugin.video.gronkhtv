@@ -37,7 +37,11 @@ class SyncStore:
                     fence INTEGER NOT NULL DEFAULT 0,
                     lease_account_id TEXT,
                     lease_fence INTEGER,
-                    lease_expires REAL
+                    lease_expires REAL,
+                    writer_account_id TEXT,
+                    writer_video_id TEXT,
+                    writer_fence INTEGER,
+                    writer_expires REAL
                 );
                 INSERT OR IGNORE INTO control(singleton) VALUES (1);
                 CREATE TABLE IF NOT EXISTS progress (
@@ -53,6 +57,18 @@ class SyncStore:
                 );
                 """
             )
+            # Additive migration for existing profiles.  Playback writers need
+            # their own lease: holding the upload lease for an entire playback
+            # would unnecessarily suppress normal progress uploads.
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(control)")}
+            for name, definition in (
+                ("writer_account_id", "TEXT"),
+                ("writer_video_id", "TEXT"),
+                ("writer_fence", "INTEGER"),
+                ("writer_expires", "REAL"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE control ADD COLUMN {name} {definition}")
 
     def activate(self, account_id, enabled):
         if not isinstance(account_id, str) or not account_id:
@@ -62,7 +78,8 @@ class SyncStore:
             epoch = db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0] + 1
             db.execute(
                 """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=?,
-                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
+                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL,
+                   writer_account_id=NULL, writer_video_id=NULL, writer_fence=NULL, writer_expires=NULL WHERE singleton=1""",
                 (account_id, epoch, int(bool(enabled))),
             )
             db.execute("COMMIT")
@@ -86,7 +103,8 @@ class SyncStore:
             epoch = control["epoch"] + 1
             db.execute(
                 """UPDATE control SET active_account_id=?, epoch=?, sync_enabled=1,
-                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
+                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL,
+                   writer_account_id=NULL, writer_video_id=NULL, writer_fence=NULL, writer_expires=NULL WHERE singleton=1""",
                 (account_id, epoch),
             )
             db.execute("COMMIT")
@@ -98,7 +116,8 @@ class SyncStore:
             epoch = db.execute("SELECT epoch FROM control WHERE singleton=1").fetchone()[0] + 1
             db.execute(
                 """UPDATE control SET active_account_id=NULL, epoch=?, sync_enabled=0,
-                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL WHERE singleton=1""",
+                   lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL,
+                   writer_account_id=NULL, writer_video_id=NULL, writer_fence=NULL, writer_expires=NULL WHERE singleton=1""",
                 (epoch,),
             )
             db.execute("COMMIT")
@@ -181,6 +200,108 @@ class SyncStore:
         with self._connection() as db:
             row = db.execute("SELECT * FROM progress WHERE account_id=? AND video_id=? AND pending=1", (account_id, video_id)).fetchone()
             return dict(row) if row else None
+
+    def claim_playback_writer(self, account_id, epoch, video_id, lease_seconds):
+        """Claim the selected stream's short durable monitor-write lease."""
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = self._clock()
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
+            if (
+                control["active_account_id"] != account_id
+                or control["epoch"] != epoch
+                or not control["sync_enabled"]
+                or (
+                    control["writer_expires"] is not None
+                    and control["writer_expires"] > now
+                )
+            ):
+                db.execute("ROLLBACK")
+                return None
+            fence = control["fence"] + 1
+            db.execute(
+                """UPDATE control SET fence=?, writer_account_id=?, writer_video_id=?,
+                   writer_fence=?, writer_expires=? WHERE singleton=1""",
+                (fence, account_id, video_id, fence, now + lease_seconds),
+            )
+            db.execute("COMMIT")
+            return {"account_id": account_id, "epoch": epoch, "video_id": video_id, "fence": fence}
+
+    def renew_playback_writer(self, account_id, epoch, video_id, lease, lease_seconds):
+        if not lease or lease_seconds <= 0:
+            return False
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
+            valid = (
+                control["active_account_id"] == account_id
+                and control["epoch"] == epoch
+                and control["writer_account_id"] == account_id
+                and control["writer_video_id"] == video_id
+                and control["writer_fence"] == lease.get("fence")
+            )
+            if not valid:
+                db.execute("ROLLBACK")
+                return False
+            db.execute(
+                "UPDATE control SET writer_expires=? WHERE singleton=1",
+                (self._clock() + lease_seconds,),
+            )
+            db.execute("COMMIT")
+            return True
+
+    def release_playback_writer(self, account_id, video_id, lease):
+        if not lease:
+            return False
+        with self._connection() as db:
+            result = db.execute(
+                """UPDATE control SET writer_account_id=NULL, writer_video_id=NULL,
+                   writer_fence=NULL, writer_expires=NULL WHERE singleton=1
+                   AND writer_account_id=? AND writer_video_id=? AND writer_fence=?""",
+                (account_id, video_id, lease.get("fence")),
+            )
+            return bool(result.rowcount)
+
+    def record_reset_if_idle(self, account_id, epoch, video_id):
+        """Publish zero only when no outgoing monitor owns this stream.
+
+        The check and mutation share one SQLite transaction, so a reset from a
+        second Kodi plugin invoker cannot replace an old monitor sample midway.
+        """
+        now = self._clock()
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
+            if (
+                control["active_account_id"] != account_id
+                or control["epoch"] != epoch
+                or not control["sync_enabled"]
+                or (
+                    control["writer_account_id"] == account_id
+                    and control["writer_video_id"] == video_id
+                    and control["writer_expires"] is not None
+                    and control["writer_expires"] > now
+                )
+            ):
+                db.execute("ROLLBACK")
+                return None
+            row = db.execute(
+                "SELECT revision FROM progress WHERE account_id=? AND video_id=?",
+                (account_id, video_id),
+            ).fetchone()
+            revision = (row["revision"] if row else 0) + 1
+            db.execute(
+                """INSERT INTO progress(account_id, video_id, offset, duration, revision, pending)
+                   VALUES (?, ?, 0, 0, ?, 1)
+                   ON CONFLICT(account_id, video_id) DO UPDATE SET
+                     offset=0, duration=0, revision=excluded.revision, pending=1""",
+                (account_id, video_id, revision),
+            )
+            db.execute("UPDATE control SET fence=fence+1 WHERE singleton=1")
+            db.execute("COMMIT")
+            return {"account_id": account_id, "video_id": video_id, "offset": 0, "duration": 0, "revision": revision}
 
     def is_current_revision(self, account_id, epoch, video_id, revision):
         """Reject a snapshot superseded by a reset or newer sample before POST."""

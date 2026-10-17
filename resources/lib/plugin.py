@@ -1229,11 +1229,23 @@ def monitor_playback(
     previous_position = None
     next_save = time.monotonic() + 5
     next_account_sync = time.monotonic() + 15
+    writer_lease = None
+    writer_current = True
+    begin_writer = getattr(progress_sync, "begin_playback_writer", None)
+    if progress_sync is not None and video_id and callable(begin_writer):
+        writer_lease = begin_writer(video_id)
+        if writer_lease is None:
+            return
 
     try:
         while player.isPlayingVideo() and not monitor.abortRequested():
             if not _is_current_playback_generation(generation):
                 return
+            renew_writer = getattr(progress_sync, "renew_playback_writer", None)
+            if writer_lease is not None and callable(renew_writer):
+                writer_current = renew_writer(video_id, writer_lease)
+                if not writer_current:
+                    return
             try:
                 current_time = _non_negative_finite(player.getTime(), "player time")
                 total_time = _non_negative_finite(
@@ -1278,7 +1290,7 @@ def monitor_playback(
             if monitor.waitForAbort(1):
                 break
     finally:
-        if latest and _is_current_playback_generation(generation):
+        if latest and writer_current and _is_current_playback_generation(generation):
             save_resume_point(episode, latest["position"], latest["duration"])
             if progress_sync is not None and video_id:
                 try:
@@ -1299,6 +1311,9 @@ def monitor_playback(
                 f"{latest['position']}/{latest['duration']}",
                 xbmc.LOGINFO,
             )
+        finish_writer = getattr(progress_sync, "finish_playback_writer", None)
+        if writer_lease is not None and callable(finish_writer):
+            finish_writer(video_id, writer_lease)
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
     if (

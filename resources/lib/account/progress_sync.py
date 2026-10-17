@@ -83,6 +83,20 @@ class ProgressSync:
         # coalesces by account/video and accepts legitimate reverse seeks and 0.
         return self._store.record_local(self._account_id, video_id, offset, duration)
 
+    def begin_playback_writer(self, video_id):
+        """Reserve a short cross-invoker lease while a monitor can commit."""
+        return self._store.claim_playback_writer(
+            self._account_id, self._epoch, video_id, self._lease_seconds
+        )
+
+    def renew_playback_writer(self, video_id, lease):
+        return self._store.renew_playback_writer(
+            self._account_id, self._epoch, video_id, lease, self._lease_seconds
+        )
+
+    def finish_playback_writer(self, video_id, lease):
+        return self._store.release_playback_writer(self._account_id, video_id, lease)
+
     def reset(self, video_id):
         """Synchronously publish an explicit selected-video reset to the account.
 
@@ -92,10 +106,12 @@ class ProgressSync:
         lease leaves the zero intent pending instead of racing a second POST.
         """
         try:
-            snapshot = self._store.record_local(
-                self._account_id, video_id, 0, 0, epoch=self._epoch, invalidate_reads=True
+            snapshot = self._store.record_reset_if_idle(
+                self._account_id, self._epoch, video_id
             )
         except Exception:
+            return "pending"
+        if snapshot is None:
             return "pending"
         lease = self._store.claim_upload(
             self._account_id, self._lease_seconds, video_id, snapshot["revision"]

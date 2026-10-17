@@ -436,3 +436,14 @@ def test_reset_fences_a_retry_after_its_lease_expires(tmp_path):
 
     assert sync.flush("video-a") == "pending"
     assert api.writes == [("video-a", 0)]
+
+
+def test_reset_defers_while_a_durable_selected_monitor_writer_is_active(tmp_path):
+    api = API()
+    sync, store = _sync(tmp_path, api)
+    sync.record_position("video-a", 2, 300, event="stop")
+
+    assert sync.begin_playback_writer("video-a") is not None
+    assert sync.reset("video-a") == "pending"
+    assert api.writes == []
+    assert store.pending("account-a", "video-a")["offset"] == 2
