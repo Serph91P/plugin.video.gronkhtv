@@ -2217,7 +2217,12 @@ def test_confirmed_reset_removes_only_local_resume_after_account_zero_succeeds(p
             assert video_id == "00000000-0000-4000-8000-000000000001"
             return "synchronized"
 
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
     monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: StoppedPlayer())
     monkeypatch.setattr(plugin, "_account_progress_sync", lambda: Sync())
     monkeypatch.setattr(
         plugin, "get_video_info", lambda episode: {"id": "00000000-0000-4000-8000-000000000001"}
@@ -2245,3 +2250,29 @@ def test_cancelled_reset_has_no_effects(plugin, monkeypatch):
 
     assert plugin.handle_reset_resume({"episode": "1105"}) is False
     assert calls == []
+
+
+def test_reset_defers_without_side_effects_while_selected_video_is_playing(plugin, monkeypatch):
+    calls = []
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            calls.append(("notification", args))
+
+    class ActivePlayer:
+        def isPlayingVideo(self):
+            return True
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: ActivePlayer())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: calls.append("sync"))
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: calls.append("remove"))
+    monkeypatch.setattr(plugin, "get_video_info", lambda episode: calls.append("info"))
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    assert "sync" not in calls
+    assert "remove" not in calls
+    assert "info" not in calls

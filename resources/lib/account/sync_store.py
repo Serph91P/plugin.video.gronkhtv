@@ -147,13 +147,17 @@ class SyncStore:
                 return "conflict"
         return "pending" if rows else "synchronized"
 
-    def record_local(self, account_id, video_id, offset, duration=0):
+    def record_local(self, account_id, video_id, offset, duration=0, epoch=None):
         _non_negative(offset, "offset")
         _non_negative(duration, "duration")
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            control = db.execute("SELECT active_account_id, sync_enabled FROM control WHERE singleton=1").fetchone()
-            if control["active_account_id"] != account_id or not control["sync_enabled"]:
+            control = db.execute("SELECT active_account_id, sync_enabled, epoch FROM control WHERE singleton=1").fetchone()
+            if (
+                control["active_account_id"] != account_id
+                or not control["sync_enabled"]
+                or (epoch is not None and control["epoch"] != epoch)
+            ):
                 db.execute("ROLLBACK")
                 raise RuntimeError("account is not the active sync context")
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
@@ -173,6 +177,22 @@ class SyncStore:
         with self._connection() as db:
             row = db.execute("SELECT * FROM progress WHERE account_id=? AND video_id=? AND pending=1", (account_id, video_id)).fetchone()
             return dict(row) if row else None
+
+    def is_current_revision(self, account_id, epoch, video_id, revision):
+        """Reject a snapshot superseded by a reset or newer sample before POST."""
+        with self._connection() as db:
+            control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
+            row = db.execute(
+                "SELECT revision FROM progress WHERE account_id=? AND video_id=?",
+                (account_id, video_id),
+            ).fetchone()
+            return bool(
+                control["active_account_id"] == account_id
+                and control["epoch"] == epoch
+                and control["sync_enabled"]
+                and row is not None
+                and row["revision"] == revision
+            )
 
     def observe_remote(self, account_id, epoch, video_id, remote):
         """Persist only a successful remote read; failures must not look absent."""
@@ -273,7 +293,7 @@ class SyncStore:
             db.execute("COMMIT")
             return observed["offset"]
 
-    def claim_upload(self, account_id, lease_seconds):
+    def claim_upload(self, account_id, lease_seconds, video_id=None, revision=None):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         now = self._clock()
@@ -283,6 +303,14 @@ class SyncStore:
             if control["active_account_id"] != account_id or not control["sync_enabled"]:
                 db.execute("ROLLBACK")
                 return None
+            if video_id is not None:
+                row = db.execute(
+                    "SELECT revision FROM progress WHERE account_id=? AND video_id=?",
+                    (account_id, video_id),
+                ).fetchone()
+                if row is None or row["revision"] != revision:
+                    db.execute("ROLLBACK")
+                    return None
             if control["lease_expires"] is not None and control["lease_expires"] > now:
                 db.execute("ROLLBACK")
                 return None

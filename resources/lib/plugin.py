@@ -1788,6 +1788,13 @@ def handle_reset_resume(params):
         "Fortschritt für diesen Stream lokal und im Konto zurücksetzen?",
     ):
         return False
+    if xbmc.Player().isPlayingVideo():
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
     progress_sync = _account_progress_sync()
     if progress_sync is None:
         xbmcgui.Dialog().notification(

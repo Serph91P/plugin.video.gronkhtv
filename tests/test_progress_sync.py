@@ -165,8 +165,8 @@ def test_auth_failure_never_clears_pending_or_invalidates_another_account(tmp_pa
 
 def test_account_switch_after_lease_fences_the_write_before_http(tmp_path):
     class FenceStore(SyncStore):
-        def claim_upload(self, account_id, lease_seconds):
-            lease = super().claim_upload(account_id, lease_seconds)
+        def claim_upload(self, account_id, lease_seconds, video_id=None, revision=None):
+            lease = super().claim_upload(account_id, lease_seconds, video_id, revision)
             self.activate("account-b", enabled=True)
             return lease
 
@@ -330,3 +330,55 @@ def test_explicit_reset_defers_zero_while_an_existing_upload_lease_is_active(tmp
     assert sync.reset("video-a") == "pending"
     assert api.writes == []
     assert store.pending("account-a", "video-a")["offset"] == 0
+
+
+def test_reset_fences_a_flush_snapshot_captured_before_its_preflight(tmp_path):
+    class ResetDuringReadAPI(API):
+        def read(self, video_id):
+            assert sync.reset(video_id) == "synchronized"
+            return RemoteProgress(status="absent")
+
+    api = ResetDuringReadAPI()
+    sync, store = _sync(tmp_path, api)
+    sync.record_position("video-a", 2, 300, event="stop")
+
+    assert sync.flush("video-a") == "pending"
+    assert api.writes == [("video-a", 0)]
+    assert store.pending("account-a", "video-a") is None
+
+
+def test_stale_reset_epoch_cannot_replace_a_new_same_account_intent(tmp_path):
+    api = API()
+    old_sync, store = _sync(tmp_path, api)
+    new_epoch = store.activate("account-a", enabled=True)
+    new_sync = ProgressSync(store, api, "account-a", new_epoch)
+    new_sync.record_position("video-a", 77, 300, event="stop")
+
+    assert old_sync.reset("video-a") == "pending"
+    assert api.writes == []
+    assert store.pending("account-a", "video-a")["offset"] == 77
+
+
+def test_reset_discards_a_positive_response_from_a_read_started_before_zero(tmp_path):
+    store = SyncStore(tmp_path / "sync.sqlite3")
+    epoch = store.activate("account-a", enabled=True)
+
+    class ResetDuringReadAPI(API):
+        offset = 2
+
+        def read(self, video_id):
+            captured = self.offset
+            assert sync.reset(video_id) == "synchronized"
+            return RemoteProgress(status="valid", offset=captured)
+
+        def write(self, video_id, offset):
+            self.offset = offset
+            self.writes.append((video_id, offset))
+
+    api = ResetDuringReadAPI()
+    sync = ProgressSync(store, api, "account-a", epoch)
+    sync.record_position("video-a", 2, 300, event="stop")
+
+    assert sync.prepare_playback("video-a") != {"state": "valid", "offset": 2}
+    assert api.writes == [("video-a", 0)]
+    assert store.observed_remote("account-a", "video-a")["offset"] == 0

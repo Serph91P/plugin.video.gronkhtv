@@ -29,6 +29,7 @@ class ProgressSync:
         # must not even read account A progress after a logout/account switch.
         if not self._store.is_active_context(self._account_id, self._epoch):
             return {"state": "pending", "offset": None}
+        snapshot_before_read = self._store.pending(self._account_id, video_id)
         try:
             remote = self._api.read(video_id)
         except AuthenticationError:
@@ -39,6 +40,10 @@ class ProgressSync:
         # invalidated.  Keep its durable local snapshot pending instead.
         if not self._store.is_active_context(self._account_id, self._epoch):
             return {"state": "pending", "offset": None}
+        if snapshot_before_read is not None:
+            current = self._store.pending(self._account_id, video_id)
+            if current is None or current["revision"] != snapshot_before_read["revision"]:
+                return {"state": "pending", "offset": None}
         if remote.status == "absent":
             try:
                 self._store.observe_remote(self._account_id, self._epoch, video_id, {"status": "absent"})
@@ -81,10 +86,14 @@ class ProgressSync:
         lease leaves the zero intent pending instead of racing a second POST.
         """
         try:
-            snapshot = self._store.record_local(self._account_id, video_id, 0, 0)
+            snapshot = self._store.record_local(
+                self._account_id, video_id, 0, 0, epoch=self._epoch
+            )
         except Exception:
             return "pending"
-        lease = self._store.claim_upload(self._account_id, self._lease_seconds)
+        lease = self._store.claim_upload(
+            self._account_id, self._lease_seconds, video_id, snapshot["revision"]
+        )
         if lease is None or lease["epoch"] != self._epoch:
             return "pending"
         if not self._store.is_active_context(self._account_id, self._epoch):
@@ -143,8 +152,14 @@ class ProgressSync:
             return "conflict"
         if _remote_changed_since_confirmed(snapshot, preflight):
             return "conflict"
+        if not self._store.is_current_revision(
+            self._account_id, self._epoch, video_id, snapshot["revision"]
+        ):
+            return "pending"
         observed_before_write = self._store.observed_remote(self._account_id, video_id)
-        lease = self._store.claim_upload(self._account_id, self._lease_seconds)
+        lease = self._store.claim_upload(
+            self._account_id, self._lease_seconds, video_id, snapshot["revision"]
+        )
         if lease is None or lease["epoch"] != self._epoch:
             return "pending"
         # An epoch change between lease acquisition and request dispatch fences
