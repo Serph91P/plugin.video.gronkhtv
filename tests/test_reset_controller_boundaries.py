@@ -1,5 +1,6 @@
 """End-to-end reset-controller boundaries using the production router and stores."""
 import concurrent.futures
+import json
 import sqlite3
 import threading
 
@@ -29,6 +30,20 @@ def _progress_rows(store):
                       confirmed_json, observed_json
                FROM progress ORDER BY account_id, video_id"""
         ).fetchall()
+
+
+def _seed_remote_snapshots(store, account_id, video_id, confirmed_offset, observed_offset):
+    with sqlite3.connect(store.path) as database:
+        database.execute(
+            """UPDATE progress SET confirmed_json=?, observed_json=?
+               WHERE account_id=? AND video_id=?""",
+            (
+                json.dumps({"status": "valid", "offset": confirmed_offset}, sort_keys=True),
+                json.dumps({"status": "valid", "offset": observed_offset}, sort_keys=True),
+                account_id,
+                video_id,
+            ),
+        )
 
 
 def _notifications(plugin, monkeypatch):
@@ -112,9 +127,14 @@ def test_router_reset_changes_only_selected_account_video_rows_and_private_file(
     other_epoch = store.activate("other-account", enabled=True)
     store.record_local("other-account", OTHER_VIDEO, 66, 300)
     store.observe_remote(other_epoch and "other-account", other_epoch, OTHER_VIDEO, {"status": "valid", "offset": 65})
+    store.record_local("other-account", VIDEO, 64, 300)
+    store.observe_remote(other_epoch and "other-account", other_epoch, VIDEO, {"status": "valid", "offset": 63})
     selected_epoch = store.activate("synthetic-account", enabled=True)
     store.record_local("synthetic-account", OTHER_VIDEO, 77, 300)
     store.observe_remote("synthetic-account", selected_epoch, OTHER_VIDEO, {"status": "valid", "offset": 76})
+    _seed_remote_snapshots(store, "other-account", OTHER_VIDEO, 65, 64)
+    _seed_remote_snapshots(store, "other-account", VIDEO, 63, 62)
+    _seed_remote_snapshots(store, "synthetic-account", OTHER_VIDEO, 76, 75)
     other_path = plugin._resume_path(1106)
     plugin.write_record(plugin.xbmcvfs, str(Path(other_path).parent), other_path, 75, 300)
     before = _progress_rows(store)
@@ -123,8 +143,13 @@ def test_router_reset_changes_only_selected_account_video_rows_and_private_file(
 
     assert remote["writes"] == [0]
     assert plugin.get_resume_record(1106, 300)["position"] == 75
-    after_without_selected = [row for row in _progress_rows(store) if row[1] != VIDEO]
-    assert after_without_selected == before
+    after_without_selected = [
+        row for row in _progress_rows(store) if row[:2] != ("synthetic-account", VIDEO)
+    ]
+    before_without_selected = [
+        row for row in before if row[:2] != ("synthetic-account", VIDEO)
+    ]
+    assert after_without_selected == before_without_selected
     selected = next(row for row in _progress_rows(store) if row[:2] == ("synthetic-account", VIDEO))
     assert selected[2] == 0
     assert selected[5] == 0
@@ -157,17 +182,39 @@ def test_router_reset_failure_reports_error_and_preserves_selected_retry_intent(
 
     monkeypatch.setattr(plugin, "GronkhTVSession", lambda *_args, **_kwargs: FailingSession())
 
+    store = plugin.SyncStore(plugin._PROGRESS_SYNC_FILE)
+    other_epoch = store.activate("other-account", enabled=True)
+    store.record_local("other-account", VIDEO, 64, 300)
+    store.observe_remote("other-account", other_epoch, VIDEO, {"status": "valid", "offset": 63})
+    selected_epoch = store.activate("synthetic-account", enabled=True)
+    store.record_local("synthetic-account", VIDEO, 2, 300)
+    store.record_local("synthetic-account", OTHER_VIDEO, 77, 300)
+    store.observe_remote("synthetic-account", selected_epoch, OTHER_VIDEO, {"status": "valid", "offset": 76})
+    _seed_remote_snapshots(store, "other-account", VIDEO, 63, 62)
+    _seed_remote_snapshots(store, "synthetic-account", OTHER_VIDEO, 76, 75)
+    _seed_remote_snapshots(store, "synthetic-account", VIDEO, 2, 2)
+    before = _progress_rows(store)
+    assert next(row for row in before if row[:2] == ("synthetic-account", VIDEO))[6] == json.dumps(
+        {"status": "valid", "offset": 2}, sort_keys=True
+    )
+
     assert plugin.handle_reset_resume({"episode": "1105"}) is False
     assert posts == [("/watched/progress/" + VIDEO, {"offset": 0})]
     assert remote["writes"] == []
     assert plugin.get_resume_record(1105, 300)["position"] == 2
     sync = plugin._account_progress_sync()
     assert sync._store.pending("synthetic-account", VIDEO)["offset"] == 0
-    assert sync._store.observed_remote("synthetic-account", VIDEO) is None
+    assert sync._store.observed_remote("synthetic-account", VIDEO) == {"status": "valid", "offset": 2}
+    selected = next(row for row in _progress_rows(store) if row[:2] == ("synthetic-account", VIDEO))
+    assert selected[6] == json.dumps({"status": "valid", "offset": 2}, sort_keys=True)
+    assert [row for row in _progress_rows(store) if row[:2] != ("synthetic-account", VIDEO)] == [
+        row for row in before if row[:2] != ("synthetic-account", VIDEO)
+    ]
     assert any("nicht vollständig zurückgesetzt" in message for message, _icon in messages)
 
 
-def test_parallel_openers_upgrade_legacy_profile_without_losing_pending_rows(tmp_path):
+@pytest.mark.parametrize("attempt", range(6))
+def test_parallel_openers_upgrade_legacy_profile_without_losing_pending_rows(tmp_path, attempt):
     """Actual two-opener migration keeps the legacy profile usable for reset."""
     database_path = tmp_path / "legacy-progress.sqlite3"
     with sqlite3.connect(database_path) as database:
@@ -192,8 +239,15 @@ def test_parallel_openers_upgrade_legacy_profile_without_losing_pending_rows(tmp
             """
         )
 
+    start = threading.Barrier(2)
+
+    def open_store():
+        start.wait(timeout=5)
+        return SyncStore(database_path)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _unused: SyncStore(database_path), range(2)))
+        futures = [pool.submit(open_store) for _ in range(2)]
+        results = [future.result(timeout=10) for future in futures]
 
     assert len(results) == 2
     pending = results[0].pending("synthetic-account", "synthetic-video")
@@ -204,6 +258,24 @@ def test_parallel_openers_upgrade_legacy_profile_without_losing_pending_rows(tmp
     with sqlite3.connect(database_path) as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(control)")}
     assert {"writer_account_id", "writer_video_id", "writer_fence", "writer_expires"} <= columns
+
+
+@pytest.mark.parametrize("attempt", range(6))
+def test_parallel_first_openers_initialize_one_new_profile(tmp_path, attempt):
+    """Two real first opens tolerate the one-time WAL transition."""
+    database_path = tmp_path / "new-progress.sqlite3"
+    start = threading.Barrier(2)
+
+    def open_store():
+        start.wait(timeout=5)
+        return SyncStore(database_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(open_store) for _ in range(2)]
+        stores = [future.result(timeout=10) for future in futures]
+
+    assert len(stores) == 2
+    assert stores[0].context() == stores[1].context()
 
 
 def test_expired_real_monitor_defers_reset_until_its_finalizer_has_stopped(

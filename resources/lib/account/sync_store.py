@@ -24,57 +24,62 @@ class SyncStore:
         return connection
 
     def _initialize(self):
-        with self._connection() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA foreign_keys=ON")
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS control (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    active_account_id TEXT,
-                    epoch INTEGER NOT NULL DEFAULT 0,
-                    sync_enabled INTEGER NOT NULL DEFAULT 0,
-                    fence INTEGER NOT NULL DEFAULT 0,
-                    lease_account_id TEXT,
-                    lease_fence INTEGER,
-                    lease_expires REAL,
-                    writer_account_id TEXT,
-                    writer_video_id TEXT,
-                    writer_fence INTEGER,
-                    writer_expires REAL
-                );
-                INSERT OR IGNORE INTO control(singleton) VALUES (1);
-                CREATE TABLE IF NOT EXISTS progress (
-                    account_id TEXT NOT NULL,
-                    video_id TEXT NOT NULL,
-                    offset REAL NOT NULL,
-                    duration REAL NOT NULL,
-                    revision INTEGER NOT NULL,
-                    pending INTEGER NOT NULL,
-                    confirmed_json TEXT,
-                    observed_json TEXT,
-                    PRIMARY KEY(account_id, video_id)
-                );
-                """
-            )
-            # Additive migration for existing profiles.  Playback writers need
-            # their own lease: holding the upload lease for an entire playback
-            # would unnecessarily suppress normal progress uploads.
-            db.execute("BEGIN IMMEDIATE")
+        for attempt in range(5):
             try:
-                columns = {row["name"] for row in db.execute("PRAGMA table_info(control)")}
-                for name, definition in (
-                    ("writer_account_id", "TEXT"),
-                    ("writer_video_id", "TEXT"),
-                    ("writer_fence", "INTEGER"),
-                    ("writer_expires", "REAL"),
-                ):
-                    if name not in columns:
-                        db.execute(f"ALTER TABLE control ADD COLUMN {name} {definition}")
-                db.execute("COMMIT")
-            except Exception:
-                db.execute("ROLLBACK")
-                raise
+                with self._connection() as db:
+                    db.execute("PRAGMA busy_timeout=3000")
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("PRAGMA foreign_keys=ON")
+                    db.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS control (
+                            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                            active_account_id TEXT,
+                            epoch INTEGER NOT NULL DEFAULT 0,
+                            sync_enabled INTEGER NOT NULL DEFAULT 0,
+                            fence INTEGER NOT NULL DEFAULT 0,
+                            lease_account_id TEXT,
+                            lease_fence INTEGER,
+                            lease_expires REAL,
+                            writer_account_id TEXT,
+                            writer_video_id TEXT,
+                            writer_fence INTEGER,
+                            writer_expires REAL
+                        );
+                        INSERT OR IGNORE INTO control(singleton) VALUES (1);
+                        CREATE TABLE IF NOT EXISTS progress (
+                            account_id TEXT NOT NULL,
+                            video_id TEXT NOT NULL, offset REAL NOT NULL,
+                            duration REAL NOT NULL, revision INTEGER NOT NULL,
+                            pending INTEGER NOT NULL, confirmed_json TEXT,
+                            observed_json TEXT,
+                            PRIMARY KEY(account_id, video_id)
+                        );
+                        """
+                    )
+                    # Additive migration for existing profiles.  Playback writers need
+                    # their own lease: holding the upload lease for an entire playback
+                    # would unnecessarily suppress normal progress uploads.
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        columns = {row["name"] for row in db.execute("PRAGMA table_info(control)")}
+                        for name, definition in (
+                            ("writer_account_id", "TEXT"),
+                            ("writer_video_id", "TEXT"),
+                            ("writer_fence", "INTEGER"),
+                            ("writer_expires", "REAL"),
+                        ):
+                            if name not in columns:
+                                db.execute(f"ALTER TABLE control ADD COLUMN {name} {definition}")
+                        db.execute("COMMIT")
+                    except Exception:
+                        db.execute("ROLLBACK")
+                        raise
+                return
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).lower() or attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def activate(self, account_id, enabled):
         if not isinstance(account_id, str) or not account_id:
