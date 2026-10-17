@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from test_plugin_playback import RecordingListItem, plugin as plugin_fixture
+from account.session import AuthenticationError, RateLimitError, ValidationError
 
 plugin = plugin_fixture
 
@@ -18,6 +19,8 @@ OTHER_VIDEO = "00000000-0000-4000-8000-000000000002"
 
 @pytest.fixture
 def local_listing(plugin, monkeypatch):
+    emitted_items = []
+
     class VFS:
         @staticmethod
         def exists(path):
@@ -77,13 +80,19 @@ def local_listing(plugin, monkeypatch):
     monkeypatch.setattr(plugin, "get_chapters", lambda *args: [])
     monkeypatch.setattr(plugin, "is_favorite", lambda *args: False)
     monkeypatch.setattr(plugin, "is_watched", lambda *args: False)
+    real_listing_account_progress = plugin._listing_account_progress
     monkeypatch.setattr(plugin, "_listing_account_progress", lambda *args, **kwargs: {})
     monkeypatch.setattr(plugin.xbmcgui, "ListItem", RecordingListItem)
     for attribute in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
         monkeypatch.setattr(plugin.xbmcplugin, attribute, lambda *args: None, raising=False)
-    monkeypatch.setattr(plugin.xbmcplugin, "addDirectoryItem", lambda handle, url, item, folder: None, raising=False)
+    monkeypatch.setattr(
+        plugin.xbmcplugin,
+        "addDirectoryItem",
+        lambda handle, url, item, folder: emitted_items.append((url, item)),
+        raising=False,
+    )
     monkeypatch.setattr(plugin.xbmc, "executebuiltin", lambda *args, **kwargs: None, raising=False)
-    return plugin, remote, settings
+    return plugin, remote, settings, emitted_items, real_listing_account_progress
 
 
 def separate_invoker(plugin, monkeypatch, name):
@@ -99,7 +108,7 @@ def separate_invoker(plugin, monkeypatch, name):
 
 
 def test_failed_guard_creation_prevents_outgoing_monitor_from_restoring_reset(local_listing, monkeypatch):
-    plugin, remote, settings = local_listing
+    plugin, remote, settings, _items, _real_listing = local_listing
     reset = separate_invoker(plugin, monkeypatch, "reset_after_guard_failure")
     state = {"playing": True}
     real_file = plugin.xbmcvfs.File
@@ -139,7 +148,7 @@ def test_failed_guard_creation_prevents_outgoing_monitor_from_restoring_reset(lo
 
 def test_false_guard_write_prevents_outgoing_monitor_from_restoring_reset(local_listing, monkeypatch):
     """Kodi VFS can report a failed write without raising an exception."""
-    plugin, remote, settings = local_listing
+    plugin, remote, settings, _items, _real_listing = local_listing
     reset = separate_invoker(plugin, monkeypatch, "reset_after_false_guard_write")
     state = {"playing": True}
     real_file = plugin.xbmcvfs.File
@@ -183,7 +192,7 @@ def test_false_guard_write_prevents_outgoing_monitor_from_restoring_reset(local_
 
 
 def test_reset_guard_is_not_mistaken_for_an_outgoing_writer(local_listing):
-    plugin, _remote, _settings = local_listing
+    plugin, _remote, _settings, _items, _real_listing = local_listing
     writer_path = plugin._resume_writer_path(1105)
 
     reset_guard = plugin._begin_resume_reset(writer_path)
@@ -200,7 +209,7 @@ def test_confirmed_router_reset_publishes_zero_and_removes_private_resume(
     local_listing, monkeypatch, position
 ):
     """The production router, ProgressClient and VFS agree on a reset to zero."""
-    plugin, remote, _settings = local_listing
+    plugin, remote, _settings, items, real_listing = local_listing
     resume_path = plugin._resume_path(1105)
     plugin.write_record(plugin.xbmcvfs, str(Path(resume_path).parent), resume_path, position, 300)
     playback = []
@@ -222,9 +231,146 @@ def test_confirmed_router_reset_publishes_zero_and_removes_private_resume(
     }
     assert playback == []
 
+    monkeypatch.setattr(plugin, "_listing_account_progress", real_listing)
+    plugin.list_videos(plugin._CATEGORIES[0])
+
+    assert len(items) == 1
+    rendered_item = items[0][1]
+    assert not any("action=reset_resume" in action for _label, action in rendered_item.context_menu)
+    assert "setResumePoint" not in rendered_item.tag.calls
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AuthenticationError("synthetic denied"),
+        RateLimitError("synthetic rate limit", retry_after=1),
+        ValidationError("synthetic validation"),
+        RuntimeError("synthetic network failure"),
+    ],
+    ids=["denied", "rate-limited", "validation", "network"],
+)
+def test_router_reset_preserves_local_record_and_zero_intent_on_transport_failure(
+    local_listing, monkeypatch, failure
+):
+    """Real router/client/store/VFS reset failures remain honest and retryable."""
+    plugin, remote, _settings, _items, _real_listing = local_listing
+    calls = []
+
+    class FailingSession:
+        def request_json(self, path, method="GET", payload=None, timeout=None):
+            if method == "POST":
+                calls.append(payload)
+                raise failure
+            pytest.fail("reset unexpectedly performed a progress read")
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin, "GronkhTVSession", lambda *_args, **_kwargs: FailingSession())
+    monkeypatch.setattr(plugin.xbmc, "Player", StoppedPlayer)
+
+    assert plugin.router("action=reset_resume&episode=1105") is None
+    assert calls
+    assert remote["writes"] == []
+    assert plugin.get_resume_record(1105, 300)["position"] == 2
+    sync = plugin._account_progress_sync()
+    assert sync._store.pending("synthetic-account", VIDEO)["offset"] == 0
+
+
+def test_router_reset_keeps_private_primary_and_backup_when_cleanup_fails(
+    local_listing, monkeypatch
+):
+    """A server-zero with a failed real backup delete is reported as partial failure."""
+    plugin, remote, _settings, _items, _real_listing = local_listing
+    resume_path = plugin._resume_path(1105)
+    backup_path = f"{resume_path}.bak"
+    plugin.write_record(plugin.xbmcvfs, str(Path(resume_path).parent), backup_path, 2, 300)
+    real_delete = plugin.xbmcvfs.delete
+    failed_once = {"value": True}
+
+    def fail_backup_delete(path):
+        if path == backup_path and failed_once["value"]:
+            return False
+        return real_delete(path)
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin.xbmcvfs, "delete", fail_backup_delete)
+    monkeypatch.setattr(plugin.xbmc, "Player", StoppedPlayer)
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    assert remote["writes"] == [0]
+    assert plugin.get_resume_record(1105, 300)["position"] == 2
+    assert Path(backup_path).exists()
+
+    failed_once["value"] = False
+    assert plugin.handle_reset_resume({"episode": "1105"}) is True
+    assert remote["writes"] == [0, 0]
+    assert not Path(resume_path).exists()
+    assert not Path(backup_path).exists()
+
+
+def test_router_reset_rejects_missing_backend_uuid_without_touching_other_stream(
+    local_listing, monkeypatch
+):
+    plugin, remote, _settings, _items, _real_listing = local_listing
+    other_path = plugin._resume_path(1106)
+    plugin.write_record(plugin.xbmcvfs, str(Path(other_path).parent), other_path, 75, 300)
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin.xbmc, "Player", StoppedPlayer)
+    monkeypatch.setattr(plugin, "get_video_info", lambda *_args: {"episode": 1105})
+
+    assert plugin.router("action=reset_resume&episode=1105") is None
+    assert remote["writes"] == []
+    assert plugin.get_resume_record(1105, 300)["position"] == 2
+    assert plugin.get_resume_record(1106, 300)["position"] == 75
+
+
+def test_router_reset_keeps_local_state_when_account_context_changes_during_write(
+    local_listing, monkeypatch
+):
+    plugin, remote, _settings, _items, _real_listing = local_listing
+    switched = {"value": False}
+
+    class SwitchingSession:
+        def request_json(self, path, method="GET", payload=None, timeout=None):
+            if method == "POST" and not switched["value"]:
+                switched["value"] = True
+                plugin.SyncStore(plugin._PROGRESS_SYNC_FILE).activate(
+                    "other-synthetic-account", enabled=True
+                )
+            if method == "POST":
+                remote["writes"].append(payload["offset"])
+                remote["offset"] = payload["offset"]
+                return {}
+            pytest.fail("reset unexpectedly performed a progress read")
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin, "GronkhTVSession", lambda *_args, **_kwargs: SwitchingSession())
+    monkeypatch.setattr(plugin.xbmc, "Player", StoppedPlayer)
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    # The immutable old-session snapshot may have accepted its POST already,
+    # but the switched context cannot confirm it or remove the private record.
+    assert remote["writes"] == [0]
+    assert plugin.get_resume_record(1105, 300)["position"] == 2
+    sync = plugin._account_progress_sync()
+    assert sync._store.context()["active_account_id"] == "other-synthetic-account"
+
 
 def test_refused_claim_releases_guard_and_allows_later_reset(local_listing, monkeypatch):
-    plugin, remote, _settings = local_listing
+    plugin, remote, _settings, _items, _real_listing = local_listing
     sync = plugin._account_progress_sync()
     blocker = sync.begin_playback_writer(OTHER_VIDEO)
 
@@ -245,7 +391,7 @@ def test_refused_claim_releases_guard_and_allows_later_reset(local_listing, monk
 
 
 def test_finishing_one_monitor_keeps_another_monitors_guard(local_listing, monkeypatch):
-    plugin, remote, settings = local_listing
+    plugin, remote, settings, _items, _real_listing = local_listing
     other = separate_invoker(plugin, monkeypatch, "overlapping_monitor")
     reset = separate_invoker(plugin, monkeypatch, "overlapping_reset")
     settings["sync_watch_progress"] = "false"
@@ -309,7 +455,7 @@ def test_partial_guard_write_removes_its_own_empty_file(
     local_listing, monkeypatch, begin_guard, suffix
 ):
     """A False VFS write after open must not leave a permanent owned guard."""
-    plugin, _remote, _settings = local_listing
+    plugin, _remote, _settings, _items, _real_listing = local_listing
     writer_path = plugin._resume_writer_path(1105)
     real_file = plugin.xbmcvfs.File
 
