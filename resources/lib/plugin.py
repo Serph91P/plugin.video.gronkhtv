@@ -1225,6 +1225,8 @@ def monitor_playback(
         xbmc.log("[Gronkh.tv] Playback did not start", xbmc.LOGWARNING)
         return
 
+    local_writer_path = _resume_writer_path(episode)
+    _begin_resume_writer(local_writer_path)
     latest = None
     previous_position = None
     next_save = time.monotonic() + 5
@@ -1290,6 +1292,9 @@ def monitor_playback(
             if monitor.waitForAbort(1):
                 break
     finally:
+        renew_writer = getattr(progress_sync, "renew_playback_writer", None)
+        if writer_lease is not None and callable(renew_writer):
+            writer_current = writer_current and renew_writer(video_id, writer_lease)
         if latest and writer_current and _is_current_playback_generation(generation):
             save_resume_point(episode, latest["position"], latest["duration"])
             if progress_sync is not None and video_id:
@@ -1314,6 +1319,7 @@ def monitor_playback(
         finish_writer = getattr(progress_sync, "finish_playback_writer", None)
         if writer_lease is not None and callable(finish_writer):
             finish_writer(video_id, writer_lease)
+        _finish_resume_writer(local_writer_path)
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
     if (
@@ -1369,6 +1375,29 @@ def monitor_playback(
 def _resume_path(episode):
     episode = _positive_int(episode, "episode")
     return os.path.join(_RESUME_DIR, f"{episode}.txt")
+
+
+def _resume_writer_path(episode):
+    return _resume_path(episode) + ".writer"
+
+
+def _begin_resume_writer(path):
+    try:
+        xbmcvfs.mkdirs(_RESUME_DIR)
+        with xbmcvfs.File(path, "w") as handle:
+            handle.write("writing")
+        return True
+    except Exception:
+        return False
+
+
+def _finish_resume_writer(path):
+    try:
+        if xbmcvfs.exists(path):
+            return xbmcvfs.delete(path)
+    except Exception:
+        return False
+    return True
 
 
 def _watched_path(episode):
@@ -1803,7 +1832,7 @@ def handle_reset_resume(params):
         "Fortschritt für diesen Stream lokal und im Konto zurücksetzen?",
     ):
         return False
-    if xbmc.Player().isPlayingVideo():
+    if xbmc.Player().isPlayingVideo() or xbmcvfs.exists(_resume_writer_path(episode)):
         xbmcgui.Dialog().notification(
             _plugin,
             "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",

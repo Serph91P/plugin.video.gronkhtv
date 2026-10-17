@@ -238,3 +238,18 @@ def test_active_playback_writer_defers_reset_without_replacing_its_pending_sampl
     assert store.record_reset_if_idle("account-a", epoch, "video-a") is None
     assert store.pending("account-a", "video-a")["revision"] == original["revision"]
     assert store.pending("account-a", "video-a")["offset"] == 2
+
+
+def test_expired_playback_writer_defers_reset_and_cannot_be_renewed(tmp_path):
+    """Lease expiry is not proof that the monitor has finished its final write."""
+    now = [100.0]
+    store = SyncStore(tmp_path / "progress.sqlite3", clock=lambda: now[0])
+    epoch = store.activate("account-a", enabled=True)
+    writer = store.claim_playback_writer("account-a", epoch, "video-a", lease_seconds=5)
+
+    assert writer is not None
+    now[0] += 6
+    assert store.record_reset_if_idle("account-a", epoch, "video-a") is None
+    assert not store.renew_playback_writer(
+        "account-a", epoch, "video-a", writer, lease_seconds=5
+    )

@@ -2278,6 +2278,33 @@ def test_reset_defers_without_side_effects_while_selected_video_is_playing(plugi
     assert "info" not in calls
 
 
+def test_reset_defers_while_an_outgoing_local_only_monitor_owns_the_resume_file(
+    plugin, monkeypatch
+):
+    calls = []
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            calls.append(("notification", args))
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: StoppedPlayer())
+    monkeypatch.setattr(plugin.xbmcvfs, "exists", lambda path: path.endswith(".writer"))
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: calls.append("sync"))
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: calls.append("remove"))
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    assert "sync" not in calls
+    assert "remove" not in calls
+
+
 def test_successful_reset_invalidates_an_outgoing_playback_monitor(plugin, monkeypatch):
     class Dialog:
         def yesno(self, *args, **kwargs):

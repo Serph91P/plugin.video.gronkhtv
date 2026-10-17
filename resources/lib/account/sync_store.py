@@ -60,15 +60,21 @@ class SyncStore:
             # Additive migration for existing profiles.  Playback writers need
             # their own lease: holding the upload lease for an entire playback
             # would unnecessarily suppress normal progress uploads.
-            columns = {row["name"] for row in db.execute("PRAGMA table_info(control)")}
-            for name, definition in (
-                ("writer_account_id", "TEXT"),
-                ("writer_video_id", "TEXT"),
-                ("writer_fence", "INTEGER"),
-                ("writer_expires", "REAL"),
-            ):
-                if name not in columns:
-                    db.execute(f"ALTER TABLE control ADD COLUMN {name} {definition}")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(control)")}
+                for name, definition in (
+                    ("writer_account_id", "TEXT"),
+                    ("writer_video_id", "TEXT"),
+                    ("writer_fence", "INTEGER"),
+                    ("writer_expires", "REAL"),
+                ):
+                    if name not in columns:
+                        db.execute(f"ALTER TABLE control ADD COLUMN {name} {definition}")
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
 
     def activate(self, account_id, enabled):
         if not isinstance(account_id, str) or not account_id:
@@ -232,6 +238,7 @@ class SyncStore:
     def renew_playback_writer(self, account_id, epoch, video_id, lease, lease_seconds):
         if not lease or lease_seconds <= 0:
             return False
+        now = self._clock()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
@@ -241,13 +248,15 @@ class SyncStore:
                 and control["writer_account_id"] == account_id
                 and control["writer_video_id"] == video_id
                 and control["writer_fence"] == lease.get("fence")
+                and control["writer_expires"] is not None
+                and control["writer_expires"] > now
             )
             if not valid:
                 db.execute("ROLLBACK")
                 return False
             db.execute(
                 "UPDATE control SET writer_expires=? WHERE singleton=1",
-                (self._clock() + lease_seconds,),
+                (now + lease_seconds,),
             )
             db.execute("COMMIT")
             return True
@@ -281,8 +290,6 @@ class SyncStore:
                 or (
                     control["writer_account_id"] == account_id
                     and control["writer_video_id"] == video_id
-                    and control["writer_expires"] is not None
-                    and control["writer_expires"] > now
                 )
             ):
                 db.execute("ROLLBACK")
