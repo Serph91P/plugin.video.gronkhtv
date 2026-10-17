@@ -2,6 +2,8 @@ import multiprocessing
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "resources" / "lib"
 if str(LIB) not in sys.path:
@@ -13,6 +15,15 @@ from account.sync_store import ContextLostError, SyncStore
 def _claim(db_path, account_id, output):
     store = SyncStore(db_path)
     output.put(store.claim_upload(account_id, lease_seconds=30))
+
+
+def _progress_state(store, account_id, video_id):
+    with store._connection() as db:
+        row = db.execute(
+            "SELECT pending, confirmed_json, observed_json FROM progress WHERE account_id=? AND video_id=?",
+            (account_id, video_id),
+        ).fetchone()
+    return tuple(row)
 
 
 def test_account_epoch_and_pending_records_are_isolated_and_zero_is_a_real_value(tmp_path):
@@ -163,23 +174,26 @@ def test_successful_current_ack_leaves_a_following_local_record_pending_without_
     assert store.display_status() == "pending"
 
 
-def test_concurrent_observation_is_not_replaced_by_a_stale_successful_ack(tmp_path):
+@pytest.mark.parametrize("add_newer_local", [False, True], ids=["current-ack", "stale-ack"])
+def test_concurrent_observation_is_not_replaced_by_a_successful_ack(tmp_path, add_newer_local):
     store = SyncStore(tmp_path / "progress.sqlite3")
     epoch = store.activate("account-a", enabled=True)
     first = store.record_local("account-a", "video-a", 120.058, 500)
     observed_before_write = {"status": "valid", "offset": 0}
     store.observe_remote("account-a", epoch, "video-a", observed_before_write)
     lease = store.claim_upload("account-a", lease_seconds=30)
-    store.record_local("account-a", "video-a", 130.125, 500)
+    if add_newer_local:
+        store.record_local("account-a", "video-a", 130.125, 500)
     concurrent_remote = {"status": "valid", "offset": 77.5}
     store.observe_remote("account-a", epoch, "video-a", concurrent_remote)
 
-    assert not store.confirm_upload(
+    assert store.confirm_upload(
         "account-a", epoch, lease, "video-a", first["revision"],
         confirmed={"status": "valid", "offset": 120},
         observed_before_write=observed_before_write,
-    )
+    ) is not add_newer_local
     assert store.observed_remote("account-a", "video-a") == concurrent_remote
+    store.record_local("account-a", "video-a", 140.125, 500)
     assert store.display_status() == "conflict"
 
 
@@ -192,6 +206,15 @@ def test_expired_or_replaced_lease_cannot_confirm_or_replace_observation(tmp_pat
     store.observe_remote("account-a", epoch, "video-a", observed)
     expired_lease = store.claim_upload("account-a", lease_seconds=1)
     now[0] += 2
+    before_expired_confirmation = _progress_state(store, "account-a", "video-a")
+
+    assert not store.confirm_upload(
+        "account-a", epoch, expired_lease, "video-a", item["revision"],
+        confirmed={"status": "valid", "offset": 120},
+        observed_before_write=observed,
+    )
+    assert _progress_state(store, "account-a", "video-a") == before_expired_confirmation
+
     replacement_lease = store.claim_upload("account-a", lease_seconds=30)
 
     assert not store.confirm_upload(
@@ -199,6 +222,5 @@ def test_expired_or_replaced_lease_cannot_confirm_or_replace_observation(tmp_pat
         confirmed={"status": "valid", "offset": 120},
         observed_before_write=observed,
     )
-    assert store.observed_remote("account-a", "video-a") == observed
-    assert store.pending("account-a", "video-a")["revision"] == item["revision"]
+    assert _progress_state(store, "account-a", "video-a") == before_expired_confirmation
     assert replacement_lease is not None
