@@ -10,6 +10,7 @@ import math
 import threading
 from functools import lru_cache
 import time
+import uuid
 import xbmcvfs
 import os
 import inputstreamhelper
@@ -23,6 +24,7 @@ from context_menu import (
     chapter_label,
     details_label,
     favorite_label,
+    reset_label,
     restart_label,
     resume_label,
 )
@@ -906,6 +908,16 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         if not resume_record and ep in account_progress:
             resume_point = account_progress[ep]
         watched = is_watched(ep)
+        if resume_point > 0:
+            # This is deliberately an add-on-owned action. Kodi's native
+            # database reset cannot clear this add-on's local/account state.
+            cm.insert(
+                0,
+                (
+                    reset_label(),
+                    f"RunPlugin(plugin://plugin.video.gronkhtv/?action=reset_resume&episode={ep})",
+                ),
+            )
         if resume_point > 60:  # Nur anzeigen wenn mehr als 1 Minute geschaut
             cm.insert(
                 0,
@@ -1214,15 +1226,29 @@ def monitor_playback(
         xbmc.log("[Gronkh.tv] Playback did not start", xbmc.LOGWARNING)
         return
 
+    local_writer_path = _begin_resume_writer(_resume_writer_path(episode))
     latest = None
     previous_position = None
     next_save = time.monotonic() + 5
     next_account_sync = time.monotonic() + 15
-
+    writer_lease = None
+    writer_current = bool(local_writer_path) and not _has_resume_reset(
+        _resume_writer_path(episode)
+    )
+    begin_writer = getattr(progress_sync, "begin_playback_writer", None)
     try:
+        if writer_current and progress_sync is not None and video_id and callable(begin_writer):
+            writer_lease = begin_writer(video_id)
+            if writer_lease is None:
+                return
         while player.isPlayingVideo() and not monitor.abortRequested():
             if not _is_current_playback_generation(generation):
                 return
+            renew_writer = getattr(progress_sync, "renew_playback_writer", None)
+            if writer_lease is not None and callable(renew_writer):
+                writer_current = renew_writer(video_id, writer_lease)
+                if not writer_current:
+                    return
             try:
                 current_time = _non_negative_finite(player.getTime(), "player time")
                 total_time = _non_negative_finite(
@@ -1240,13 +1266,14 @@ def monitor_playback(
                 )
                 previous_position = current_time
                 now = time.monotonic()
-                if latest and now >= next_save:
+                if latest and writer_current and now >= next_save:
                     save_resume_point(
                         episode, latest["position"], latest["duration"]
                     )
                     next_save = now + 5
                 if (
                     latest
+                    and writer_current
                     and progress_sync is not None
                     and video_id
                     and (now >= next_account_sync or event != "tick")
@@ -1267,7 +1294,15 @@ def monitor_playback(
             if monitor.waitForAbort(1):
                 break
     finally:
-        if latest and _is_current_playback_generation(generation):
+        renew_writer = getattr(progress_sync, "renew_playback_writer", None)
+        if writer_lease is not None and callable(renew_writer):
+            writer_current = writer_current and renew_writer(video_id, writer_lease)
+        if (
+            latest
+            and writer_current
+            and _is_current_playback_generation(generation)
+            and not _has_resume_reset(_resume_writer_path(episode))
+        ):
             save_resume_point(episode, latest["position"], latest["duration"])
             if progress_sync is not None and video_id:
                 try:
@@ -1288,6 +1323,11 @@ def monitor_playback(
                 f"{latest['position']}/{latest['duration']}",
                 xbmc.LOGINFO,
             )
+        finish_writer = getattr(progress_sync, "finish_playback_writer", None)
+        if writer_lease is not None and callable(finish_writer):
+            finish_writer(video_id, writer_lease)
+        if local_writer_path:
+            _finish_resume_writer(local_writer_path)
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
     if (
@@ -1343,6 +1383,94 @@ def monitor_playback(
 def _resume_path(episode):
     episode = _positive_int(episode, "episode")
     return os.path.join(_RESUME_DIR, f"{episode}.txt")
+
+
+def _resume_writer_path(episode):
+    return _resume_path(episode) + ".writer"
+
+
+def _write_resume_guard(path):
+    """Persist one VFS guard and return its path only after a confirmed write."""
+    created = False
+    persisted = False
+    try:
+        if not xbmcvfs.mkdirs(_RESUME_DIR):
+            return None
+        with xbmcvfs.File(path, "w") as handle:
+            created = True
+            if not handle.write("writing"):
+                return None
+        persisted = True
+        return path
+    except Exception:
+        return None
+    finally:
+        if created and not persisted:
+            _finish_resume_writer(path)
+
+
+def _begin_resume_writer(path):
+    """Create one ownership marker for this monitor invocation.
+
+    Multiple Kodi plugin modules can monitor one stream concurrently. A shared
+    boolean marker lets one completed monitor clear another monitor's
+    protection, so every invocation owns a distinct sibling marker.
+    """
+    return _write_resume_guard(f"{path}.{uuid.uuid4().hex}")
+
+
+def _begin_resume_reset(path):
+    """Fence new private writers while a confirmed reset is in progress."""
+    return _write_resume_guard(
+        f"{path.removesuffix('.writer')}.reset.{uuid.uuid4().hex}"
+    )
+
+
+def _finish_resume_writer(path):
+    try:
+        if xbmcvfs.exists(path):
+            return xbmcvfs.delete(path)
+    except Exception:
+        return False
+    return True
+
+
+def _has_resume_writers(path):
+    """Return whether any durable monitor guard still owns this stream."""
+    try:
+        directory, basename = os.path.dirname(path), os.path.basename(path)
+        try:
+            _directories, files = xbmcvfs.listdir(directory)
+        except Exception:
+            files = os.listdir(directory)
+        # Recognize the former single marker during an add-on upgrade. Read the
+        # directory before the legacy exists check so reset/registration races
+        # always cross the same observable VFS boundary.
+        return xbmcvfs.exists(path) or basename in files or any(
+            name.startswith(basename + ".") and not name.startswith(basename + ".reset.")
+            for name in files
+        )
+    except FileNotFoundError:
+        return False
+    except Exception:
+        # A failed inspection cannot prove that outgoing private writers ended.
+        return True
+
+
+def _has_resume_reset(path):
+    """A reset guard makes a monitor discard an old sample before commit."""
+    try:
+        directory, basename = os.path.dirname(path), os.path.basename(path)
+        try:
+            _directories, files = xbmcvfs.listdir(directory)
+        except Exception:
+            files = os.listdir(directory)
+        reset_basename = basename.removesuffix(".writer") + ".reset."
+        return any(name.startswith(reset_basename) for name in files)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
 
 
 def _watched_path(episode):
@@ -1483,6 +1611,7 @@ def router(paramstring):
         "play": handle_play,
         "play_resume": handle_play_resume,
         "play_from_start": handle_play_from_start,
+        "reset_resume": handle_reset_resume,
         "jump_to_chapter": jump_to_chapter,
         "add_favorite": handle_add_favorite,
         "remove_favorite": handle_remove_favorite,
@@ -1762,6 +1891,85 @@ def handle_play_from_start(params):
     _play_direct(url)
     progress_sync, video_id = _playback_sync_context(episode)
     _monitor_episode(episode, progress_sync, video_id)
+
+
+def handle_reset_resume(params):
+    """Confirm and reset one stream locally and in the signed-in account.
+
+    This add-on action never starts playback. The private record is only
+    removed after the account coordinator confirms a zero offset.
+    """
+    episode = _positive_int(params.get("episode"), "episode")
+    if not xbmcgui.Dialog().yesno(
+        _plugin,
+        "Fortschritt für diesen Stream lokal und im Konto zurücksetzen?",
+    ):
+        return False
+    writer_path = _resume_writer_path(episode)
+    if xbmc.Player().isPlayingVideo():
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
+    reset_guard = _begin_resume_reset(writer_path)
+    if not reset_guard:
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Fortschritt kann derzeit nicht sicher zurückgesetzt werden",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
+    try:
+        if _has_resume_writers(writer_path):
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        progress_sync = _account_progress_sync()
+        if progress_sync is None:
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Anmeldung und Fortschrittssynchronisierung erforderlich",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        info = get_video_info(episode)
+        video_id = info.get("id") if isinstance(info, dict) else None
+        if not video_id:
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Stream-ID für Kontofortschritt nicht verfügbar",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        if progress_sync.reset(video_id) != "synchronized":
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Fortschritt konnte nicht vollständig zurückgesetzt werden",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        # A monitor that sampled before native playback stopped must not write its
+        # final positive position after this confirmed reset.
+        _begin_playback_generation()
+        if not remove_record(xbmcvfs, _resume_path(episode)):
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Kontofortschritt zurückgesetzt, lokales Löschen fehlgeschlagen",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        clear_watched(episode)
+        xbmcgui.Dialog().notification(
+            _plugin, "Fortschritt zurückgesetzt", xbmcgui.NOTIFICATION_INFO
+        )
+        return True
+    finally:
+        _finish_resume_writer(reset_guard)
 
 
 def seconds_to_time(s):

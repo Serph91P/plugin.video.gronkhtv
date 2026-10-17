@@ -86,6 +86,9 @@ def plugin(monkeypatch, tmp_path):
     xbmcvfs = types.ModuleType("xbmcvfs")
     xbmcvfs.translatePath = lambda path: str(tmp_path / path.rsplit("/", 1)[-1])
     xbmcvfs.exists = lambda path: False
+    xbmcvfs.mkdirs = lambda path: Path(path).mkdir(parents=True, exist_ok=True) or True
+    xbmcvfs.File = lambda path, mode="r": open(path, mode, encoding="utf-8")
+    xbmcvfs.delete = lambda path: Path(path).unlink() or True
 
     inputstreamhelper = types.ModuleType("inputstreamhelper")
     inputstreamhelper.Helper = object
@@ -1172,19 +1175,23 @@ def test_context_menu_preserves_resume_chapter_action_order_and_urls(
             "RunPlugin(plugin://plugin.video.gronkhtv/?action=play_from_start&episode=1105)",
         ),
         (
+            "Fortschritt zurücksetzen",
+            "RunPlugin(plugin://plugin.video.gronkhtv/?action=reset_resume&episode=1105)",
+        ),
+        (
             "Game (0:01:30)",
             "RunPlugin(plugin://plugin.video.gronkhtv/?action=jump_to_chapter&episode=1105&offset=90)",
         ),
         (
             "Zu Favoriten hinzufügen",
-            items[0].context_menu[3][1],
+            items[0].context_menu[4][1],
         ),
         (
             "Stream-Details anzeigen",
             "RunPlugin(plugin://plugin.video.gronkhtv/?action=show_details&episode=1105)",
         ),
     ]
-    assert "action=add_favorite&episode=1105&video_data=" in items[0].context_menu[3][1]
+    assert "action=add_favorite&episode=1105&video_data=" in items[0].context_menu[4][1]
 
 
 def test_listing_marks_persisted_watched_episode_without_a_resume_point(plugin, monkeypatch):
@@ -2169,3 +2176,161 @@ def test_save_resume_point_reports_failed_completed_cleanup(plugin, monkeypatch)
     monkeypatch.setattr(plugin, "remove_record", lambda vfs, path: False)
 
     assert plugin.save_resume_point(1105, 285, 300) is False
+
+
+def test_listing_offers_addon_owned_reset_for_a_short_private_resume(plugin, monkeypatch):
+    items = []
+    video = {"episode": 1105, "title": "Episode", "video_length": 300, "tags": []}
+    monkeypatch.setattr(plugin.xbmcgui, "ListItem", RecordingListItem)
+    monkeypatch.setattr(plugin, "get_videos", lambda *args, **kwargs: ([video], ""))
+    monkeypatch.setattr(plugin, "get_chapters", lambda episode: [])
+    monkeypatch.setattr(
+        plugin, "get_resume_record", lambda *args, **kwargs: {"position": 2, "duration": 300}
+    )
+    monkeypatch.setattr(plugin, "is_watched", lambda episode: False, raising=False)
+    monkeypatch.setattr(plugin, "is_favorite", lambda episode: False)
+    monkeypatch.setattr(
+        plugin.xbmcplugin,
+        "addDirectoryItem",
+        lambda handle, url, list_item, is_folder: items.append(list_item),
+        raising=False,
+    )
+    for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+
+    plugin.list_videos("category")
+
+    assert ("Fortschritt zurücksetzen", "RunPlugin(plugin://plugin.video.gronkhtv/?action=reset_resume&episode=1105)") in items[0].context_menu
+
+
+def test_confirmed_reset_removes_only_local_resume_after_account_zero_succeeds(plugin, monkeypatch):
+    removed = []
+    played = []
+    notifications = []
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            notifications.append(args)
+
+    class Sync:
+        def reset(self, video_id):
+            assert video_id == "00000000-0000-4000-8000-000000000001"
+            return "synchronized"
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: StoppedPlayer())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: Sync())
+    monkeypatch.setattr(
+        plugin, "get_video_info", lambda episode: {"id": "00000000-0000-4000-8000-000000000001"}
+    )
+    monkeypatch.setattr(plugin, "remove_record", lambda vfs, path: removed.append(path) or True)
+    monkeypatch.setattr(plugin, "clear_watched", lambda episode: True)
+    monkeypatch.setattr(plugin, "_play_direct", lambda *args: played.append(args))
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is True
+    assert removed == [plugin._resume_path(1105)]
+    assert played == []
+    assert notifications
+
+
+def test_cancelled_reset_has_no_effects(plugin, monkeypatch):
+    calls = []
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return False
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: calls.append("sync"))
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: calls.append("remove"))
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    assert calls == []
+
+
+def test_reset_defers_without_side_effects_while_selected_video_is_playing(plugin, monkeypatch):
+    calls = []
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            calls.append(("notification", args))
+
+    class ActivePlayer:
+        def isPlayingVideo(self):
+            return True
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: ActivePlayer())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: calls.append("sync"))
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: calls.append("remove"))
+    monkeypatch.setattr(plugin, "get_video_info", lambda episode: calls.append("info"))
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    assert "sync" not in calls
+    assert "remove" not in calls
+    assert "info" not in calls
+
+
+def test_reset_defers_while_an_outgoing_local_only_monitor_owns_the_resume_file(
+    plugin, monkeypatch
+):
+    calls = []
+
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            calls.append(("notification", args))
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: StoppedPlayer())
+    monkeypatch.setattr(plugin.xbmcvfs, "exists", lambda path: path.endswith(".writer"))
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: calls.append("sync"))
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: calls.append("remove"))
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is False
+    assert "sync" not in calls
+    assert "remove" not in calls
+
+
+def test_successful_reset_invalidates_an_outgoing_playback_monitor(plugin, monkeypatch):
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            pass
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    class Sync:
+        def reset(self, video_id):
+            return "synchronized"
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: StoppedPlayer())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: Sync())
+    monkeypatch.setattr(plugin, "get_video_info", lambda episode: {"id": "backend-video"})
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: True)
+    monkeypatch.setattr(plugin, "clear_watched", lambda episode: True)
+    monkeypatch.setattr(plugin, "_PLAYBACK_GENERATION", 7)
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is True
+    assert plugin._PLAYBACK_GENERATION == 8

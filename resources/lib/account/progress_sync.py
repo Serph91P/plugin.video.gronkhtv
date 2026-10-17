@@ -29,6 +29,8 @@ class ProgressSync:
         # must not even read account A progress after a logout/account switch.
         if not self._store.is_active_context(self._account_id, self._epoch):
             return {"state": "pending", "offset": None}
+        snapshot_before_read = self._store.pending(self._account_id, video_id)
+        read_fence = self._store.read_fence()
         try:
             remote = self._api.read(video_id)
         except AuthenticationError:
@@ -39,10 +41,16 @@ class ProgressSync:
         # invalidated.  Keep its durable local snapshot pending instead.
         if not self._store.is_active_context(self._account_id, self._epoch):
             return {"state": "pending", "offset": None}
+        if snapshot_before_read is not None:
+            current = self._store.pending(self._account_id, video_id)
+            if current is None or current["revision"] != snapshot_before_read["revision"]:
+                return {"state": "pending", "offset": None}
         if remote.status == "absent":
             try:
-                self._store.observe_remote(self._account_id, self._epoch, video_id, {"status": "absent"})
+                accepted = self._store.observe_remote(self._account_id, self._epoch, video_id, {"status": "absent", "_read_fence": read_fence})
             except ContextLostError:
+                return {"state": "pending", "offset": None}
+            if not accepted:
                 return {"state": "pending", "offset": None}
             return {"state": "absent", "offset": None}
         if remote.status != "valid":
@@ -52,12 +60,15 @@ class ProgressSync:
             "offset": remote.offset,
             "updated_at": remote.updated_at,
             "marked_as_watched": remote.marked_as_watched,
+            "_read_fence": read_fence,
         }
         snapshot = self._store.pending(self._account_id, video_id)
         preflight = {"state": "valid", "offset": remote.offset}
         try:
-            self._store.observe_remote(self._account_id, self._epoch, video_id, observed)
+            accepted = self._store.observe_remote(self._account_id, self._epoch, video_id, observed)
         except ContextLostError:
+            return {"state": "pending", "offset": None}
+        if not accepted:
             return {"state": "pending", "offset": None}
         if snapshot is not None and _remote_changed_since_confirmed(snapshot, preflight):
             return {
@@ -71,6 +82,68 @@ class ProgressSync:
         # Event is retained at the boundary to make callers explicit; the store
         # coalesces by account/video and accepts legitimate reverse seeks and 0.
         return self._store.record_local(self._account_id, video_id, offset, duration)
+
+    def begin_playback_writer(self, video_id):
+        """Reserve a short cross-invoker lease while a monitor can commit."""
+        return self._store.claim_playback_writer(
+            self._account_id, self._epoch, video_id, self._lease_seconds
+        )
+
+    def renew_playback_writer(self, video_id, lease):
+        return self._store.renew_playback_writer(
+            self._account_id, self._epoch, video_id, lease, self._lease_seconds
+        )
+
+    def finish_playback_writer(self, video_id, lease):
+        return self._store.release_playback_writer(self._account_id, video_id, lease)
+
+    def reset(self, video_id):
+        """Synchronously publish an explicit selected-video reset to the account.
+
+        Unlike regular samples, an explicit reset intentionally writes zero and
+        bypasses the conflict preflight.  It still shares the account epoch,
+        lease and revision fencing with every background uploader.  A busy
+        lease leaves the zero intent pending instead of racing a second POST.
+        """
+        try:
+            snapshot = self._store.record_reset_if_idle(
+                self._account_id, self._epoch, video_id
+            )
+        except Exception:
+            return "pending"
+        if snapshot is None:
+            return "pending"
+        lease = self._store.claim_upload(
+            self._account_id, self._lease_seconds, video_id, snapshot["revision"]
+        )
+        if lease is None or lease["epoch"] != self._epoch:
+            return "pending"
+        if not self._store.is_active_context(self._account_id, self._epoch):
+            return "pending"
+        observed_before_write = self._store.observed_remote(self._account_id, video_id)
+        try:
+            self._write_bounded(video_id, 0, lease, snapshot["revision"])
+        except _ContextLostError:
+            return "pending"
+        except AuthenticationError:
+            return "authentication_required"
+        except ValidationError:
+            return "invalid"
+        except RateLimitError:
+            return "rate_limited"
+        except Exception:
+            return "pending"
+        if self._store.confirm_upload(
+            self._account_id,
+            self._epoch,
+            lease,
+            video_id,
+            snapshot["revision"],
+            confirmed={"offset": 0},
+            observed_before_write=observed_before_write,
+        ):
+            return "synchronized"
+        return "pending"
 
     def resolve_conflict(self, video_id, choice):
         """Apply a foreground user's conflict choice without a network call."""
@@ -101,8 +174,14 @@ class ProgressSync:
             return "conflict"
         if _remote_changed_since_confirmed(snapshot, preflight):
             return "conflict"
+        if not self._store.is_current_revision(
+            self._account_id, self._epoch, video_id, snapshot["revision"]
+        ):
+            return "pending"
         observed_before_write = self._store.observed_remote(self._account_id, video_id)
-        lease = self._store.claim_upload(self._account_id, self._lease_seconds)
+        lease = self._store.claim_upload(
+            self._account_id, self._lease_seconds, video_id, snapshot["revision"]
+        )
         if lease is None or lease["epoch"] != self._epoch:
             return "pending"
         # An epoch change between lease acquisition and request dispatch fences
@@ -111,7 +190,7 @@ class ProgressSync:
             return "pending"
         sent_offset = wire_offset(snapshot["offset"])
         try:
-            self._write_bounded(video_id, sent_offset)
+            self._write_bounded(video_id, sent_offset, lease, snapshot["revision"])
         except _ContextLostError:
             return "pending"
         except AuthenticationError:
@@ -134,12 +213,14 @@ class ProgressSync:
             return "synchronized"
         return "pending"
 
-    def _write_bounded(self, video_id, offset):
+    def _write_bounded(self, video_id, offset, lease, revision):
         """Retry only transient session failures; never sleep or loop in Kodi UI."""
         attempts = max(1, self._max_write_attempts)
         last_error = None
         for _ in range(attempts):
-            if not self._store.is_active_context(self._account_id, self._epoch):
+            if not self._store.owns_upload(
+                self._account_id, self._epoch, lease, video_id, revision
+            ):
                 raise _ContextLostError()
             try:
                 return self._api.write(video_id, offset)
