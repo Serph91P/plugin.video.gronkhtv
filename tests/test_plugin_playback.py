@@ -369,7 +369,7 @@ def test_opening_settings_reconciles_valid_session_before_rendering(plugin, monk
 
 @pytest.mark.parametrize(
     ("cookie_exists", "session_present", "status"),
-    [(False, "false", "30209"), (True, "true", "30210")],
+    [(False, "false", "30209"), (True, "true", "30227")],
 )
 def test_account_indicator_is_initialized_from_persisted_session(
     plugin, monkeypatch, cookie_exists, session_present, status
@@ -391,6 +391,36 @@ def test_account_indicator_is_initialized_from_persisted_session(
     ]
 
 
+@pytest.mark.parametrize(
+    ("language", "expected_status"),
+    [
+        ("en_us", "Saved session, sign-in not verified"),
+        ("en_gb", "Saved session, sign-in not verified"),
+        ("de_de", "Gespeicherte Sitzung, Anmeldung nicht bestätigt"),
+    ],
+)
+def test_persisted_session_status_is_neutral_in_tracked_translations(
+    plugin, monkeypatch, language, expected_status
+):
+    """Startup must not claim a saved, unchecked cookie has expired."""
+    strings = (
+        ROOT / "resources" / "language" / f"resource.language.{language}" / "strings.po"
+    ).read_text(encoding="utf-8")
+
+    def localized_string(string_id):
+        entry = strings.split(f'msgctxt "#{string_id}"', maxsplit=1)[1]
+        return entry.split("msgstr ", maxsplit=1)[1].splitlines()[0].strip('"')
+
+    settings = {"account_status": "Signed in: stale"}
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(plugin._addon, "getLocalizedString", localized_string)
+    monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
+
+    plugin._sync_account_indicator_from_storage()
+
+    assert settings["account_status"] == expected_status
+
+
 def test_persisted_cookie_clears_stale_positive_account_status_on_startup(plugin, monkeypatch):
     """A saved cookie is not proof that the displayed sign-in is still valid."""
     settings = {
@@ -407,7 +437,7 @@ def test_persisted_cookie_clears_stale_positive_account_status_on_startup(plugin
     assert settings == {
         "account_session_present": "true",
         "account_logged_in": "false",
-        "account_status": "30210",
+        "account_status": "30227",
     }
 
 

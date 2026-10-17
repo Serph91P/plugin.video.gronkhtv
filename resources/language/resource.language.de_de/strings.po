@@ -139,3 +139,7 @@ msgstr "Kodi-Fortschritt behalten"
 msgctxt "#30226"
 msgid "Use account progress"
 msgstr "Konto-Fortschritt verwenden"
+
+msgctxt "#30227"
+msgid "Saved session, sign-in not verified"
+msgstr "Gespeicherte Sitzung, Anmeldung nicht bestätigt"

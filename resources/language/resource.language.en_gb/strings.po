@@ -139,3 +139,7 @@ msgstr "Keep Kodi progress"
 msgctxt "#30226"
 msgid "Use account progress"
 msgstr "Use account progress"
+
+msgctxt "#30227"
+msgid "Saved session, sign-in not verified"
+msgstr "Saved session, sign-in not verified"

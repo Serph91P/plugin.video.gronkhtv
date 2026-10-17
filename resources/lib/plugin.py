@@ -91,7 +91,7 @@ def _sync_account_indicator_from_storage():
     # the backend still accepts the session.
     _addon.setSetting("account_logged_in", "false")
     _addon.setSetting(
-        "account_status", _addon.getLocalizedString(30210 if session_present else 30209)
+        "account_status", _addon.getLocalizedString(30227 if session_present else 30209)
     )
 
 
