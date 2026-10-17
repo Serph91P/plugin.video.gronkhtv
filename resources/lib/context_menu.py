@@ -11,6 +11,11 @@ def restart_label():
     return "Von Anfang starten"
 
 
+def reset_label():
+    """Label for the add-on's own account-and-local resume reset."""
+    return "Fortschritt zurücksetzen"
+
+
 def favorite_label(is_favorite):
     if is_favorite:
         return "Aus Favoriten entfernen"

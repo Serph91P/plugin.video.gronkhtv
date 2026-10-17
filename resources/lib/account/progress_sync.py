@@ -72,6 +72,48 @@ class ProgressSync:
         # coalesces by account/video and accepts legitimate reverse seeks and 0.
         return self._store.record_local(self._account_id, video_id, offset, duration)
 
+    def reset(self, video_id):
+        """Synchronously publish an explicit selected-video reset to the account.
+
+        Unlike regular samples, an explicit reset intentionally writes zero and
+        bypasses the conflict preflight.  It still shares the account epoch,
+        lease and revision fencing with every background uploader.  A busy
+        lease leaves the zero intent pending instead of racing a second POST.
+        """
+        try:
+            snapshot = self._store.record_local(self._account_id, video_id, 0, 0)
+        except Exception:
+            return "pending"
+        lease = self._store.claim_upload(self._account_id, self._lease_seconds)
+        if lease is None or lease["epoch"] != self._epoch:
+            return "pending"
+        if not self._store.is_active_context(self._account_id, self._epoch):
+            return "pending"
+        observed_before_write = self._store.observed_remote(self._account_id, video_id)
+        try:
+            self._write_bounded(video_id, 0)
+        except _ContextLostError:
+            return "pending"
+        except AuthenticationError:
+            return "authentication_required"
+        except ValidationError:
+            return "invalid"
+        except RateLimitError:
+            return "rate_limited"
+        except Exception:
+            return "pending"
+        if self._store.confirm_upload(
+            self._account_id,
+            self._epoch,
+            lease,
+            video_id,
+            snapshot["revision"],
+            confirmed={"offset": 0},
+            observed_before_write=observed_before_write,
+        ):
+            return "synchronized"
+        return "pending"
+
     def resolve_conflict(self, video_id, choice):
         """Apply a foreground user's conflict choice without a network call."""
         if choice == "kodi":

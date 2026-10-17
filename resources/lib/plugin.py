@@ -23,6 +23,7 @@ from context_menu import (
     chapter_label,
     details_label,
     favorite_label,
+    reset_label,
     restart_label,
     resume_label,
 )
@@ -906,6 +907,16 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         if not resume_record and ep in account_progress:
             resume_point = account_progress[ep]
         watched = is_watched(ep)
+        if resume_point > 0:
+            # This is deliberately an add-on-owned action. Kodi's native
+            # database reset cannot clear this add-on's local/account state.
+            cm.insert(
+                0,
+                (
+                    reset_label(),
+                    f"RunPlugin(plugin://plugin.video.gronkhtv/?action=reset_resume&episode={ep})",
+                ),
+            )
         if resume_point > 60:  # Nur anzeigen wenn mehr als 1 Minute geschaut
             cm.insert(
                 0,
@@ -1483,6 +1494,7 @@ def router(paramstring):
         "play": handle_play,
         "play_resume": handle_play_resume,
         "play_from_start": handle_play_from_start,
+        "reset_resume": handle_reset_resume,
         "jump_to_chapter": jump_to_chapter,
         "add_favorite": handle_add_favorite,
         "remove_favorite": handle_remove_favorite,
@@ -1762,6 +1774,56 @@ def handle_play_from_start(params):
     _play_direct(url)
     progress_sync, video_id = _playback_sync_context(episode)
     _monitor_episode(episode, progress_sync, video_id)
+
+
+def handle_reset_resume(params):
+    """Confirm and reset one stream locally and in the signed-in account.
+
+    This add-on action never starts playback. The private record is only
+    removed after the account coordinator confirms a zero offset.
+    """
+    episode = _positive_int(params.get("episode"), "episode")
+    if not xbmcgui.Dialog().yesno(
+        _plugin,
+        "Fortschritt für diesen Stream lokal und im Konto zurücksetzen?",
+    ):
+        return False
+    progress_sync = _account_progress_sync()
+    if progress_sync is None:
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Anmeldung und Fortschrittssynchronisierung erforderlich",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
+    info = get_video_info(episode)
+    video_id = info.get("id") if isinstance(info, dict) else None
+    if not video_id:
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Stream-ID für Kontofortschritt nicht verfügbar",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
+    if progress_sync.reset(video_id) != "synchronized":
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Fortschritt konnte nicht vollständig zurückgesetzt werden",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
+    if not remove_record(xbmcvfs, _resume_path(episode)):
+        xbmcgui.Dialog().notification(
+            _plugin,
+            "Kontofortschritt zurückgesetzt, lokales Löschen fehlgeschlagen",
+            xbmcgui.NOTIFICATION_WARNING,
+        )
+        return False
+    clear_watched(episode)
+    xbmcgui.Dialog().notification(
+        _plugin, "Fortschritt zurückgesetzt", xbmcgui.NOTIFICATION_INFO
+    )
+    return True
 
 
 def seconds_to_time(s):

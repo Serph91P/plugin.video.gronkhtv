@@ -305,3 +305,28 @@ def test_failed_read_does_not_replace_a_previously_observed_remote_value(tmp_pat
 
     assert sync.prepare_playback("video-a") == {"state": "unavailable", "offset": None}
     assert store.observed_remote("account-a", "video-a")["offset"] == 42
+
+
+def test_explicit_reset_replaces_pending_position_and_confirms_zero(tmp_path):
+    api = API()
+    sync, store = _sync(tmp_path, api)
+    sync.record_position("video-a", 2, 500, event="stop")
+
+    assert sync.reset("video-a") == "synchronized"
+    assert api.writes == [("video-a", 0)]
+    assert store.pending("account-a", "video-a") is None
+    assert store.observed_remote("account-a", "video-a") == {
+        "status": "valid",
+        "offset": 0,
+    }
+
+
+def test_explicit_reset_defers_zero_while_an_existing_upload_lease_is_active(tmp_path):
+    api = API()
+    sync, store = _sync(tmp_path, api)
+    sync.record_position("video-a", 2, 500, event="stop")
+    assert store.claim_upload("account-a", lease_seconds=30) is not None
+
+    assert sync.reset("video-a") == "pending"
+    assert api.writes == []
+    assert store.pending("account-a", "video-a")["offset"] == 0
