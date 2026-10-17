@@ -213,11 +213,10 @@ def test_router_reset_failure_reports_error_and_preserves_selected_retry_intent(
     assert any("nicht vollständig zurückgesetzt" in message for message, _icon in messages)
 
 
-@pytest.mark.parametrize("attempt", range(6))
-def test_parallel_openers_upgrade_legacy_profile_without_losing_pending_rows(tmp_path, attempt):
-    """Actual two-opener migration keeps the legacy profile usable for reset."""
-    database_path = tmp_path / "legacy-progress.sqlite3"
+def _legacy_wal_profile(database_path):
+    """Create the pre-writer-lease production schema in its normal WAL mode."""
     with sqlite3.connect(database_path) as database:
+        database.execute("PRAGMA journal_mode=WAL")
         database.executescript(
             """
             CREATE TABLE control (
@@ -239,18 +238,53 @@ def test_parallel_openers_upgrade_legacy_profile_without_losing_pending_rows(tmp
             """
         )
 
-    start = threading.Barrier(2)
 
-    def open_store():
-        start.wait(timeout=5)
-        return SyncStore(database_path)
+@pytest.mark.parametrize("attempt", range(6))
+def test_parallel_openers_upgrade_legacy_wal_profile_at_table_info_boundary(tmp_path, attempt):
+    """Two real migrations serialize after observing the old WAL profile schema."""
+    database_path = tmp_path / "legacy-progress.sqlite3"
+    _legacy_wal_profile(database_path)
+    table_info = threading.Barrier(2)
+
+    class Cursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __iter__(self):
+            rows = list(self._cursor)
+            try:
+                table_info.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+            return iter(rows)
+
+    class Connection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._connection.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def execute(self, sql, *args):
+            cursor = self._connection.execute(sql, *args)
+            return Cursor(cursor) if sql == "PRAGMA table_info(control)" else cursor
+
+    class ConcurrentStore(SyncStore):
+        def _connection(self):
+            return Connection(super()._connection())
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(open_store) for _ in range(2)]
-        results = [future.result(timeout=10) for future in futures]
+        stores = list(pool.map(lambda _index: ConcurrentStore(database_path), range(2)))
 
-    assert len(results) == 2
-    pending = results[0].pending("synthetic-account", "synthetic-video")
+    assert len(stores) == 2
+    pending = stores[0].pending("synthetic-account", "synthetic-video")
     assert {key: pending[key] for key in ("account_id", "video_id", "offset", "duration", "revision", "pending")} == {
         "account_id": "synthetic-account", "video_id": "synthetic-video",
         "offset": 2.0, "duration": 300.0, "revision": 1, "pending": 1,
