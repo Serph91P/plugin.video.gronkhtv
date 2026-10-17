@@ -1391,15 +1391,22 @@ def _resume_writer_path(episode):
 
 def _write_resume_guard(path):
     """Persist one VFS guard and return its path only after a confirmed write."""
+    created = False
+    persisted = False
     try:
         if not xbmcvfs.mkdirs(_RESUME_DIR):
             return None
         with xbmcvfs.File(path, "w") as handle:
+            created = True
             if not handle.write("writing"):
                 return None
+        persisted = True
         return path
     except Exception:
         return None
+    finally:
+        if created and not persisted:
+            _finish_resume_writer(path)
 
 
 def _begin_resume_writer(path):

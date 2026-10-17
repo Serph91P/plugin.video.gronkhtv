@@ -195,6 +195,34 @@ def test_reset_guard_is_not_mistaken_for_an_outgoing_writer(local_listing):
         plugin._finish_resume_writer(reset_guard)
 
 
+@pytest.mark.parametrize("position", [2, 75], ids=["two-seconds", "normal-position"])
+def test_confirmed_router_reset_publishes_zero_and_removes_private_resume(
+    local_listing, monkeypatch, position
+):
+    """The production router, ProgressClient and VFS agree on a reset to zero."""
+    plugin, remote, _settings = local_listing
+    resume_path = plugin._resume_path(1105)
+    plugin.write_record(plugin.xbmcvfs, str(Path(resume_path).parent), resume_path, position, 300)
+    playback = []
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    monkeypatch.setattr(plugin.xbmc, "Player", StoppedPlayer)
+    monkeypatch.setattr(plugin, "_play_direct", lambda *args: playback.append(args))
+
+    assert plugin.router("action=reset_resume&episode=1105") is None
+
+    assert remote["writes"] == [0]
+    assert remote["offset"] == 0
+    assert plugin.get_resume_record(1105, 300) is None
+    assert plugin._account_progress_sync().prepare_playback(VIDEO) == {
+        "state": "valid", "offset": 0
+    }
+    assert playback == []
+
+
 def test_refused_claim_releases_guard_and_allows_later_reset(local_listing, monkeypatch):
     plugin, remote, _settings = local_listing
     sync = plugin._account_progress_sync()
@@ -271,3 +299,41 @@ def test_finishing_one_monitor_keeps_another_monitors_guard(local_listing, monke
         thread.join(5)
     assert not errors
     assert remote["writes"] == []
+
+
+@pytest.mark.parametrize("begin_guard, suffix", [
+    ("_begin_resume_writer", ".writer."),
+    ("_begin_resume_reset", ".reset."),
+])
+def test_partial_guard_write_removes_its_own_empty_file(
+    local_listing, monkeypatch, begin_guard, suffix
+):
+    """A False VFS write after open must not leave a permanent owned guard."""
+    plugin, _remote, _settings = local_listing
+    writer_path = plugin._resume_writer_path(1105)
+    real_file = plugin.xbmcvfs.File
+
+    class PartialGuard:
+        def __init__(self, path):
+            self._file = real_file(path, "w")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._file.close()
+            return False
+
+        def write(self, _value):
+            return False
+
+    def partial_writer_file(path, mode="r"):
+        if mode == "w" and suffix in str(path):
+            return PartialGuard(path)
+        return real_file(path, mode)
+
+    monkeypatch.setattr(plugin.xbmcvfs, "File", partial_writer_file)
+
+    assert getattr(plugin, begin_guard)(writer_path) is None
+    parent = Path(writer_path).parent
+    assert not [path for path in parent.iterdir() if suffix in path.name]
