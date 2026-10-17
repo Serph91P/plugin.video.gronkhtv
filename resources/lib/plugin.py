@@ -10,6 +10,7 @@ import math
 import threading
 from functools import lru_cache
 import time
+import uuid
 import xbmcvfs
 import os
 import inputstreamhelper
@@ -1225,21 +1226,19 @@ def monitor_playback(
         xbmc.log("[Gronkh.tv] Playback did not start", xbmc.LOGWARNING)
         return
 
-    local_writer_path = _resume_writer_path(episode)
-    _begin_resume_writer(local_writer_path)
+    local_writer_path = _begin_resume_writer(_resume_writer_path(episode))
     latest = None
     previous_position = None
     next_save = time.monotonic() + 5
     next_account_sync = time.monotonic() + 15
     writer_lease = None
-    writer_current = True
+    writer_current = bool(local_writer_path)
     begin_writer = getattr(progress_sync, "begin_playback_writer", None)
-    if progress_sync is not None and video_id and callable(begin_writer):
-        writer_lease = begin_writer(video_id)
-        if writer_lease is None:
-            return
-
     try:
+        if writer_current and progress_sync is not None and video_id and callable(begin_writer):
+            writer_lease = begin_writer(video_id)
+            if writer_lease is None:
+                return
         while player.isPlayingVideo() and not monitor.abortRequested():
             if not _is_current_playback_generation(generation):
                 return
@@ -1265,13 +1264,14 @@ def monitor_playback(
                 )
                 previous_position = current_time
                 now = time.monotonic()
-                if latest and now >= next_save:
+                if latest and writer_current and now >= next_save:
                     save_resume_point(
                         episode, latest["position"], latest["duration"]
                     )
                     next_save = now + 5
                 if (
                     latest
+                    and writer_current
                     and progress_sync is not None
                     and video_id
                     and (now >= next_account_sync or event != "tick")
@@ -1319,7 +1319,8 @@ def monitor_playback(
         finish_writer = getattr(progress_sync, "finish_playback_writer", None)
         if writer_lease is not None and callable(finish_writer):
             finish_writer(video_id, writer_lease)
-        _finish_resume_writer(local_writer_path)
+        if local_writer_path:
+            _finish_resume_writer(local_writer_path)
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
     if (
@@ -1382,13 +1383,20 @@ def _resume_writer_path(episode):
 
 
 def _begin_resume_writer(path):
+    """Create one ownership marker for this monitor invocation.
+
+    Multiple Kodi plugin modules can monitor one stream concurrently. A shared
+    boolean marker lets one completed monitor clear another monitor's
+    protection, so every invocation owns a distinct sibling marker.
+    """
+    marker = f"{path}.{uuid.uuid4().hex}"
     try:
         xbmcvfs.mkdirs(_RESUME_DIR)
-        with xbmcvfs.File(path, "w") as handle:
+        with xbmcvfs.File(marker, "w") as handle:
             handle.write("writing")
-        return True
+        return marker
     except Exception:
-        return False
+        return None
 
 
 def _finish_resume_writer(path):
@@ -1398,6 +1406,25 @@ def _finish_resume_writer(path):
     except Exception:
         return False
     return True
+
+
+def _has_resume_writers(path):
+    """Return whether any durable monitor guard still owns this stream."""
+    try:
+        if xbmcvfs.exists(path):
+            # Recognize the former single marker during an add-on upgrade.
+            return True
+        directory, basename = os.path.dirname(path), os.path.basename(path)
+        try:
+            _directories, files = xbmcvfs.listdir(directory)
+        except Exception:
+            files = os.listdir(directory)
+        return any(name.startswith(basename + ".") for name in files)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        # A failed inspection cannot prove that outgoing private writers ended.
+        return True
 
 
 def _watched_path(episode):
@@ -1832,7 +1859,7 @@ def handle_reset_resume(params):
         "Fortschritt für diesen Stream lokal und im Konto zurücksetzen?",
     ):
         return False
-    if xbmc.Player().isPlayingVideo() or xbmcvfs.exists(_resume_writer_path(episode)):
+    if xbmc.Player().isPlayingVideo() or _has_resume_writers(_resume_writer_path(episode)):
         xbmcgui.Dialog().notification(
             _plugin,
             "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",

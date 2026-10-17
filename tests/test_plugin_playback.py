@@ -86,6 +86,9 @@ def plugin(monkeypatch, tmp_path):
     xbmcvfs = types.ModuleType("xbmcvfs")
     xbmcvfs.translatePath = lambda path: str(tmp_path / path.rsplit("/", 1)[-1])
     xbmcvfs.exists = lambda path: False
+    xbmcvfs.mkdirs = lambda path: Path(path).mkdir(parents=True, exist_ok=True) or True
+    xbmcvfs.File = lambda path, mode="r": open(path, mode, encoding="utf-8")
+    xbmcvfs.delete = lambda path: Path(path).unlink() or True
 
     inputstreamhelper = types.ModuleType("inputstreamhelper")
     inputstreamhelper.Helper = object
