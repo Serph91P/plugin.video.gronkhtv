@@ -90,9 +90,13 @@ def _sync_account_indicator_from_storage():
     # A persisted cookie makes account controls available, but is not proof that
     # the backend still accepts the session.
     _addon.setSetting("account_logged_in", "false")
+    _addon.setSetting(
+        "account_status", _addon.getLocalizedString(30227 if session_present else 30209)
+    )
 
 
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
+_account_session_validated = False
 configure_account_session(
     _account_session if os.path.exists(_ACCOUNT_COOKIE_FILE) else None
 )
@@ -291,10 +295,10 @@ def _set_account_status(status):
 
 
 def _account_progress_sync():
-    """Return a private queue bound to the persisted, stable account context.
+    """Return a private queue bound to a freshly validated stable account context.
 
-    It does not issue HTTP itself.  The playback monitor only writes local
-    snapshots; the bounded POST is started after playback has stopped.
+    The playback monitor only writes local snapshots; the bounded POST is
+    started after playback has stopped.
     """
     if not _setting_enabled("sync_watch_progress") or not os.path.exists(_ACCOUNT_COOKIE_FILE):
         return None
@@ -302,11 +306,18 @@ def _account_progress_sync():
         store = SyncStore(_PROGRESS_SYNC_FILE)
         context = store.context()
         account_id = context["active_account_id"]
-        if not account_id or not context["sync_enabled"]:
-            _read_account_user(expected_sync_epoch=context["epoch"], timeout=2.25)
+        if not _account_session_validated or not account_id or not context["sync_enabled"]:
+            user = _read_account_user(expected_sync_epoch=context["epoch"], timeout=2.25)
+            if user is None:
+                return None
             context = store.context()
             account_id = context["active_account_id"]
-            if not account_id or not context["sync_enabled"]:
+            if (
+                not _setting_enabled("sync_watch_progress")
+                or not account_id
+                or not context["sync_enabled"]
+                or account_id != _account_id(user)
+            ):
                 return None
         # A sync job must retain the cookies it was created with.  The global
         # session is reused by interactive login/logout and may later represent
@@ -718,7 +729,9 @@ def list_live_streams():
 
 
 def _read_account_user(expected_sync_epoch=None, timeout=None):
+    global _account_session_validated
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        _account_session_validated = False
         _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
@@ -734,10 +747,17 @@ def _read_account_user(expected_sync_epoch=None, timeout=None):
             if timeout is not None
             else _account_session.current_user()
         )
+        if _account_id(user) is None:
+            _account_session_validated = False
+            _addon.setSetting("account_session_present", "true")
+            _addon.setSetting("account_logged_in", "false")
+            _set_account_status(_addon.getLocalizedString(30210))
+            return None
     except (AuthenticationError, SessionError):
         # Keep persisted credentials available for an explicit retry or Logout.
         # Rendering/opening account controls must never destroy session data.
         configure_account_session(None)
+        _account_session_validated = False
         _deactivate_account_progress_sync()
         _addon.setSetting("account_session_present", "true")
         _addon.setSetting("account_logged_in", "false")
@@ -745,6 +765,7 @@ def _read_account_user(expected_sync_epoch=None, timeout=None):
         return None
 
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        _account_session_validated = False
         return None
     account_id = _account_id(user)
     if account_id is not None and expected_sync_epoch is not None:
@@ -760,6 +781,7 @@ def _read_account_user(expected_sync_epoch=None, timeout=None):
     _addon.setSetting("account_session_present", "true")
     _addon.setSetting("account_logged_in", "true")
     _set_account_status(status)
+    _account_session_validated = True
     return user
 
 
