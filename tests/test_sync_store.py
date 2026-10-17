@@ -124,3 +124,81 @@ def test_reconcile_cannot_reactivate_after_a_concurrent_logout(tmp_path):
         "epoch": logout_epoch,
         "sync_enabled": 0,
     }
+
+
+def test_stale_successful_ack_advances_its_unchanged_observation_without_clearing_pending(tmp_path):
+    store = SyncStore(tmp_path / "progress.sqlite3")
+    epoch = store.activate("account-a", enabled=True)
+    first = store.record_local("account-a", "video-a", 120.058, 500)
+    observed_before_write = {"status": "valid", "offset": 0}
+    store.observe_remote("account-a", epoch, "video-a", observed_before_write)
+    lease = store.claim_upload("account-a", lease_seconds=30)
+    second = store.record_local("account-a", "video-a", 130.125, 500)
+
+    assert not store.confirm_upload(
+        "account-a", epoch, lease, "video-a", first["revision"],
+        confirmed={"status": "valid", "offset": 120},
+        observed_before_write=observed_before_write,
+    )
+    assert store.pending("account-a", "video-a")["revision"] == second["revision"]
+    assert store.observed_remote("account-a", "video-a") == {"status": "valid", "offset": 120}
+    assert store.display_status() == "pending"
+
+
+def test_successful_current_ack_leaves_a_following_local_record_pending_without_conflict(tmp_path):
+    store = SyncStore(tmp_path / "progress.sqlite3")
+    epoch = store.activate("account-a", enabled=True)
+    item = store.record_local("account-a", "video-a", 120.058, 500)
+    observed_before_write = {"status": "valid", "offset": 0}
+    store.observe_remote("account-a", epoch, "video-a", observed_before_write)
+    lease = store.claim_upload("account-a", lease_seconds=30)
+
+    assert store.confirm_upload(
+        "account-a", epoch, lease, "video-a", item["revision"],
+        confirmed={"status": "valid", "offset": 120},
+        observed_before_write=observed_before_write,
+    )
+    store.record_local("account-a", "video-a", 130.125, 500)
+
+    assert store.display_status() == "pending"
+
+
+def test_concurrent_observation_is_not_replaced_by_a_stale_successful_ack(tmp_path):
+    store = SyncStore(tmp_path / "progress.sqlite3")
+    epoch = store.activate("account-a", enabled=True)
+    first = store.record_local("account-a", "video-a", 120.058, 500)
+    observed_before_write = {"status": "valid", "offset": 0}
+    store.observe_remote("account-a", epoch, "video-a", observed_before_write)
+    lease = store.claim_upload("account-a", lease_seconds=30)
+    store.record_local("account-a", "video-a", 130.125, 500)
+    concurrent_remote = {"status": "valid", "offset": 77.5}
+    store.observe_remote("account-a", epoch, "video-a", concurrent_remote)
+
+    assert not store.confirm_upload(
+        "account-a", epoch, lease, "video-a", first["revision"],
+        confirmed={"status": "valid", "offset": 120},
+        observed_before_write=observed_before_write,
+    )
+    assert store.observed_remote("account-a", "video-a") == concurrent_remote
+    assert store.display_status() == "conflict"
+
+
+def test_expired_or_replaced_lease_cannot_confirm_or_replace_observation(tmp_path):
+    now = [100]
+    store = SyncStore(tmp_path / "progress.sqlite3", clock=lambda: now[0])
+    epoch = store.activate("account-a", enabled=True)
+    item = store.record_local("account-a", "video-a", 120.058, 500)
+    observed = {"status": "valid", "offset": 0}
+    store.observe_remote("account-a", epoch, "video-a", observed)
+    expired_lease = store.claim_upload("account-a", lease_seconds=1)
+    now[0] += 2
+    replacement_lease = store.claim_upload("account-a", lease_seconds=30)
+
+    assert not store.confirm_upload(
+        "account-a", epoch, expired_lease, "video-a", item["revision"],
+        confirmed={"status": "valid", "offset": 120},
+        observed_before_write=observed,
+    )
+    assert store.observed_remote("account-a", "video-a") == observed
+    assert store.pending("account-a", "video-a")["revision"] == item["revision"]
+    assert replacement_lease is not None

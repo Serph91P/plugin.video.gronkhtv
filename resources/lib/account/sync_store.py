@@ -309,31 +309,40 @@ class SyncStore:
             if not valid or not row:
                 db.execute("ROLLBACK")
                 return False
+            observed_json = json.dumps(observed_before_write, sort_keys=True) if observed_before_write is not None else None
+            current = db.execute(
+                "SELECT observed_json FROM progress WHERE account_id=? AND video_id=?",
+                (account_id, video_id),
+            ).fetchone()["observed_json"]
+            update_observed = current == observed_json
+            confirmed_json = json.dumps(confirmed) if confirmed is not None else None
+            observed_after_write = (
+                json.dumps({"status": "valid", "offset": confirmed["offset"]}, sort_keys=True)
+                if confirmed is not None else None
+            )
             if row["revision"] == revision:
-                observed_json = json.dumps(observed_before_write, sort_keys=True) if observed_before_write is not None else None
-                current = db.execute(
-                    "SELECT observed_json FROM progress WHERE account_id=? AND video_id=?",
-                    (account_id, video_id),
-                ).fetchone()["observed_json"]
-                update_observed = current == observed_json
                 db.execute(
                     """UPDATE progress SET pending=0, confirmed_json=?,
                        observed_json=CASE WHEN ? THEN ? ELSE observed_json END
                        WHERE account_id=? AND video_id=?""",
                     (
-                        json.dumps(confirmed) if confirmed is not None else None,
+                        confirmed_json,
                         update_observed,
-                        json.dumps({"status": "valid", "offset": confirmed["offset"]}, sort_keys=True) if confirmed is not None else None,
+                        observed_after_write,
                         account_id,
                         video_id,
                     ),
                 )
             else:
                 # The POST succeeded for an older snapshot. Preserve the newer
-                # pending position but retain its real server confirmation.
+                # pending position but retain its real server confirmation. Only
+                # advance the observation if nothing observed the server since
+                # this POST's preflight.
                 db.execute(
-                    "UPDATE progress SET confirmed_json=? WHERE account_id=? AND video_id=?",
-                    (json.dumps(confirmed) if confirmed is not None else None, account_id, video_id),
+                    """UPDATE progress SET confirmed_json=?,
+                       observed_json=CASE WHEN ? THEN ? ELSE observed_json END
+                       WHERE account_id=? AND video_id=?""",
+                    (confirmed_json, update_observed, observed_after_write, account_id, video_id),
                 )
             db.execute(
                 """UPDATE control SET lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL
