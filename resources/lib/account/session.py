@@ -106,8 +106,13 @@ class GronkhTVSession:
         user = self.request_json("/users/self", timeout=timeout, phase="current_user")
         if isinstance(user, dict) and "data" in user:
             user = user["data"]
-        if isinstance(user, dict) and user:
-            return user
+        if isinstance(user, dict):
+            for identity_key in ("id", "login", "usertag", "email"):
+                identifier = user.get(identity_key)
+                if isinstance(identifier, int) and not isinstance(identifier, bool):
+                    return user
+                if isinstance(identifier, str) and identifier.strip():
+                    return user
         raise SessionError("GronkhTV session could not be verified", phase="current_user")
 
     def request_json(self, path, method="GET", payload=None, timeout=None, phase=None):

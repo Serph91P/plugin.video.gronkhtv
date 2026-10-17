@@ -368,10 +368,11 @@ def test_opening_settings_reconciles_valid_session_before_rendering(plugin, monk
 
 
 @pytest.mark.parametrize(
-    ("cookie_exists", "session_present"), [(False, "false"), (True, "true")]
+    ("cookie_exists", "session_present", "status"),
+    [(False, "false", "30209"), (True, "true", "30210")],
 )
 def test_account_indicator_is_initialized_from_persisted_session(
-    plugin, monkeypatch, cookie_exists, session_present
+    plugin, monkeypatch, cookie_exists, session_present, status
 ):
     calls = []
     monkeypatch.setattr(plugin.os.path, "exists", lambda path: cookie_exists)
@@ -386,7 +387,28 @@ def test_account_indicator_is_initialized_from_persisted_session(
     assert calls == [
         ("account_session_present", session_present),
         ("account_logged_in", "false"),
+        ("account_status", status),
     ]
+
+
+def test_persisted_cookie_clears_stale_positive_account_status_on_startup(plugin, monkeypatch):
+    """A saved cookie is not proof that the displayed sign-in is still valid."""
+    settings = {
+        "account_logged_in": "true",
+        "account_status": "30211: stale",
+    }
+
+    monkeypatch.setattr(plugin.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(plugin._addon, "getSetting", settings.get)
+    monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
+
+    plugin._sync_account_indicator_from_storage()
+
+    assert settings == {
+        "account_session_present": "true",
+        "account_logged_in": "false",
+        "account_status": "30210",
+    }
 
 
 def test_login_reuses_already_authenticated_session_without_prompting(plugin, monkeypatch):
@@ -1307,6 +1329,43 @@ def test_validated_session_with_invalid_flat_id_does_not_restore_context(
     assert SyncStore(progress_path).context() == initial
 
 
+@pytest.mark.parametrize(
+    "user",
+    [
+        {"message": "not authenticated"},
+        {"id": None},
+        {"id": True},
+    ],
+)
+def test_invalid_session_identity_cannot_reuse_an_active_progress_context(
+    plugin, monkeypatch, tmp_path, user
+):
+    """A malformed success response cannot authorize a persisted account."""
+    from account.sync_store import SyncStore
+
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("synthetic-session", encoding="utf-8")
+    SyncStore(progress_path).activate("account-a", enabled=True)
+    settings = {"sync_watch_progress": "true"}
+
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(
+        plugin,
+        "_account_session",
+        types.SimpleNamespace(current_user=lambda timeout=None: user),
+    )
+    monkeypatch.setattr(plugin._addon, "getSetting", settings.get)
+    monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
+    monkeypatch.setattr(plugin, "configure_account_session", lambda session: None)
+
+    assert plugin._account_progress_sync() is None
+    assert settings["account_logged_in"] == "false"
+    assert settings["account_status"] == "30210"
+    assert SyncStore(progress_path).context()["active_account_id"] == "account-a"
+
+
 def test_stale_active_progress_context_requires_a_fresh_session_validation(
     plugin, monkeypatch, tmp_path
 ):
@@ -1367,6 +1426,37 @@ def test_context_recovery_never_validates_a_session_when_sync_or_cookie_gate_is_
         "getSetting",
         lambda key: "true" if key == "sync_watch_progress" and sync_enabled else "false",
     )
+
+    assert plugin._account_progress_sync() is None
+
+
+@pytest.mark.parametrize("race", ["account_switch", "opt_out"])
+def test_progress_acquisition_rejects_state_changed_during_fresh_validation(
+    plugin, monkeypatch, tmp_path, race
+):
+    """A stale validation response cannot authorize a newer context or opt-out."""
+    from account.sync_store import SyncStore
+
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("synthetic-session", encoding="utf-8")
+    store = SyncStore(progress_path)
+    store.activate("account-a", enabled=True)
+    settings = {"sync_watch_progress": "true"}
+
+    class Session:
+        def current_user(self, timeout=None):
+            if race == "account_switch":
+                store.activate("account-b", enabled=True)
+            else:
+                settings["sync_watch_progress"] = "false"
+            return {"id": "account-a"}
+
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(plugin, "_account_session", Session())
+    monkeypatch.setattr(plugin._addon, "getSetting", settings.get)
+    monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
 
     assert plugin._account_progress_sync() is None
 

@@ -275,7 +275,18 @@ def test_auth_diagnostics_use_actual_2fa_and_current_user_callsites(tmp_path):
     assert current_user.value.auth_diagnostic() == "phase=current_user status=401"
 
 
-@pytest.mark.parametrize("payload", [b"{}", b"[]", b'{"data": {}}', b'{"data": []}'])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        b"[]",
+        b'{"data": {}}',
+        b'{"data": []}',
+        b'{"message": "not authenticated"}',
+        b'{"data": {"id": null}}',
+        b'{"data": {"id": true}}',
+    ],
+)
 def test_current_user_rejects_empty_or_malformed_success_payloads(tmp_path, payload):
     session, _, _ = _session(tmp_path, [FakeResponse(200, payload)])
 
