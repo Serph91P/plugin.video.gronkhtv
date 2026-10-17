@@ -1232,7 +1232,9 @@ def monitor_playback(
     next_save = time.monotonic() + 5
     next_account_sync = time.monotonic() + 15
     writer_lease = None
-    writer_current = bool(local_writer_path)
+    writer_current = bool(local_writer_path) and not _has_resume_reset(
+        _resume_writer_path(episode)
+    )
     begin_writer = getattr(progress_sync, "begin_playback_writer", None)
     try:
         if writer_current and progress_sync is not None and video_id and callable(begin_writer):
@@ -1295,7 +1297,12 @@ def monitor_playback(
         renew_writer = getattr(progress_sync, "renew_playback_writer", None)
         if writer_lease is not None and callable(renew_writer):
             writer_current = writer_current and renew_writer(video_id, writer_lease)
-        if latest and writer_current and _is_current_playback_generation(generation):
+        if (
+            latest
+            and writer_current
+            and _is_current_playback_generation(generation)
+            and not _has_resume_reset(_resume_writer_path(episode))
+        ):
             save_resume_point(episode, latest["position"], latest["duration"])
             if progress_sync is not None and video_id:
                 try:
@@ -1382,6 +1389,19 @@ def _resume_writer_path(episode):
     return _resume_path(episode) + ".writer"
 
 
+def _write_resume_guard(path):
+    """Persist one VFS guard and return its path only after a confirmed write."""
+    try:
+        if not xbmcvfs.mkdirs(_RESUME_DIR):
+            return None
+        with xbmcvfs.File(path, "w") as handle:
+            if not handle.write("writing"):
+                return None
+        return path
+    except Exception:
+        return None
+
+
 def _begin_resume_writer(path):
     """Create one ownership marker for this monitor invocation.
 
@@ -1389,14 +1409,14 @@ def _begin_resume_writer(path):
     boolean marker lets one completed monitor clear another monitor's
     protection, so every invocation owns a distinct sibling marker.
     """
-    marker = f"{path}.{uuid.uuid4().hex}"
-    try:
-        xbmcvfs.mkdirs(_RESUME_DIR)
-        with xbmcvfs.File(marker, "w") as handle:
-            handle.write("writing")
-        return marker
-    except Exception:
-        return None
+    return _write_resume_guard(f"{path}.{uuid.uuid4().hex}")
+
+
+def _begin_resume_reset(path):
+    """Fence new private writers while a confirmed reset is in progress."""
+    return _write_resume_guard(
+        f"{path.removesuffix('.writer')}.reset.{uuid.uuid4().hex}"
+    )
 
 
 def _finish_resume_writer(path):
@@ -1411,19 +1431,38 @@ def _finish_resume_writer(path):
 def _has_resume_writers(path):
     """Return whether any durable monitor guard still owns this stream."""
     try:
-        if xbmcvfs.exists(path):
-            # Recognize the former single marker during an add-on upgrade.
-            return True
         directory, basename = os.path.dirname(path), os.path.basename(path)
         try:
             _directories, files = xbmcvfs.listdir(directory)
         except Exception:
             files = os.listdir(directory)
-        return any(name.startswith(basename + ".") for name in files)
+        # Recognize the former single marker during an add-on upgrade. Read the
+        # directory before the legacy exists check so reset/registration races
+        # always cross the same observable VFS boundary.
+        return xbmcvfs.exists(path) or basename in files or any(
+            name.startswith(basename + ".") and not name.startswith(basename + ".reset.")
+            for name in files
+        )
     except FileNotFoundError:
         return False
     except Exception:
         # A failed inspection cannot prove that outgoing private writers ended.
+        return True
+
+
+def _has_resume_reset(path):
+    """A reset guard makes a monitor discard an old sample before commit."""
+    try:
+        directory, basename = os.path.dirname(path), os.path.basename(path)
+        try:
+            _directories, files = xbmcvfs.listdir(directory)
+        except Exception:
+            files = os.listdir(directory)
+        reset_basename = basename.removesuffix(".writer") + ".reset."
+        return any(name.startswith(reset_basename) for name in files)
+    except FileNotFoundError:
+        return False
+    except Exception:
         return True
 
 
@@ -1859,52 +1898,71 @@ def handle_reset_resume(params):
         "Fortschritt für diesen Stream lokal und im Konto zurücksetzen?",
     ):
         return False
-    if xbmc.Player().isPlayingVideo() or _has_resume_writers(_resume_writer_path(episode)):
+    writer_path = _resume_writer_path(episode)
+    if xbmc.Player().isPlayingVideo():
         xbmcgui.Dialog().notification(
             _plugin,
             "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",
             xbmcgui.NOTIFICATION_WARNING,
         )
         return False
-    progress_sync = _account_progress_sync()
-    if progress_sync is None:
+    reset_guard = _begin_resume_reset(writer_path)
+    if not reset_guard:
         xbmcgui.Dialog().notification(
             _plugin,
-            "Anmeldung und Fortschrittssynchronisierung erforderlich",
+            "Fortschritt kann derzeit nicht sicher zurückgesetzt werden",
             xbmcgui.NOTIFICATION_WARNING,
         )
         return False
-    info = get_video_info(episode)
-    video_id = info.get("id") if isinstance(info, dict) else None
-    if not video_id:
+    try:
+        if _has_resume_writers(writer_path):
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Fortschritt kann während der Wiedergabe nicht zurückgesetzt werden",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        progress_sync = _account_progress_sync()
+        if progress_sync is None:
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Anmeldung und Fortschrittssynchronisierung erforderlich",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        info = get_video_info(episode)
+        video_id = info.get("id") if isinstance(info, dict) else None
+        if not video_id:
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Stream-ID für Kontofortschritt nicht verfügbar",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        if progress_sync.reset(video_id) != "synchronized":
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Fortschritt konnte nicht vollständig zurückgesetzt werden",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        # A monitor that sampled before native playback stopped must not write its
+        # final positive position after this confirmed reset.
+        _begin_playback_generation()
+        if not remove_record(xbmcvfs, _resume_path(episode)):
+            xbmcgui.Dialog().notification(
+                _plugin,
+                "Kontofortschritt zurückgesetzt, lokales Löschen fehlgeschlagen",
+                xbmcgui.NOTIFICATION_WARNING,
+            )
+            return False
+        clear_watched(episode)
         xbmcgui.Dialog().notification(
-            _plugin,
-            "Stream-ID für Kontofortschritt nicht verfügbar",
-            xbmcgui.NOTIFICATION_WARNING,
+            _plugin, "Fortschritt zurückgesetzt", xbmcgui.NOTIFICATION_INFO
         )
-        return False
-    if progress_sync.reset(video_id) != "synchronized":
-        xbmcgui.Dialog().notification(
-            _plugin,
-            "Fortschritt konnte nicht vollständig zurückgesetzt werden",
-            xbmcgui.NOTIFICATION_WARNING,
-        )
-        return False
-    # A monitor that sampled before native playback stopped must not write its
-    # final positive position after this confirmed reset.
-    _begin_playback_generation()
-    if not remove_record(xbmcvfs, _resume_path(episode)):
-        xbmcgui.Dialog().notification(
-            _plugin,
-            "Kontofortschritt zurückgesetzt, lokales Löschen fehlgeschlagen",
-            xbmcgui.NOTIFICATION_WARNING,
-        )
-        return False
-    clear_watched(episode)
-    xbmcgui.Dialog().notification(
-        _plugin, "Fortschritt zurückgesetzt", xbmcgui.NOTIFICATION_INFO
-    )
-    return True
+        return True
+    finally:
+        _finish_resume_writer(reset_guard)
 
 
 def seconds_to_time(s):

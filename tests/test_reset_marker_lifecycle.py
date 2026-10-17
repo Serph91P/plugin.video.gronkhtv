@@ -137,6 +137,64 @@ def test_failed_guard_creation_prevents_outgoing_monitor_from_restoring_reset(lo
     assert record is None or record["position"] == 0, (record, remote)
 
 
+def test_false_guard_write_prevents_outgoing_monitor_from_restoring_reset(local_listing, monkeypatch):
+    """Kodi VFS can report a failed write without raising an exception."""
+    plugin, remote, settings = local_listing
+    reset = separate_invoker(plugin, monkeypatch, "reset_after_false_guard_write")
+    state = {"playing": True}
+    real_file = plugin.xbmcvfs.File
+
+    class FailedGuard:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def write(self, _value): return False
+
+    def false_writer_file(path, mode="r"):
+        if ".writer" in str(path) and mode == "w":
+            return FailedGuard()
+        return real_file(path, mode)
+
+    class Player:
+        def isPlayingVideo(self): return state["playing"]
+        def isPlaying(self): return state["playing"]
+        def getTime(self): return 2
+        def getTotalTime(self): return 300
+        def getPlaySpeed(self): return 1
+        def play(self, *args, **kwargs): pytest.fail("unexpected playback control")
+        def stop(self, *args, **kwargs): pytest.fail("unexpected playback control")
+        def seekTime(self, *args, **kwargs): pytest.fail("unexpected playback control")
+
+    class Monitor:
+        def abortRequested(self): return False
+        def waitForAbort(self, timeout):
+            state["playing"] = False
+            settings["sync_watch_progress"] = "true"
+            assert reset.handle_reset_resume({"episode": "1105"}) is True
+            return True
+
+    settings["sync_watch_progress"] = "false"
+    monkeypatch.setattr(plugin.xbmcvfs, "File", false_writer_file)
+    monkeypatch.setattr(plugin.xbmc, "Player", Player)
+    monkeypatch.setattr(plugin.xbmc, "Monitor", Monitor)
+    plugin.monitor_playback(1105, progress_sync=None, video_id=VIDEO)
+
+    record = plugin.get_resume_record(1105, 300)
+    assert record is None or record["position"] == 0, (record, remote)
+
+
+def test_reset_guard_is_not_mistaken_for_an_outgoing_writer(local_listing):
+    plugin, _remote, _settings = local_listing
+    writer_path = plugin._resume_writer_path(1105)
+
+    reset_guard = plugin._begin_resume_reset(writer_path)
+
+    try:
+        assert reset_guard
+        assert plugin._has_resume_writers(writer_path) is False
+    finally:
+        plugin._finish_resume_writer(reset_guard)
+
+
 def test_refused_claim_releases_guard_and_allows_later_reset(local_listing, monkeypatch):
     plugin, remote, _settings = local_listing
     sync = plugin._account_progress_sync()
