@@ -147,7 +147,9 @@ class SyncStore:
                 return "conflict"
         return "pending" if rows else "synchronized"
 
-    def record_local(self, account_id, video_id, offset, duration=0, epoch=None):
+    def record_local(
+        self, account_id, video_id, offset, duration=0, epoch=None, invalidate_reads=False
+    ):
         _non_negative(offset, "offset")
         _non_negative(duration, "duration")
         with self._connection() as db:
@@ -170,6 +172,8 @@ class SyncStore:
                      revision=excluded.revision, pending=1""",
                 (account_id, video_id, offset, duration, revision),
             )
+            if invalidate_reads:
+                db.execute("UPDATE control SET fence=fence+1 WHERE singleton=1")
             db.execute("COMMIT")
             return {"account_id": account_id, "video_id": video_id, "offset": offset, "duration": duration, "revision": revision}
 
@@ -194,13 +198,20 @@ class SyncStore:
                 and row["revision"] == revision
             )
 
+    def read_fence(self):
+        """Return the durable reset fence captured before a remote read."""
+        with self._connection() as db:
+            return db.execute("SELECT fence FROM control WHERE singleton=1").fetchone()["fence"]
+
     def observe_remote(self, account_id, epoch, video_id, remote):
         """Persist only a successful remote read; failures must not look absent."""
         if not isinstance(remote, dict) or remote.get("status") not in {"valid", "absent"}:
             raise ValueError("only successful remote observations are persistable")
+        expected_fence = remote.get("_read_fence")
+        persisted_remote = {key: value for key, value in remote.items() if key != "_read_fence"}
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            control = db.execute("SELECT active_account_id, epoch, sync_enabled FROM control WHERE singleton=1").fetchone()
+            control = db.execute("SELECT active_account_id, epoch, sync_enabled, fence FROM control WHERE singleton=1").fetchone()
             if (
                 control["active_account_id"] != account_id
                 or control["epoch"] != epoch
@@ -208,19 +219,23 @@ class SyncStore:
             ):
                 db.execute("ROLLBACK")
                 raise ContextLostError("account is not the active sync context")
+            if expected_fence is not None and control["fence"] != expected_fence:
+                db.execute("ROLLBACK")
+                return False
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
             if row is None:
                 db.execute(
                     """INSERT INTO progress(account_id, video_id, offset, duration, revision, pending, observed_json)
                        VALUES (?, ?, 0, 0, 0, 0, ?)""",
-                    (account_id, video_id, json.dumps(remote, sort_keys=True)),
+                    (account_id, video_id, json.dumps(persisted_remote, sort_keys=True)),
                 )
             else:
                 db.execute(
                     "UPDATE progress SET observed_json=? WHERE account_id=? AND video_id=?",
-                    (json.dumps(remote, sort_keys=True), account_id, video_id),
+                    (json.dumps(persisted_remote, sort_keys=True), account_id, video_id),
                 )
             db.execute("COMMIT")
+            return True
 
     def observed_remote(self, account_id, video_id):
         with self._connection() as db:
@@ -318,6 +333,28 @@ class SyncStore:
             db.execute("UPDATE control SET fence=?, lease_account_id=?, lease_fence=?, lease_expires=? WHERE singleton=1", (fence, account_id, fence, now + lease_seconds))
             db.execute("COMMIT")
             return {"account_id": account_id, "epoch": control["epoch"], "fence": fence}
+
+    def owns_upload(self, account_id, epoch, lease, video_id, revision):
+        """Fence retries after a reset or a newer lease replaces this job."""
+        if not lease:
+            return False
+        with self._connection() as db:
+            control = db.execute("SELECT * FROM control WHERE singleton=1").fetchone()
+            row = db.execute(
+                "SELECT revision FROM progress WHERE account_id=? AND video_id=?",
+                (account_id, video_id),
+            ).fetchone()
+            return bool(
+                row is not None
+                and row["revision"] == revision
+                and control["active_account_id"] == account_id
+                and control["epoch"] == epoch
+                and control["sync_enabled"]
+                and control["lease_account_id"] == account_id
+                and control["lease_fence"] == lease.get("fence")
+                and control["lease_expires"] is not None
+                and control["lease_expires"] > self._clock()
+            )
 
     def confirm_upload(self, account_id, epoch, lease, video_id, revision, confirmed=None, observed_before_write=None):
         if not lease:

@@ -30,6 +30,7 @@ class ProgressSync:
         if not self._store.is_active_context(self._account_id, self._epoch):
             return {"state": "pending", "offset": None}
         snapshot_before_read = self._store.pending(self._account_id, video_id)
+        read_fence = self._store.read_fence()
         try:
             remote = self._api.read(video_id)
         except AuthenticationError:
@@ -46,8 +47,10 @@ class ProgressSync:
                 return {"state": "pending", "offset": None}
         if remote.status == "absent":
             try:
-                self._store.observe_remote(self._account_id, self._epoch, video_id, {"status": "absent"})
+                accepted = self._store.observe_remote(self._account_id, self._epoch, video_id, {"status": "absent", "_read_fence": read_fence})
             except ContextLostError:
+                return {"state": "pending", "offset": None}
+            if not accepted:
                 return {"state": "pending", "offset": None}
             return {"state": "absent", "offset": None}
         if remote.status != "valid":
@@ -57,12 +60,15 @@ class ProgressSync:
             "offset": remote.offset,
             "updated_at": remote.updated_at,
             "marked_as_watched": remote.marked_as_watched,
+            "_read_fence": read_fence,
         }
         snapshot = self._store.pending(self._account_id, video_id)
         preflight = {"state": "valid", "offset": remote.offset}
         try:
-            self._store.observe_remote(self._account_id, self._epoch, video_id, observed)
+            accepted = self._store.observe_remote(self._account_id, self._epoch, video_id, observed)
         except ContextLostError:
+            return {"state": "pending", "offset": None}
+        if not accepted:
             return {"state": "pending", "offset": None}
         if snapshot is not None and _remote_changed_since_confirmed(snapshot, preflight):
             return {
@@ -87,7 +93,7 @@ class ProgressSync:
         """
         try:
             snapshot = self._store.record_local(
-                self._account_id, video_id, 0, 0, epoch=self._epoch
+                self._account_id, video_id, 0, 0, epoch=self._epoch, invalidate_reads=True
             )
         except Exception:
             return "pending"
@@ -100,7 +106,7 @@ class ProgressSync:
             return "pending"
         observed_before_write = self._store.observed_remote(self._account_id, video_id)
         try:
-            self._write_bounded(video_id, 0)
+            self._write_bounded(video_id, 0, lease, snapshot["revision"])
         except _ContextLostError:
             return "pending"
         except AuthenticationError:
@@ -168,7 +174,7 @@ class ProgressSync:
             return "pending"
         sent_offset = wire_offset(snapshot["offset"])
         try:
-            self._write_bounded(video_id, sent_offset)
+            self._write_bounded(video_id, sent_offset, lease, snapshot["revision"])
         except _ContextLostError:
             return "pending"
         except AuthenticationError:
@@ -191,12 +197,14 @@ class ProgressSync:
             return "synchronized"
         return "pending"
 
-    def _write_bounded(self, video_id, offset):
+    def _write_bounded(self, video_id, offset, lease, revision):
         """Retry only transient session failures; never sleep or loop in Kodi UI."""
         attempts = max(1, self._max_write_attempts)
         last_error = None
         for _ in range(attempts):
-            if not self._store.is_active_context(self._account_id, self._epoch):
+            if not self._store.owns_upload(
+                self._account_id, self._epoch, lease, video_id, revision
+            ):
                 raise _ContextLostError()
             try:
                 return self._api.write(video_id, offset)

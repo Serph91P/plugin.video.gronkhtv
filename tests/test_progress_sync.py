@@ -11,7 +11,7 @@ if str(LIB) not in sys.path:
 
 from account.progress import RemoteProgress
 from account.progress_sync import ProgressSync
-from account.session import AuthenticationError
+from account.session import AuthenticationError, SessionError
 from account.sync_store import SyncStore
 
 
@@ -382,3 +382,57 @@ def test_reset_discards_a_positive_response_from_a_read_started_before_zero(tmp_
     assert sync.prepare_playback("video-a") != {"state": "valid", "offset": 2}
     assert api.writes == [("video-a", 0)]
     assert store.observed_remote("account-a", "video-a")["offset"] == 0
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_reset_fences_a_positive_read_even_without_a_pending_snapshot(tmp_path, confirmed):
+    store = SyncStore(tmp_path / "sync.sqlite3")
+    epoch = store.activate("account-a", enabled=True)
+
+    class ResetDuringReadAPI(API):
+        offset = 2
+
+        def read(self, video_id):
+            captured = self.offset
+            assert sync.reset(video_id) == "synchronized"
+            return RemoteProgress(status="valid", offset=captured)
+
+        def write(self, video_id, offset):
+            self.offset = offset
+            self.writes.append((video_id, offset))
+
+    api = ResetDuringReadAPI()
+    sync = ProgressSync(store, api, "account-a", epoch)
+    if confirmed:
+        assert sync.reset("video-a") == "synchronized"
+        api.offset = 2
+        api.writes.clear()
+
+    assert store.pending("account-a", "video-a") is None
+    assert sync.prepare_playback("video-a") != {"state": "valid", "offset": 2}
+    assert api.writes == [("video-a", 0)]
+    assert store.observed_remote("account-a", "video-a")["offset"] == 0
+
+
+def test_reset_fences_a_retry_after_its_lease_expires(tmp_path):
+    now = [0.0]
+    store = SyncStore(tmp_path / "sync.sqlite3", clock=lambda: now[0])
+    epoch = store.activate("account-a", enabled=True)
+
+    class ResetDuringRetryAPI(API):
+        interrupted = False
+
+        def write(self, video_id, offset):
+            if offset == 2 and not self.interrupted:
+                self.interrupted = True
+                now[0] = 6.0
+                assert sync.reset(video_id) == "synchronized"
+                raise SessionError("synthetic transient failure")
+            self.writes.append((video_id, offset))
+
+    api = ResetDuringRetryAPI()
+    sync = ProgressSync(store, api, "account-a", epoch)
+    sync.record_position("video-a", 2, 300, event="stop")
+
+    assert sync.flush("video-a") == "pending"
+    assert api.writes == [("video-a", 0)]

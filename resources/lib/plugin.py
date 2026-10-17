@@ -1819,6 +1819,9 @@ def handle_reset_resume(params):
             xbmcgui.NOTIFICATION_WARNING,
         )
         return False
+    # A monitor that sampled before native playback stopped must not write its
+    # final positive position after this confirmed reset.
+    _begin_playback_generation()
     if not remove_record(xbmcvfs, _resume_path(episode)):
         xbmcgui.Dialog().notification(
             _plugin,

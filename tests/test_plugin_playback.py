@@ -2276,3 +2276,31 @@ def test_reset_defers_without_side_effects_while_selected_video_is_playing(plugi
     assert "sync" not in calls
     assert "remove" not in calls
     assert "info" not in calls
+
+
+def test_successful_reset_invalidates_an_outgoing_playback_monitor(plugin, monkeypatch):
+    class Dialog:
+        def yesno(self, *args, **kwargs):
+            return True
+
+        def notification(self, *args):
+            pass
+
+    class StoppedPlayer:
+        def isPlayingVideo(self):
+            return False
+
+    class Sync:
+        def reset(self, video_id):
+            return "synchronized"
+
+    monkeypatch.setattr(plugin.xbmcgui, "Dialog", Dialog)
+    monkeypatch.setattr(plugin.xbmc, "Player", lambda: StoppedPlayer())
+    monkeypatch.setattr(plugin, "_account_progress_sync", lambda: Sync())
+    monkeypatch.setattr(plugin, "get_video_info", lambda episode: {"id": "backend-video"})
+    monkeypatch.setattr(plugin, "remove_record", lambda *args: True)
+    monkeypatch.setattr(plugin, "clear_watched", lambda episode: True)
+    monkeypatch.setattr(plugin, "_PLAYBACK_GENERATION", 7)
+
+    assert plugin.handle_reset_resume({"episode": "1105"}) is True
+    assert plugin._PLAYBACK_GENERATION == 8
