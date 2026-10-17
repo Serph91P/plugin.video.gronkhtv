@@ -105,8 +105,10 @@ class GronkhTVSession:
     def current_user(self, timeout=None):
         user = self.request_json("/users/self", timeout=timeout, phase="current_user")
         if isinstance(user, dict) and "data" in user:
-            return user["data"]
-        return user
+            user = user["data"]
+        if isinstance(user, dict) and user:
+            return user
+        raise SessionError("GronkhTV session could not be verified", phase="current_user")
 
     def request_json(self, path, method="GET", payload=None, timeout=None, phase=None):
         csrf = method.upper() not in ("GET", "HEAD") and bool(

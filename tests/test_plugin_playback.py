@@ -951,9 +951,14 @@ def test_account_progress_sync_uses_an_immutable_session_snapshot(plugin, monkey
     import uuid
 
     writes = []
+    session_reads = []
 
     class MutableSession:
         identity = "account-a"
+
+        def current_user(self, timeout=None):
+            session_reads.append(timeout)
+            return {"id": self.identity}
 
         def request_json(self, path, method="GET", payload=None, timeout=None):
             if method == "GET":
@@ -981,6 +986,7 @@ def test_account_progress_sync_uses_an_immutable_session_snapshot(plugin, monkey
     epoch = plugin.SyncStore(plugin._PROGRESS_SYNC_FILE).activate("account-a", True)
 
     sync = plugin._account_progress_sync()
+    assert session_reads == [2.25]
     video_id = str(uuid.uuid4())
     sync.record_position(video_id, 12, 300, event="pause")
     mutable.identity = "account-b"
@@ -1299,6 +1305,42 @@ def test_validated_session_with_invalid_flat_id_does_not_restore_context(
 
     assert plugin._account_progress_sync() is None
     assert SyncStore(progress_path).context() == initial
+
+
+def test_stale_active_progress_context_requires_a_fresh_session_validation(
+    plugin, monkeypatch, tmp_path
+):
+    """A persisted context alone must not authorize progress reads after startup."""
+    from account.sync_store import SyncStore
+
+    progress_path = tmp_path / "progress-sync.sqlite3"
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("synthetic-session", encoding="utf-8")
+    store = SyncStore(progress_path)
+    store.activate("account-1", enabled=True)
+    initial = store.context()
+    session_reads = []
+    settings = {"sync_watch_progress": "true", "account_status": "30211: stale"}
+
+    class UnverifiedSession:
+        def current_user(self, timeout=None):
+            session_reads.append(timeout)
+            raise plugin.SessionError("not verified")
+
+    monkeypatch.setattr(plugin, "_PROGRESS_SYNC_FILE", str(progress_path))
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(cookie_path))
+    monkeypatch.setattr(plugin, "_account_session", UnverifiedSession())
+    monkeypatch.setattr(plugin._addon, "getSetting", settings.get)
+    monkeypatch.setattr(plugin._addon, "setSetting", settings.__setitem__)
+    monkeypatch.setattr(plugin, "configure_account_session", lambda session: None)
+
+    assert plugin._account_progress_sync() is None
+    assert session_reads == [2.25]
+    assert cookie_path.exists()
+    assert SyncStore(progress_path).context()["active_account_id"] is None
+    assert settings["account_logged_in"] == "false"
+    assert settings["account_status"] == "30210"
+    assert initial["epoch"] < SyncStore(progress_path).context()["epoch"]
 
 
 @pytest.mark.parametrize(
