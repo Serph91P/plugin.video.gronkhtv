@@ -291,7 +291,7 @@ class SyncStore:
             db.execute("COMMIT")
             return {"account_id": account_id, "epoch": control["epoch"], "fence": fence}
 
-    def confirm_upload(self, account_id, epoch, lease, video_id, revision, confirmed=None):
+    def confirm_upload(self, account_id, epoch, lease, video_id, revision, confirmed=None, observed_before_write=None):
         if not lease:
             return False
         with self._connection() as db:
@@ -302,22 +302,55 @@ class SyncStore:
                 and control["epoch"] == epoch
                 and control["lease_account_id"] == account_id
                 and control["lease_fence"] == lease.get("fence")
+                and control["lease_expires"] is not None
+                and control["lease_expires"] > self._clock()
             )
             row = db.execute("SELECT revision FROM progress WHERE account_id=? AND video_id=?", (account_id, video_id)).fetchone()
-            if not valid or not row or row["revision"] != revision:
+            if not valid or not row:
                 db.execute("ROLLBACK")
                 return False
-            db.execute(
-                """UPDATE progress SET pending=0, confirmed_json=? WHERE account_id=? AND video_id=?""",
-                (json.dumps(confirmed) if confirmed is not None else None, account_id, video_id),
+            observed_json = json.dumps(observed_before_write, sort_keys=True) if observed_before_write is not None else None
+            current = db.execute(
+                "SELECT observed_json FROM progress WHERE account_id=? AND video_id=?",
+                (account_id, video_id),
+            ).fetchone()["observed_json"]
+            update_observed = current == observed_json
+            confirmed_json = json.dumps(confirmed) if confirmed is not None else None
+            observed_after_write = (
+                json.dumps({"status": "valid", "offset": confirmed["offset"]}, sort_keys=True)
+                if confirmed is not None else None
             )
+            if row["revision"] == revision:
+                db.execute(
+                    """UPDATE progress SET pending=0, confirmed_json=?,
+                       observed_json=CASE WHEN ? THEN ? ELSE observed_json END
+                       WHERE account_id=? AND video_id=?""",
+                    (
+                        confirmed_json,
+                        update_observed,
+                        observed_after_write,
+                        account_id,
+                        video_id,
+                    ),
+                )
+            else:
+                # The POST succeeded for an older snapshot. Preserve the newer
+                # pending position but retain its real server confirmation. Only
+                # advance the observation if nothing observed the server since
+                # this POST's preflight.
+                db.execute(
+                    """UPDATE progress SET confirmed_json=?,
+                       observed_json=CASE WHEN ? THEN ? ELSE observed_json END
+                       WHERE account_id=? AND video_id=?""",
+                    (confirmed_json, update_observed, observed_after_write, account_id, video_id),
+                )
             db.execute(
                 """UPDATE control SET lease_account_id=NULL, lease_fence=NULL, lease_expires=NULL
                    WHERE singleton=1 AND lease_account_id=? AND lease_fence=?""",
                 (account_id, lease.get("fence")),
             )
             db.execute("COMMIT")
-            return True
+            return row["revision"] == revision
 
 
 def _non_negative(value, name):

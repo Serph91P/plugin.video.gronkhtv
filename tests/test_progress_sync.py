@@ -99,6 +99,47 @@ def test_choosing_kodi_progress_rebases_the_pending_snapshot_before_upload(tmp_p
     assert store.pending("account-a", "video-a") is None
 
 
+def test_keep_kodi_conflict_upload_confirms_integer_wire_offset_for_integer_echo(tmp_path):
+    class Session:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                {"data": {"watch_progress": {"offset": 100, "updated_at": "before"}}},
+                {"data": {}},
+                {"data": {"watch_progress": {"offset": 90, "updated_at": "external"}}},
+                {"data": {"watch_progress": {"offset": 90, "updated_at": "external"}}},
+                {"data": {}},
+                {"data": {"watch_progress": {"offset": 120, "updated_at": "echo"}}},
+                {"data": {}},
+            ]
+
+        def request_json(self, path, method="GET", payload=None, timeout=None):
+            self.calls.append((path, method, payload, timeout))
+            return self.responses.pop(0)
+
+    from account.progress import ProgressClient
+
+    video_id = "b0b3d510-1da2-4bcb-9d6c-9d13d23b38b1"
+    session = Session()
+    sync, store = _sync(tmp_path, ProgressClient(session))
+    sync.record_position(video_id, 120.058, 500, event="pause")
+    assert sync.flush(video_id) == "synchronized"
+
+    sync.record_position(video_id, 120.5, 500, event="pause")
+    assert sync.prepare_playback(video_id)["state"] == "conflict"
+    assert sync.resolve_conflict(video_id, "kodi") == 120.5
+    assert sync.flush(video_id) == "synchronized"
+
+    sync.record_position(video_id, 120.9, 500, event="pause")
+    assert sync.flush(video_id) == "synchronized"
+    assert store.pending("account-a", video_id) is None
+    assert [call[2] for call in session.calls if call[1] == "POST"] == [
+        {"offset": 120},
+        {"offset": 120},
+        {"offset": 120},
+    ]
+
+
 def test_failed_preflight_read_keeps_pending_and_does_not_write(tmp_path):
     api = API()
     sync, store = _sync(tmp_path, api)

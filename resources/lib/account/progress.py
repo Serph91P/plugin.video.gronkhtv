@@ -52,7 +52,7 @@ class ProgressClient:
 
     def write(self, video_id, offset):
         video_id = _video_id(video_id)
-        offset = _offset(offset)
+        offset = wire_offset(offset)
         return self._session.request_json(
             f"/watched/progress/{video_id}",
             method="POST",
@@ -74,6 +74,11 @@ def _offset(value):
     if not math.isfinite(value) or value < 0:
         raise ValueError("offset must be finite non-negative seconds")
     return value
+
+
+def wire_offset(value):
+    """Return the explicitly integer-valued, validated progress wire format."""
+    return int(_offset(value))
 
 
 def _optional_string(value):

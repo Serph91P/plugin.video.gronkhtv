@@ -6,6 +6,7 @@ Network work is deliberately separate from Kodi playback hooks: hooks call
 
 import json
 
+from account.progress import wire_offset
 from account.session import AuthenticationError, RateLimitError, SessionError, ValidationError
 from account.sync_store import ContextLostError
 
@@ -100,6 +101,7 @@ class ProgressSync:
             return "conflict"
         if _remote_changed_since_confirmed(snapshot, preflight):
             return "conflict"
+        observed_before_write = self._store.observed_remote(self._account_id, video_id)
         lease = self._store.claim_upload(self._account_id, self._lease_seconds)
         if lease is None or lease["epoch"] != self._epoch:
             return "pending"
@@ -107,8 +109,9 @@ class ProgressSync:
         # the job before it can send account A's record with a newer session.
         if not self._store.is_active_context(self._account_id, self._epoch):
             return "pending"
+        sent_offset = wire_offset(snapshot["offset"])
         try:
-            self._write_bounded(video_id, snapshot["offset"])
+            self._write_bounded(video_id, sent_offset)
         except _ContextLostError:
             return "pending"
         except AuthenticationError:
@@ -125,7 +128,8 @@ class ProgressSync:
             lease,
             video_id,
             snapshot["revision"],
-            confirmed={"offset": snapshot["offset"]},
+            confirmed={"offset": sent_offset},
+            observed_before_write=observed_before_write,
         ):
             return "synchronized"
         return "pending"
