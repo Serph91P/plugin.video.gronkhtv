@@ -26,6 +26,8 @@ class ResumeStartController:
             return {"state": "explicit", "offset": explicit_offset}
         if self._progress_sync is None or not self._video_id:
             return {"state": "disabled", "offset": local_offset}
+        # An account read cannot fall back to a private resume, even on timeout.
+        local_offset = 0
         if aborted is not None and aborted():
             return {"state": "aborted", "offset": local_offset}
         thread = threading.Thread(target=self._read, daemon=True)
@@ -40,7 +42,7 @@ class ResumeStartController:
             self._done.wait(min(remaining, 0.05))
         with self._lock:
             result = self._result
-        if result is None or result.get("state") not in {"valid", "conflict"}:
+        if result is None or result.get("state") != "valid":
             return self._fallback(
                 result.get("state", "unavailable") if result else "unavailable",
                 local_offset,
