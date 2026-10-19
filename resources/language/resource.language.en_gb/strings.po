@@ -155,3 +155,19 @@ msgstr "Watched update sent but not yet confirmed by account"
 msgctxt "#30231"
 msgid "Account watch status currently unavailable"
 msgstr "Account watch status currently unavailable"
+
+msgctxt "#30232"
+msgid "Reset progress in account and Kodi"
+msgstr "Reset progress in account and Kodi"
+
+msgctxt "#30233"
+msgid "Reset this stream to zero in the account and Kodi? Playback will not start."
+msgstr "Reset this stream to zero in the account and Kodi? Playback will not start."
+
+msgctxt "#30234"
+msgid "Stop playback and wait for active progress uploads before resetting"
+msgstr "Stop playback and wait for active progress uploads before resetting"
+
+msgctxt "#30235"
+msgid "Progress reset could not be completed or confirmed"
+msgstr "Progress reset could not be completed or confirmed"

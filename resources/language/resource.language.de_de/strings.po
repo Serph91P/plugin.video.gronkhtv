@@ -155,3 +155,19 @@ msgstr "Gesehen-Markierung gesendet, aber noch nicht vom Konto bestätigt"
 msgctxt "#30231"
 msgid "Account watch status currently unavailable"
 msgstr "Gesehen-Status des Kontos derzeit nicht verfügbar"
+
+msgctxt "#30232"
+msgid "Reset progress in account and Kodi"
+msgstr "Fortschritt im Konto und in Kodi zurücksetzen"
+
+msgctxt "#30233"
+msgid "Reset this stream to zero in the account and Kodi? Playback will not start."
+msgstr "Diesen Stream im Konto und in Kodi auf null zurücksetzen? Die Wiedergabe wird nicht gestartet."
+
+msgctxt "#30234"
+msgid "Stop playback and wait for active progress uploads before resetting"
+msgstr "Vor dem Zurücksetzen die Wiedergabe beenden und laufende Fortschritts-Uploads abwarten"
+
+msgctxt "#30235"
+msgid "Progress reset could not be completed or confirmed"
+msgstr "Fortschritt konnte nicht vollständig zurückgesetzt oder bestätigt werden"
