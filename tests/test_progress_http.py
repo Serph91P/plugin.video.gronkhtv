@@ -97,7 +97,11 @@ def test_two_clients_server_authority_and_durable_failed_post_over_real_http(tmp
         monkeypatch.setattr(plugin, "get_video_info", lambda ep: {"id": VIDEO, "source_length": 300})
         assert plugin.handle_mark_watched({"episode": "1105"}) is True
         assert plugin._account_watched(second.prepare_playback(VIDEO), 300) is True
-        assert second.record_position(VIDEO, 0, 300, event="stop") == "synchronized"
+        monkeypatch.setattr(plugin.xbmcgui.Dialog, "yesno", lambda *a, **k: True, raising=False)
+        monkeypatch.setattr(plugin.xbmc, "Player", lambda: type("Stopped", (), {"isPlayingVideo": lambda self: False})())
+        monkeypatch.setattr(plugin, "remove_record", lambda *a: True)
+        monkeypatch.setattr(plugin, "clear_watched", lambda *a: True)
+        assert plugin.handle_reset_resume({"episode": "1105"}) is True
         assert first.prepare_playback(VIDEO)["offset"] == 0
         assert plugin._account_watched(first.prepare_playback(VIDEO), 300) is False
         assert state["posts"] == [
