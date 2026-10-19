@@ -375,6 +375,7 @@ def test_account_indicator_is_initialized_from_persisted_session(
     assert calls == [
         ("account_session_present", session_present),
         ("account_logged_in", "false"),
+        ("account_status", "30228" if cookie_exists else "30209"),
     ]
 
 

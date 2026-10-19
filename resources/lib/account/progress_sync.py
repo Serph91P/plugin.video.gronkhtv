@@ -3,6 +3,7 @@
 import threading
 
 from account.progress import _offset
+from account.operation_lock import progress_operation
 from account.session import AuthenticationError, RateLimitError, ValidationError
 
 
@@ -51,7 +52,10 @@ class ProgressSync:
     def _write_or_queue(self, video_id, offset):
         # No detached uploader: stop waits for its bounded POST before Kodi
         # tears the interpreter down. The queue contains failures only.
-        with self._write_lock:
+        with self._write_lock, progress_operation(self._store.path) as acquired:
+            if not acquired:
+                self._store.enqueue(self._account_id, video_id, offset)
+                return "pending"
             previous = self._store.pending(self._account_id, video_id)
             state = self._post(video_id, offset)
             if state != "synchronized":
@@ -60,7 +64,9 @@ class ProgressSync:
             return "synchronized" if self._store.remove(previous) else "pending"
 
     def flush(self, video_id):
-        with self._write_lock:
+        with self._write_lock, progress_operation(self._store.path) as acquired:
+            if not acquired:
+                return "pending"
             record = self._store.pending(self._account_id, video_id)
             if record is None:
                 return "synchronized"
