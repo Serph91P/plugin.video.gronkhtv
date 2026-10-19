@@ -17,6 +17,7 @@ import inputstreamhelper
 from account import AuthenticationError, GronkhTVSession, SessionError
 from account.progress import ProgressClient
 from account.progress_sync import ProgressSync
+from account.session import verified_user
 from account.resume_start import ResumeStartController
 from account.sync_store import SyncStore
 from context_menu import (
@@ -90,6 +91,8 @@ def _sync_account_indicator_from_storage():
     # A persisted cookie makes account controls available, but is not proof that
     # the backend still accepts the session.
     _addon.setSetting("account_logged_in", "false")
+    # Never display an old account name while the saved cookie is unverified.
+    _addon.setSetting("account_status", _addon.getLocalizedString(30228 if session_present else 30209))
 
 
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
@@ -699,6 +702,7 @@ def _read_account_user(timeout=None):
             if timeout is not None
             else _account_session.current_user()
         )
+        user = verified_user(user)
     except (AuthenticationError, SessionError):
         # Keep persisted credentials available for an explicit retry or Logout.
         # Rendering/opening account controls must never destroy session data.
