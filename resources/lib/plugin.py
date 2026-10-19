@@ -335,7 +335,7 @@ def _account_id(user):
     return None
 
 
-def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offset=None):
+def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offset=None, duration=0):
     """Only a server GET can supply account resume, never a private fallback."""
     if explicit_offset is not None:
         return explicit_offset
@@ -346,11 +346,19 @@ def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offse
         timeout_seconds=3,
         aborted=xbmc.Monitor().abortRequested,
     )
-    return result.get("offset") or 0
+    return 0 if _account_watched(result, duration) else result.get("offset") or 0
 
 
-def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=12):
-    """Fetch a bounded set of private resume values before rendering a list.
+def _account_watched(progress, duration):
+    """Project server state onto Kodi's user-approved 95% watched indicator."""
+    return progress.get("state") == "valid" and (
+        progress.get("marked_as_watched") is True
+        or is_completed({"position": progress.get("offset"), "duration": duration})
+    )
+
+
+def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=None):
+    """Read this page's account state with four workers and a shared deadline.
 
     The progress adapter has a per-request timeout; this additional shared
     deadline prevents a long page from serially blocking Kodi's directory
@@ -364,7 +372,7 @@ def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=12):
     candidates = []
     attempted_items = 0
     for video in videos:
-        if attempted_items >= maximum_reads or time.monotonic() >= deadline:
+        if (maximum_reads is not None and attempted_items >= maximum_reads) or time.monotonic() >= deadline:
             break
         if not isinstance(video, dict):
             continue
@@ -403,34 +411,36 @@ def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=12):
     results = {}
     lock = threading.Lock()
     done = threading.Event()
-    remaining = [len(candidates)]
+    work = iter(candidates)
+    remaining = [min(4, len(candidates))]
 
-    def read(episode, video_id):
+    def read():
         try:
-            if time.monotonic() >= deadline:
-                return
-            result = progress_sync.prepare_playback(video_id)
-            if (
-                time.monotonic() < deadline
-                and result.get("state") == "valid"
-                and result.get("offset") is not None
-            ):
+            while time.monotonic() < deadline:
                 with lock:
-                    if time.monotonic() < deadline:
+                    candidate = next(work, None)
+                if candidate is None:
+                    return
+                episode, video_id = candidate
+                try:
+                    result = progress_sync.prepare_playback(video_id)
+                except Exception:
+                    continue
+                with lock:
+                    if time.monotonic() < deadline and result.get("state") in {"valid", "absent"}:
                         results[episode] = result
-        except Exception:
-            pass
         finally:
             with lock:
                 remaining[0] -= 1
                 if remaining[0] == 0:
                     done.set()
 
-    for episode, video_id in candidates:
-        threading.Thread(target=read, args=(episode, video_id), daemon=True).start()
+    for _ in range(remaining[0]):
+        threading.Thread(target=read, daemon=True).start()
     if candidates:
         done.wait(max(0, deadline - time.monotonic()))
-    return results
+    with lock:
+        return dict(results)
 
 
 def _playback_sync_context(episode):
@@ -833,7 +843,9 @@ def list_videos(category, offset=0, search_str="", game_id=None):
             remote = account_progress.get(ep, {})
             resume_point = remote.get("offset") or 0
             resume_duration = video_duration
-            watched = remote.get("marked_as_watched") is True
+            watched = _account_watched(remote, video_duration)
+            if watched:
+                resume_point = 0
         else:
             resume_record = get_resume_record(ep, legacy_duration=video_duration)
             resume_point = resume_record["position"] if resume_record else 0
@@ -854,6 +866,12 @@ def list_videos(category, offset=0, search_str="", game_id=None):
                     f"RunPlugin(plugin://plugin.video.gronkhtv/?action=play_from_start&episode={ep})",
                 ),
             )
+
+        if account_mode and not watched:
+            cm.append((
+                _addon.getLocalizedString(30227),
+                f"RunPlugin(plugin://plugin.video.gronkhtv/?action=mark_watched&episode={ep})",
+            ))
 
         # Favoriten-Menü
         if is_favorite(ep):
@@ -907,6 +925,8 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         duration_str = seconds_to_time(video.get("video_length", 0))
 
         plot_parts = []
+        if account_mode and not remote:
+            plot_parts.append(_addon.getLocalizedString(30231))
         if views:
             plot_parts.append(f"Aufrufe: {views:,}")
         plot_parts.append(f"Dauer: {duration_str}")
@@ -963,7 +983,10 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         xbmcplugin.addDirectoryItem(_HANDLE, "", list_item, False)
 
     xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
-    xbmcplugin.endOfDirectory(_HANDLE)
+    if account_mode:
+        xbmcplugin.endOfDirectory(_HANDLE, cacheToDisc=False)
+    else:
+        xbmcplugin.endOfDirectory(_HANDLE)
 
 
 def add_more_item(category, offset):
@@ -1104,7 +1127,7 @@ def play_video(path, episode, start_offset=0):
     resume_point = resume_record["position"] if resume_record else 0
     backend_video_id = info.get("id") if isinstance(info, dict) else None
     if start_offset == 0 and progress_sync is not None and backend_video_id:
-        resume_point = _account_resume_offset(progress_sync, backend_video_id, resume_point)
+        resume_point = _account_resume_offset(progress_sync, backend_video_id, resume_point, duration=video_length)
     xbmc.log(f"[Gronkh.tv] Resume point: {resume_point}", xbmc.LOGINFO)
 
     # Start-Offset (für Kapitel-Sprung oder Resume)
@@ -1216,6 +1239,7 @@ def monitor_playback(
                     )
                     if state == "synchronized":
                         progress_sync.flush_pending(exclude_video_id=video_id)
+                        xbmc.executebuiltin("Container.Refresh")
                     else:
                         xbmc.log(f"[Gronkh.tv] Account progress upload: {state}", xbmc.LOGWARNING)
                 except Exception as exc:
@@ -1423,6 +1447,7 @@ def router(paramstring):
         "play": handle_play,
         "play_resume": handle_play_resume,
         "play_from_start": handle_play_from_start,
+        "mark_watched": handle_mark_watched,
         "jump_to_chapter": jump_to_chapter,
         "add_favorite": handle_add_favorite,
         "remove_favorite": handle_remove_favorite,
@@ -1668,7 +1693,9 @@ def handle_play_resume(params):
     episode = _positive_int(params.get("episode"), "episode")
     progress_sync, video_id = _playback_sync_context(episode)
     if progress_sync is not None and video_id:
-        resume_point = _account_resume_offset(progress_sync, video_id, 0)
+        info = get_video_info(episode)
+        duration = info.get("source_length", 0) if isinstance(info, dict) else 0
+        resume_point = _account_resume_offset(progress_sync, video_id, 0, duration=duration)
     elif _account_progress_enabled():
         _report_seek_failure("Kontofortschritt nicht verfügbar")
         return False
@@ -1683,6 +1710,34 @@ def handle_play_resume(params):
         return True
     _stop_failed_playback(player)
     _report_seek_failure("Fortsetzen fehlgeschlagen")
+    return False
+
+
+def handle_mark_watched(params):
+    """Explicit account command; never replace it with a private Kodi marker."""
+    episode = _positive_int(params.get("episode"), "episode")
+    message = 30223
+    if _account_progress_enabled():
+        progress_sync = _account_progress_sync()
+        if progress_sync is not None:
+            try:
+                info = get_video_info(episode)
+                if not isinstance(info, dict):
+                    raise ValueError("Video metadata unavailable")
+                duration = _non_negative_finite(info.get("source_length"), "duration")
+                state = progress_sync.mark_watched(info["id"], duration)
+                if state == "synchronized":
+                    confirmed = _account_watched(progress_sync.prepare_playback(info["id"]), duration)
+                    xbmc.executebuiltin("Container.Refresh")
+                    if confirmed:
+                        return True
+                    message = 30230
+                else:
+                    message = {"pending": 30222, "authentication_required": 30223}.get(state, 30229)
+            except Exception as exc:
+                xbmc.log(f"[Gronkh.tv] Account mark watched failed ({type(exc).__name__})", xbmc.LOGWARNING)
+                message = 30229
+    xbmcgui.Dialog().notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
     return False
 
 

@@ -36,6 +36,19 @@ class ProgressSync:
         if event not in {"pause", "stop", "end"}:
             return "ignored"
         offset = _offset(offset)
+        return self._write_or_queue(video_id, offset)
+
+    def mark_watched(self, video_id, duration):
+        """Explicit user command: set account progress to the known video end.
+
+        This is never used by playback sampling or automatic completion.
+        """
+        duration = _offset(duration)
+        if duration <= 0:
+            raise ValueError("A positive video duration is required")
+        return self._write_or_queue(video_id, duration)
+
+    def _write_or_queue(self, video_id, offset):
         # No detached uploader: stop waits for its bounded POST before Kodi
         # tears the interpreter down. The queue contains failures only.
         with self._write_lock:

@@ -20,11 +20,12 @@ from account.session import GronkhTVSession
 from account.progress import ProgressClient
 from account.progress_sync import ProgressSync
 from account.sync_store import SyncStore
+from test_plugin_playback import plugin
 
 VIDEO = "b0b3d510-1da2-4bcb-9d6c-9d13d23b38b1"
 
 
-def test_two_clients_server_authority_and_durable_failed_post_over_real_http(tmp_path, monkeypatch):
+def test_two_clients_server_authority_and_durable_failed_post_over_real_http(tmp_path, monkeypatch, plugin):
     state = {"offset": 75, "fail_post": False, "posts": []}
 
     class Handler(BaseHTTPRequestHandler):
@@ -89,10 +90,18 @@ def test_two_clients_server_authority_and_durable_failed_post_over_real_http(tmp
         assert reopened.flush(VIDEO) == "synchronized"
         assert reopened_store.pending("synthetic-account", VIDEO) is None
         assert second.prepare_playback(VIDEO)["offset"] == 2.125
+        # Explicit user action through the real Kodi route and HTTP adapters;
+        # the synthetic backend keeps marked_as_watched=False throughout.
+        monkeypatch.setattr(plugin, "_account_progress_enabled", lambda: True)
+        monkeypatch.setattr(plugin, "_account_progress_sync", lambda: first)
+        monkeypatch.setattr(plugin, "get_video_info", lambda ep: {"id": VIDEO, "source_length": 300})
+        assert plugin.handle_mark_watched({"episode": "1105"}) is True
+        assert plugin._account_watched(second.prepare_playback(VIDEO), 300) is True
         assert second.record_position(VIDEO, 0, 300, event="stop") == "synchronized"
         assert first.prepare_playback(VIDEO)["offset"] == 0
+        assert plugin._account_watched(first.prepare_playback(VIDEO), 300) is False
         assert state["posts"] == [
-            {"offset": 150.125}, {"offset": 2.125}, {"offset": 2.125}, {"offset": 0},
+            {"offset": 150.125}, {"offset": 2.125}, {"offset": 2.125}, {"offset": 300}, {"offset": 0},
         ]
     finally:
         server.shutdown()

@@ -63,6 +63,7 @@ def plugin(monkeypatch, tmp_path):
     xbmc.LOGWARNING = 2
     xbmc.LOGERROR = 3
     xbmc.log = lambda *args, **kwargs: None
+    xbmc.executebuiltin = lambda *args, **kwargs: None
     xbmc.sleep = lambda milliseconds: None
     xbmc.Player = lambda: pytest.fail("player reached before route validation")
     xbmc.Monitor = lambda: pytest.fail("monitor reached before route validation")
@@ -974,7 +975,7 @@ def test_play_video_uses_bounded_account_resume_for_normal_start(plugin, monkeyp
     )
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: {"position": 12, "duration": 300})
     monkeypatch.setattr(plugin, "_account_progress_sync", lambda: object())
-    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *args: 42)
+    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *args, **kwargs: 42)
     monkeypatch.setattr(plugin, "_configure_authenticated_playback", lambda *args: True)
     monkeypatch.setattr(plugin.xbmcplugin, "setResolvedUrl", lambda *args, **kwargs: resolved.append(args), raising=False)
     monkeypatch.setattr(plugin, "monitor_playback", lambda *args, **kwargs: monitor_calls.append((args, kwargs)))
@@ -1072,7 +1073,7 @@ def test_context_menu_preserves_resume_chapter_action_order_and_urls(
         raising=False,
     )
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
 
     plugin.list_videos("category")
 
@@ -1122,7 +1123,7 @@ def test_listing_marks_persisted_watched_episode_without_a_resume_point(plugin, 
         raising=False,
     )
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
 
     plugin.list_videos("category")
 
@@ -1165,7 +1166,7 @@ def test_listing_uses_authenticated_remote_progress_before_playback(plugin, monk
         raising=False,
     )
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
 
     plugin.list_videos("category")
 
@@ -1231,7 +1232,7 @@ def test_latest_uploads_validate_session_without_local_progress_context(
         raising=False,
     )
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
 
     plugin.list_videos(plugin._CATEGORIES[0])
     plugin.list_videos(plugin._CATEGORIES[0])
@@ -1386,7 +1387,7 @@ def test_remote_only_list_resume_context_seeks_the_account_offset(plugin, monkey
         raising=False,
     )
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
 
     plugin.list_videos("category")
 
@@ -1432,7 +1433,7 @@ def test_favorite_without_backend_id_uses_episode_lookup_for_account_progress(
         raising=False,
     )
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
 
     plugin.list_videos(plugin._CATEGORIES[6])
 
@@ -1867,7 +1868,7 @@ def test_explicit_playback_paths_bind_account_sync_and_backend_video_id(
     monkeypatch.setattr(plugin, "_play_direct", lambda *args: player)
     monkeypatch.setattr(plugin, "_seek_to_offset", lambda *args, **kwargs: True)
     monkeypatch.setattr(plugin, "get_resume_record", lambda *args, **kwargs: {"position": 10, "duration": 300})
-    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *args: 75)
+    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *args, **kwargs: 75)
     monkeypatch.setattr(plugin, "remove_record", lambda *args, **kwargs: True)
     monkeypatch.setattr(plugin, "clear_watched", lambda *args, **kwargs: True)
     monkeypatch.setattr(

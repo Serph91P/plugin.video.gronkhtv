@@ -21,7 +21,7 @@ def listing(plugin, monkeypatch, remote):
     monkeypatch.setattr(plugin.xbmcgui, "ListItem", RecordingListItem)
     monkeypatch.setattr(plugin.xbmcplugin, "addDirectoryItem", lambda h, u, item, f: items.append(item), raising=False)
     for name in ("setPluginCategory", "setContent", "addSortMethod", "endOfDirectory"):
-        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *a: None, raising=False)
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *a, **kw: None, raising=False)
     plugin.list_videos("category")
     return items[0]
 
@@ -29,7 +29,10 @@ def listing(plugin, monkeypatch, remote):
 @pytest.mark.parametrize("watched", [True, False])
 def test_account_listing_uses_server_resume_and_watched_not_private_files(plugin, monkeypatch, watched):
     item = listing(plugin, monkeypatch, {1105: {"state": "valid", "offset": 75, "marked_as_watched": watched}})
-    assert item.tag.calls["setResumePoint"] == [((75, 300), {})]
+    if watched:
+        assert "setResumePoint" not in item.tag.calls
+    else:
+        assert item.tag.calls["setResumePoint"] == [((75, 300), {})]
     assert item.tag.calls["setPlaycount"] == [((int(watched),), {})]
 
 
@@ -46,7 +49,8 @@ def test_resume_context_action_ignores_existing_private_offset(plugin, monkeypat
     calls = []
     monkeypatch.setattr(plugin, "get_resume_record", lambda *a, **kw: {"position": 2, "duration": 300})
     monkeypatch.setattr(plugin, "_playback_sync_context", lambda ep: (sync, "backend-id"))
-    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *a: 75)
+    monkeypatch.setattr(plugin, "get_video_info", lambda ep: {"id": "backend-id", "source_length": 300})
+    monkeypatch.setattr(plugin, "_account_resume_offset", lambda *a, **kw: 75)
     monkeypatch.setattr(plugin, "get_playlist_url", lambda ep: "https://media/playlist")
     monkeypatch.setattr(plugin, "_play_direct", lambda url: object())
     monkeypatch.setattr(plugin, "_seek_to_offset", lambda player, offset, **kw: calls.append(offset) or True)
