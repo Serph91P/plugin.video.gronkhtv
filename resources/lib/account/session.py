@@ -63,6 +63,18 @@ class LoginResult:
         self.user = user
 
 
+def verified_user(user):
+    """A saved cookie or display label alone is not a verified user identity."""
+    if isinstance(user, dict):
+        for key in ("id", "login", "usertag", "email"):
+            identity = user.get(key)
+            if isinstance(identity, int) and not isinstance(identity, bool):
+                return user
+            if isinstance(identity, str) and identity.strip():
+                return user
+    raise SessionError("GronkhTV session could not be verified", phase="current_user")
+
+
 class GronkhTVSession:
     def __init__(self, cookie_path, cookie_jar=None, opener=None):
         self.cookie_path = Path(cookie_path)
@@ -105,8 +117,8 @@ class GronkhTVSession:
     def current_user(self, timeout=None):
         user = self.request_json("/users/self", timeout=timeout, phase="current_user")
         if isinstance(user, dict) and "data" in user:
-            return user["data"]
-        return user
+            user = user["data"]
+        return verified_user(user)
 
     def request_json(self, path, method="GET", payload=None, timeout=None, phase=None):
         csrf = method.upper() not in ("GET", "HEAD") and bool(

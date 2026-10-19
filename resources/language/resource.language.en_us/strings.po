@@ -144,6 +144,10 @@ msgctxt "#30227"
 msgid "Mark as watched in account"
 msgstr "Mark as watched in account"
 
+msgctxt "#30228"
+msgid "Saved session, sign-in not verified"
+msgstr "Saved session, sign-in not verified"
+
 msgctxt "#30229"
 msgid "Could not mark stream as watched"
 msgstr "Could not mark stream as watched"
