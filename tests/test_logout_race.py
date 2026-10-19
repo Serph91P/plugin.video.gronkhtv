@@ -41,10 +41,21 @@ def test_slow_logout_clears_old_cookie_before_dispatch_and_preserves_new_login(t
 
 @pytest.mark.parametrize("status", [204, 503])
 def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monkeypatch, status, plugin):
+    import gronkhtv_api
+    monkeypatch.setattr(gronkhtv_api, "_account_session", None)
+    monkeypatch.setattr(gronkhtv_api, "urlopen", lambda *a, **k: pytest.fail("authenticated session replaced by anonymous fallback"))
     started, finish = threading.Event(), threading.Event()
     requests, errors = [], []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
+        def do_GET(self):
+            assert self.path == "/v3/videos/synthetic"
+            assert "synthetic-new" in self.headers.get("Cookie", "")
+            body = b'{"data":{"synthetic":true}}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         def do_POST(self):
             requests.append((self.path, self.headers.get("Cookie"), self.headers.get("X-XSRF-TOKEN")))
             started.set()
@@ -82,6 +93,7 @@ def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monke
         new = GronkhTVSession(path)
         new.cookie_jar.set_cookie(cookie("session", "synthetic-new"))
         new.save()
+        plugin.configure_account_session(new)
         settings.update(account_logged_in="true", account_session_present="true", account_status="Synthetic New User")
         finish.set()
         worker.join(3)
@@ -89,6 +101,8 @@ def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monke
         assert GronkhTVSession(path)._cookie_value("session") == "synthetic-new"
         assert settings["account_logged_in"] == "true"
         assert settings["account_status"] == "Synthetic New User"
+        assert gronkhtv_api._account_session is new
+        assert gronkhtv_api.get_json("/videos/synthetic") == {"data": {"synthetic": True}}
         assert requests[0][0] == "/v3/auth/logout"
         assert "synthetic-old" in requests[0][1] and requests[0][2] == "synthetic-csrf"
         assert errors == []
