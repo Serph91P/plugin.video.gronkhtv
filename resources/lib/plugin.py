@@ -18,6 +18,7 @@ from account import AuthenticationError, GronkhTVSession, SessionError
 from account.progress import ProgressClient
 from account.progress_sync import ProgressSync
 from account.session import verified_user
+from account.operation_lock import progress_operation
 from account.resume_start import ResumeStartController
 from account.sync_store import SyncStore
 from context_menu import (
@@ -877,6 +878,12 @@ def list_videos(category, offset=0, search_str="", game_id=None):
                 f"RunPlugin(plugin://plugin.video.gronkhtv/?action=mark_watched&episode={ep})",
             ))
 
+        if account_mode and ((remote.get("offset") or 0) > 0 or watched):
+            cm.append((
+                _addon.getLocalizedString(30232),
+                f"RunPlugin(plugin://plugin.video.gronkhtv/?action=reset_resume&episode={ep})",
+            ))
+
         # Favoriten-Menü
         if is_favorite(ep):
             cm.append(
@@ -1154,6 +1161,19 @@ def play_video(path, episode, start_offset=0):
 def monitor_playback(
     episode, next_episode=None, progress_sync=None, video_id=None, generation=None
 ):
+    if progress_sync is not None or _account_progress_enabled():
+        while True:
+            with progress_operation(_PROGRESS_SYNC_FILE) as acquired:
+                if acquired:
+                    return _monitor_playback(episode, next_episode, progress_sync, video_id, generation)
+            if xbmc.Monitor().waitForAbort(0.1):
+                return
+    return _monitor_playback(episode, next_episode, progress_sync, video_id, generation)
+
+
+def _monitor_playback(
+    episode, next_episode=None, progress_sync=None, video_id=None, generation=None
+):
     """Überwacht die Wiedergabe, speichert Fortschritt und startet ggf. nächste Episode"""
     global _PLAYBACK_GENERATION
     if generation is None:
@@ -1175,6 +1195,10 @@ def monitor_playback(
         xbmc.log("[Gronkh.tv] Playback did not start", xbmc.LOGWARNING)
         return
 
+    try:
+        media_path = player.getPlayingFile()
+    except (AttributeError, RuntimeError):
+        media_path = None
     latest = None
     previous_position = None
     next_save = time.monotonic() + 5
@@ -1186,6 +1210,8 @@ def monitor_playback(
             if not _is_current_playback_generation(generation):
                 return
             try:
+                if media_path and player.getPlayingFile() != media_path:
+                    return
                 current_time = _non_negative_finite(player.getTime(), "player time")
                 total_time = _non_negative_finite(
                     player.getTotalTime(), "player duration"
@@ -1452,6 +1478,7 @@ def router(paramstring):
         "play_resume": handle_play_resume,
         "play_from_start": handle_play_from_start,
         "mark_watched": handle_mark_watched,
+        "reset_resume": handle_reset_resume,
         "jump_to_chapter": jump_to_chapter,
         "add_favorite": handle_add_favorite,
         "remove_favorite": handle_remove_favorite,
@@ -1742,6 +1769,51 @@ def handle_mark_watched(params):
                 xbmc.log(f"[Gronkh.tv] Account mark watched failed ({type(exc).__name__})", xbmc.LOGWARNING)
                 message = 30229
     xbmcgui.Dialog().notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
+    return False
+
+
+def handle_reset_resume(params):
+    """Explicit non-playing reset; a queued zero is not a completed reset."""
+    episode = _positive_int(params.get("episode"), "episode")
+    dialog = xbmcgui.Dialog()
+    if not dialog.yesno(_plugin, _addon.getLocalizedString(30233)):
+        return False
+    with progress_operation(_PROGRESS_SYNC_FILE) as acquired:
+        if acquired:
+            return _reset_account_progress(episode, dialog)
+    dialog.notification(_plugin, _addon.getLocalizedString(30234), xbmcgui.NOTIFICATION_WARNING)
+    return False
+
+
+def _reset_account_progress(episode, dialog):
+    message = 30223
+    if xbmc.Player().isPlayingVideo():
+        message = 30234
+    elif _account_progress_enabled():
+        progress_sync = _account_progress_sync()
+        if progress_sync is not None:
+            try:
+                info = get_video_info(episode)
+                video_id = info.get("id") if isinstance(info, dict) else None
+                if not video_id:
+                    raise ValueError("Video identity unavailable")
+                state = progress_sync.record_position(video_id, 0, event="stop")
+                if state == "synchronized":
+                    remote = progress_sync.prepare_playback(video_id)
+                    if (remote.get("state") == "valid" and remote.get("offset") == 0
+                            and not remote.get("marked_as_watched")):
+                        removed = remove_record(xbmcvfs, _resume_path(episode))
+                        cleared = clear_watched(episode) if removed else False
+                        xbmc.executebuiltin("Container.Refresh")
+                        if removed and cleared:
+                            return True
+                    message = 30235
+                else:
+                    message = {"pending": 30222, "authentication_required": 30223}.get(state, 30235)
+            except Exception as exc:
+                xbmc.log(f"[Gronkh.tv] Account reset failed ({type(exc).__name__})", xbmc.LOGWARNING)
+                message = 30235
+    dialog.notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
     return False
 
 
