@@ -6,6 +6,7 @@ from urllib.request import HTTPCookieProcessor
 
 import pytest
 
+from test_plugin_playback import plugin
 from test_account_session import FakeResponse, _cookie, _session
 import account.session as session_module
 from account.session import GronkhTVSession, SessionError
@@ -39,7 +40,7 @@ def test_slow_logout_clears_old_cookie_before_dispatch_and_preserves_new_login(t
 
 
 @pytest.mark.parametrize("status", [204, 503])
-def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monkeypatch, status):
+def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monkeypatch, status, plugin):
     started, finish = threading.Event(), threading.Event()
     requests, errors = [], []
     class Handler(BaseHTTPRequestHandler):
@@ -63,10 +64,15 @@ def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monke
     old.cookie_jar.set_cookie(cookie("XSRF-TOKEN", "synthetic-csrf"))
     old.cookie_jar.set_cookie(cookie("session", "synthetic-old"))
     old.save()
+    settings = {}
+    monkeypatch.setattr(plugin, "_ACCOUNT_COOKIE_FILE", str(path))
+    monkeypatch.setattr(plugin, "_account_session", old)
+    monkeypatch.setattr(plugin.xbmcgui.Dialog, "yesno", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(plugin._addon, "setSetting", lambda key, value: settings.__setitem__(key, value))
     def logout():
         try:
-            old.logout()
-        except SessionError as exc:
+            plugin.handle_account_logout()
+        except Exception as exc:
             errors.append(exc)
     worker = threading.Thread(target=logout)
     worker.start()
@@ -76,13 +82,16 @@ def test_real_http_late_logout_does_not_remove_new_saved_session(tmp_path, monke
         new = GronkhTVSession(path)
         new.cookie_jar.set_cookie(cookie("session", "synthetic-new"))
         new.save()
+        settings.update(account_logged_in="true", account_session_present="true", account_status="Synthetic New User")
         finish.set()
         worker.join(3)
         assert not worker.is_alive()
         assert GronkhTVSession(path)._cookie_value("session") == "synthetic-new"
+        assert settings["account_logged_in"] == "true"
+        assert settings["account_status"] == "Synthetic New User"
         assert requests[0][0] == "/v3/auth/logout"
         assert "synthetic-old" in requests[0][1] and requests[0][2] == "synthetic-csrf"
-        assert len(errors) == (0 if status == 204 else 1)
+        assert errors == []
     finally:
         finish.set()
         worker.join(3)

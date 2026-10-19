@@ -1667,9 +1667,14 @@ def handle_account_logout(params=None):
     try:
         _account_session.logout()
     except SessionError:
+        # logout() already removed its old local state before dispatch.
         xbmc.log("[Gronkh.tv] Remote logout failed", xbmc.LOGWARNING)
-        _account_session.clear()
     configure_account_session(None)
+    if os.path.exists(_ACCOUNT_COOKIE_FILE):
+        # A newer invocation saved a session while the old logout was in flight.
+        # Do not erase its cookie or overwrite its confirmed account indicator.
+        xbmc.executebuiltin("Container.Refresh")
+        return
     _addon.setSetting("account_session_present", "false")
     _addon.setSetting("account_logged_in", "false")
     _set_account_status(_addon.getLocalizedString(30209))
