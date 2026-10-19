@@ -152,10 +152,12 @@ class GronkhTVSession:
                     method="POST",
                     accepted_statuses=(204,),
                     csrf=True,
+                    clear_before_dispatch=True,
                 )
             except AuthenticationError:
                 pass
-        self.clear()
+        else:
+            self.clear()
 
     def save(self):
         self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +192,7 @@ class GronkhTVSession:
         csrf=False,
         timeout=None,
         phase=None,
+        clear_before_dispatch=False,
     ):
         url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
         headers = {
@@ -214,6 +217,11 @@ class GronkhTVSession:
             headers["X-XSRF-TOKEN"] = unquote(csrf_token)
 
         request = Request(url, data=data, headers=headers, method=method)
+        if clear_before_dispatch:
+            # Freeze only the outgoing old cookies before local logout. A late
+            # response must not unlink a session saved by a newer invocation.
+            self.cookie_jar.add_cookie_header(request)
+            self.clear()
         try:
             with self.opener.open(request, timeout=timeout or _TIMEOUT) as response:
                 status = getattr(response, "status", None)
