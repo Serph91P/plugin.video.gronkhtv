@@ -54,7 +54,7 @@ msgstr "Anmelden"
 
 msgctxt "#30205"
 msgid "Sign out"
-msgstr "Abmelden"
+msgstr "Abmelden / Sitzung zurücksetzen"
 
 msgctxt "#30206"
 msgid "Playback"
@@ -107,3 +107,119 @@ msgstr "Möchtest du dich abmelden?"
 msgctxt "#30218"
 msgid "Signed out"
 msgstr "Abgemeldet"
+
+msgctxt "#30219"
+msgid "Synchronize watch progress"
+msgstr "Wiedergabefortschritt synchronisieren"
+
+msgctxt "#30220"
+msgid "Progress sync disabled"
+msgstr "Fortschrittssynchronisierung deaktiviert"
+
+msgctxt "#30221"
+msgid "Progress synchronized"
+msgstr "Fortschritt synchronisiert"
+
+msgctxt "#30222"
+msgid "Progress pending locally"
+msgstr "Fortschritt lokal ausstehend"
+
+msgctxt "#30223"
+msgid "Sign in required for progress sync"
+msgstr "Anmeldung für Fortschrittssynchronisierung erforderlich"
+
+msgctxt "#30224"
+msgid "Progress conflict needs a choice"
+msgstr "Fortschrittskonflikt benötigt eine Auswahl"
+
+msgctxt "#30225"
+msgid "Keep Kodi progress"
+msgstr "Kodi-Fortschritt behalten"
+
+msgctxt "#30226"
+msgid "Use account progress"
+msgstr "Konto-Fortschritt verwenden"
+
+msgctxt "#30227"
+msgid "Mark as watched in account"
+msgstr "Im Konto als gesehen markieren"
+
+msgctxt "#30228"
+msgid "Saved session, sign-in not verified"
+msgstr "Gespeicherte Sitzung, Anmeldung nicht bestätigt"
+
+msgctxt "#30229"
+msgid "Could not mark stream as watched"
+msgstr "Stream konnte nicht als gesehen markiert werden"
+
+msgctxt "#30230"
+msgid "Watched update sent but not yet confirmed by account"
+msgstr "Gesehen-Markierung gesendet, aber noch nicht vom Konto bestätigt"
+
+msgctxt "#30231"
+msgid "Account watch status currently unavailable"
+msgstr "Gesehen-Status des Kontos derzeit nicht verfügbar"
+
+msgctxt "#30232"
+msgid "Reset progress in account and Kodi"
+msgstr "Fortschritt im Konto und in Kodi zurücksetzen"
+
+msgctxt "#30233"
+msgid "Reset this stream to zero in the account and Kodi? Playback will not start."
+msgstr "Diesen Stream im Konto und in Kodi auf null zurücksetzen? Die Wiedergabe wird nicht gestartet."
+
+msgctxt "#30234"
+msgid "Stop playback and wait for active progress uploads before resetting"
+msgstr "Vor dem Zurücksetzen die Wiedergabe beenden und laufende Fortschritts-Uploads abwarten"
+
+msgctxt "#30235"
+msgid "Progress reset could not be completed or confirmed"
+msgstr "Fortschritt konnte nicht vollständig zurückgesetzt oder bestätigt werden"
+
+msgctxt "#30300"
+msgid "Video library"
+msgstr "Videothek"
+
+msgctxt "#30301"
+msgid "Browse videos"
+msgstr "Videos durchsuchen"
+
+msgctxt "#30302"
+msgid "Most viewed videos"
+msgstr "Meistgesehene Videos"
+
+msgctxt "#30303"
+msgid "Search videos"
+msgstr "Videos suchen"
+
+msgctxt "#30304"
+msgid "Browse by tag"
+msgstr "Nach Tags"
+
+msgctxt "#30305"
+msgid "Browse by series"
+msgstr "Nach Serien"
+
+msgctxt "#30306"
+msgid "Browse by game"
+msgstr "Nach Spielen"
+
+msgctxt "#30307"
+msgid "Next page"
+msgstr "Nächste Seite"
+
+msgctxt "#30308"
+msgid "No matching videos on this page"
+msgstr "Keine passenden Videos auf dieser Seite"
+
+msgctxt "#30309"
+msgid "GronkhTV could not load this content"
+msgstr "GronkhTV konnte diesen Inhalt nicht laden"
+
+msgctxt "#30310"
+msgid "Sign in under Account again or check your access to this video"
+msgstr "Bitte unter Konto erneut anmelden oder die Berechtigung für dieses Video prüfen"
+
+msgctxt "#30311"
+msgid "Enable account playback and make sure InputStream Adaptive is available"
+msgstr "Bitte Kontowiedergabe aktivieren und prüfen, ob InputStream Adaptive verfügbar ist"

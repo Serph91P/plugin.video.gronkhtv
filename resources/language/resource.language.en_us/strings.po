@@ -54,7 +54,7 @@ msgstr "Sign in"
 
 msgctxt "#30205"
 msgid "Sign out"
-msgstr "Sign out"
+msgstr "Sign out / reset session"
 
 msgctxt "#30206"
 msgid "Playback"
@@ -107,3 +107,119 @@ msgstr "Do you want to sign out?"
 msgctxt "#30218"
 msgid "Signed out"
 msgstr "Signed out"
+
+msgctxt "#30219"
+msgid "Synchronize watch progress"
+msgstr "Synchronize watch progress"
+
+msgctxt "#30220"
+msgid "Progress sync disabled"
+msgstr "Progress sync disabled"
+
+msgctxt "#30221"
+msgid "Progress synchronized"
+msgstr "Progress synchronized"
+
+msgctxt "#30222"
+msgid "Progress pending locally"
+msgstr "Progress pending locally"
+
+msgctxt "#30223"
+msgid "Sign in required for progress sync"
+msgstr "Sign in required for progress sync"
+
+msgctxt "#30224"
+msgid "Progress conflict needs a choice"
+msgstr "Progress conflict needs a choice"
+
+msgctxt "#30225"
+msgid "Keep Kodi progress"
+msgstr "Keep Kodi progress"
+
+msgctxt "#30226"
+msgid "Use account progress"
+msgstr "Use account progress"
+
+msgctxt "#30227"
+msgid "Mark as watched in account"
+msgstr "Mark as watched in account"
+
+msgctxt "#30228"
+msgid "Saved session, sign-in not verified"
+msgstr "Saved session, sign-in not verified"
+
+msgctxt "#30229"
+msgid "Could not mark stream as watched"
+msgstr "Could not mark stream as watched"
+
+msgctxt "#30230"
+msgid "Watched update sent but not yet confirmed by account"
+msgstr "Watched update sent but not yet confirmed by account"
+
+msgctxt "#30231"
+msgid "Account watch status currently unavailable"
+msgstr "Account watch status currently unavailable"
+
+msgctxt "#30232"
+msgid "Reset progress in account and Kodi"
+msgstr "Reset progress in account and Kodi"
+
+msgctxt "#30233"
+msgid "Reset this stream to zero in the account and Kodi? Playback will not start."
+msgstr "Reset this stream to zero in the account and Kodi? Playback will not start."
+
+msgctxt "#30234"
+msgid "Stop playback and wait for active progress uploads before resetting"
+msgstr "Stop playback and wait for active progress uploads before resetting"
+
+msgctxt "#30235"
+msgid "Progress reset could not be completed or confirmed"
+msgstr "Progress reset could not be completed or confirmed"
+
+msgctxt "#30300"
+msgid "Video library"
+msgstr "Video library"
+
+msgctxt "#30301"
+msgid "Browse videos"
+msgstr "Browse videos"
+
+msgctxt "#30302"
+msgid "Most viewed videos"
+msgstr "Most viewed videos"
+
+msgctxt "#30303"
+msgid "Search videos"
+msgstr "Search videos"
+
+msgctxt "#30304"
+msgid "Browse by tag"
+msgstr "Browse by tag"
+
+msgctxt "#30305"
+msgid "Browse by series"
+msgstr "Browse by series"
+
+msgctxt "#30306"
+msgid "Browse by game"
+msgstr "Browse by game"
+
+msgctxt "#30307"
+msgid "Next page"
+msgstr "Next page"
+
+msgctxt "#30308"
+msgid "No matching videos on this page"
+msgstr "No matching videos on this page"
+
+msgctxt "#30309"
+msgid "GronkhTV could not load this content"
+msgstr "GronkhTV could not load this content"
+
+msgctxt "#30310"
+msgid "Sign in under Account again or check your access to this video"
+msgstr "Sign in under Account again or check your access to this video"
+
+msgctxt "#30311"
+msgid "Enable account playback and make sure InputStream Adaptive is available"
+msgstr "Enable account playback and make sure InputStream Adaptive is available"

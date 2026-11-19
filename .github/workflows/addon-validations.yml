@@ -7,6 +7,13 @@ on:
   pull_request:
     branches: [main, develop]
 
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact candidate commit to validate.
+        required: true
+        type: string
+
 permissions:
   contents: read
 
@@ -16,6 +23,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Bind workflow dispatch to exact candidate
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+          ACTUAL_SHA: ${{ github.sha }}
+        run: test "$EXPECTED_SHA" = "$ACTUAL_SHA"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -47,11 +61,13 @@ jobs:
   package:
     name: Package Validation
     needs: addon-validations
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.candidate_sha == github.sha)
     permissions:
       contents: read
       id-token: write
-    uses: Serph91P/repository.serph91p/.github/workflows/reusable-addon-package.yml@7adff881ab5d0a7fc63f7474a78b2688e2e6eee4
+    uses: Serph91P/repository.serph91p/.github/workflows/reusable-addon-package.yml@552ebaa4d9cc34ad7cc6dfd1ef710eb2e4cdd91e
     with:
       addon_id: plugin.video.gronkhtv
       runtime_entries_json: '["addon.xml","addon.py","resources/"]'

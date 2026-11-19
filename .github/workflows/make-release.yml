@@ -1,117 +1,98 @@
 name: Make Release
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'addon.xml'
-      - 'addon.py'
-      - 'resources/**'
+  workflow_call:
+    inputs:
+      validation_run_id:
+        required: true
+        type: number
+      validation_head_sha:
+        required: true
+        type: string
+      addon_version:
+        required: true
+        type: string
+      asset_name:
+        required: true
+        type: string
+      artifact_sha256:
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
   release:
-    name: Make Release
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Add-on
-        uses: actions/checkout@v4
+      - name: Checkout exact validated commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install libxml2-utils xmlstarlet
+          ref: ${{ inputs.validation_head_sha }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.11'
 
-      - name: Get version and check tag
-        id: version
-        run: |
-          version=$(python -c 'from pathlib import Path; from scripts.build_release import parse_addon_xml; print(parse_addon_xml(Path("addon.xml"))[1])')
-          filename=${{ github.event.repository.name }}-${version}.zip
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "filename=$filename" >> "$GITHUB_OUTPUT"
-
-          if git rev-parse "v$version" >/dev/null 2>&1; then
-            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          if gh api "repos/${{ github.repository }}/releases/tags/v$version" --jq '.assets[].name' 2>/dev/null | grep -Fxq -- "$filename"; then
-            echo "asset_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "asset_exists=false" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create Zip
-        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
-        id: create-zip
-        run: |
-          filename=${{ steps.version.outputs.filename }}
-          package_source=$(mktemp -d)
-          cp -a -- addon.xml addon.py resources "$package_source/"
-          python scripts/build_release.py --source "$package_source" --output "${GITHUB_WORKSPACE}/${filename}" --expected-version "${{ steps.version.outputs.version }}"
-          echo "filename=$filename" >> "$GITHUB_OUTPUT"
-
-      - name: Verify Zip
-        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
-        run: |
-          python scripts/build_release.py --verify-only --output "${GITHUB_WORKSPACE}/${{ steps.create-zip.outputs.filename }}" --expected-version "${{ steps.version.outputs.version }}"
-
-      - name: Check tag points to current commit (retry safety)
-        if: steps.version.outputs.tag_exists == 'true' && steps.version.outputs.asset_exists == 'false'
-        run: |
-          tag_sha=$(git rev-parse "v${{ steps.version.outputs.version }}^{}")
-          if [ "$tag_sha" != "${{ github.sha }}" ]; then
-            echo "Tag v${{ steps.version.outputs.version }} points to $tag_sha but current commit is ${{ github.sha }}"
-            echo "Refusing to attach asset built from different commit to existing immutable tag"
-            exit 1
-          fi
-
-      - name: Create and push tag
-        if: steps.version.outputs.tag_exists == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
-
-      - name: Get Changelog
-        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
-        id: changelog
-        run: |
-          changes=$(xmlstarlet sel -t -v '//news' -n addon.xml)
-          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-          {
-            echo "changes<<$EOF"
-            echo "$changes"
-            echo "$EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Create Release
-        if: steps.version.outputs.tag_exists == 'false' || steps.version.outputs.asset_exists == 'false'
-        uses: softprops/action-gh-release@v2
+      - name: Download exact validated package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          files: "${{ steps.create-zip.outputs.filename }}"
-          body: ${{ steps.changelog.outputs.changes }}
-          fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: addon-package
+          run-id: ${{ inputs.validation_run_id }}
+          github-token: ${{ github.token }}
 
-      - name: Verify release asset
-        run: |
-          gh api "repos/${{ github.repository }}/releases/tags/v${{ steps.version.outputs.version }}" --jq '.assets[].name' | grep -Fxq -- "${{ steps.version.outputs.filename }}"
+      - name: Verify package identity and digest
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          VERSION: ${{ inputs.addon_version }}
+          EXPECTED_SHA256: ${{ inputs.artifact_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$ASSET_NAME"
+          actual=$(sha256sum "$ASSET_NAME" | cut -d' ' -f1)
+          test "$actual" = "$EXPECTED_SHA256"
+          python scripts/build_release.py --verify-only --output "$ASSET_NAME" --expected-version "$VERSION"
+          source_version=$(python -c 'from pathlib import Path; from scripts.build_release import parse_addon_xml; print(parse_addon_xml(Path("addon.xml"))[1])')
+          test "$source_version" = "$VERSION"
+          test "$ASSET_NAME" = "plugin.video.gronkhtv-${VERSION}.zip"
+
+      - name: Publish or verify immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.addon_version }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_SHA256: ${{ inputs.artifact_sha256 }}
+          VALIDATED_SHA: ${{ inputs.validation_head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            test "$(git rev-parse "${tag}^{commit}")" = "$VALIDATED_SHA"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" "$VALIDATED_SHA" -m "Release $tag"
+            git push origin "$tag"
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            asset_count=$(gh release view "$tag" --json assets --jq "[.assets[] | select(.name == \"$ASSET_NAME\")] | length")
+            if [ "$asset_count" = 0 ]; then
+              gh release upload "$tag" "$ASSET_NAME"
+            elif [ "$asset_count" = 1 ]; then
+              tmp=$(mktemp)
+              gh release download "$tag" --pattern "$ASSET_NAME" --output "$tmp"
+              test "$(sha256sum "$tmp" | cut -d' ' -f1)" = "$EXPECTED_SHA256"
+            else
+              echo "Release contains duplicate assets named $ASSET_NAME" >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" "$ASSET_NAME" --verify-tag --title "$tag" --notes-from-tag
+          fi

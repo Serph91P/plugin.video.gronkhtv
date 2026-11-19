@@ -694,23 +694,17 @@ def test_cli_expected_version(tmp_path, mode, source_version, expected_version, 
         assert "version" in (result.stderr + result.stdout).lower() or "mismatch" in (result.stderr + result.stdout).lower()
 
 
-def test_workflow_passes_expected_version_to_build_and_verify():
-    """Workflow must pass --expected-version to both build and verify steps."""
+def test_workflow_passes_exact_validated_version_to_archive_verifier():
+    """Release workflow verifies downloaded package against evidence version."""
     import yaml
     workflow_path = ROOT / ".github" / "workflows" / "make-release.yml"
     with open(workflow_path) as f:
         workflow = yaml.safe_load(f)
 
     steps = workflow["jobs"]["release"]["steps"]
-
-    # Find Create Zip step
-    create_zip_step = next(s for s in steps if s.get("name") == "Create Zip")
-    create_zip_run = create_zip_step["run"]
-    assert "--expected-version" in create_zip_run
-    assert "${{ steps.version.outputs.version }}" in create_zip_run
-
-    # Find Verify Zip step
-    verify_zip_step = next(s for s in steps if s.get("name") == "Verify Zip")
-    verify_zip_run = verify_zip_step["run"]
-    assert "--expected-version" in verify_zip_run
-    assert "${{ steps.version.outputs.version }}" in verify_zip_run
+    verify = next(
+        step for step in steps if step.get("name") == "Verify package identity and digest"
+    )
+    assert verify["env"]["VERSION"] == "${{ inputs.addon_version }}"
+    assert "--expected-version \"$VERSION\"" in verify["run"]
+    assert "EXPECTED_SHA256" in verify["env"]

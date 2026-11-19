@@ -11,8 +11,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 REUSABLE_REPOSITORY = "Serph91P/repository.serph91p"
-PACKAGE_PIN = "7adff881ab5d0a7fc63f7474a78b2688e2e6eee4"
-NOTIFIER_PIN = "5afd718564c0d55a914978e43aafd34c92a53029"
+PACKAGE_PIN = "552ebaa4d9cc34ad7cc6dfd1ef710eb2e4cdd91e"
+NOTIFIER_PIN = "552ebaa4d9cc34ad7cc6dfd1ef710eb2e4cdd91e"
 PACKAGE_WORKFLOW = (
     f"{REUSABLE_REPOSITORY}/.github/workflows/"
     f"reusable-addon-package.yml@{PACKAGE_PIN}"
@@ -61,19 +61,16 @@ def workflow_step(workflow, name):
 
 def test_main_release_behavior_remains_available():
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
+    workflow = load_workflow(WORKFLOWS / "make-release.yml")
 
-    assert "name: Make Release" in make_release
-    assert "branches: [main]" in make_release
-    assert "paths:" in make_release
-    assert "      - 'addon.xml'" in make_release
-    assert "      - 'addon.py'" in make_release
-    assert "      - 'resources/**'" in make_release
-    assert "permissions:\n  contents: write" in make_release
-    assert "Set up Python" in make_release
-    assert "python-version: '3.11'" in make_release
-    assert "scripts/build_release.py" in make_release
-    assert "rsync" not in make_release
-    assert "zip -r" not in make_release
+    assert set(workflow["on"]["workflow_call"]["inputs"]) == {
+        "validation_run_id", "validation_head_sha", "addon_version",
+        "asset_name", "artifact_sha256",
+    }
+    assert workflow["permissions"] == {"actions": "read", "contents": "write"}
+    assert "Download exact validated package" in make_release
+    assert "Verify package identity and digest" in make_release
+    assert "Publish or verify immutable release" in make_release
 
     assert not (WORKFLOWS / "build-repo.yml").exists()
 
@@ -84,6 +81,53 @@ def test_addon_validations_has_minimal_workflow_permissions():
     )
 
     assert "permissions:\n  contents: read\n\njobs:" in addon_validations
+
+
+def test_version_allocator_dispatch_guard_rejects_untrusted_refs_and_bot_recursion():
+    workflow = load_workflow(WORKFLOWS / "allocate-release-version.yml")
+    guard = workflow["jobs"]["allocate"]["if"]
+
+    def allows(ref, actor):
+        expression = guard.replace("github.ref", repr(ref)).replace(
+            "github.actor", repr(actor)
+        )
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        return bool(eval(expression, {"__builtins__": {}}, {}))
+
+    assert allows("refs/heads/main", "release-operator")
+    assert not allows("refs/heads/feature/untrusted", "release-operator")
+    assert not allows("refs/heads/release/v2.3.6", "release-operator")
+    assert not allows("refs/tags/v2.3.6", "release-operator")
+    assert not allows("refs/heads/main", "github-actions[bot]")
+
+
+def test_version_allocator_is_serialized_retry_safe_and_explicitly_dispatches_checks():
+    workflow = load_workflow(WORKFLOWS / "allocate-release-version.yml")
+    text = (WORKFLOWS / "allocate-release-version.yml").read_text(encoding="utf-8")
+
+    assert workflow["on"]["push"] == {
+        "branches": ["main"],
+        "paths": ["addon.py", "resources/**"],
+    }
+    assert workflow["concurrency"] == {
+        "group": "gronkhtv-version-allocation",
+        "cancel-in-progress": "false",
+    }
+    assert workflow["jobs"]["allocate"]["if"] == (
+        "github.ref == 'refs/heads/main' && "
+        "github.actor != 'github-actions[bot]'"
+    )
+    assert workflow["permissions"] == {
+        "actions": "write",
+        "contents": "write",
+        "pull-requests": "write",
+    }
+    assert "scripts/release_version.py --released-ref \"$released_tag\" --apply" in text
+    assert "git ls-remote --exit-code --heads" in text
+    assert "Existing candidate branch has different version bytes" in text
+    assert "gh workflow run addon-validations.yml" in text
+    assert '-f candidate_sha="$candidate_sha"' in text
+    assert "gh pr list --base main" in text
 
 
 def test_addon_validations_runs_full_pytest_suite():
@@ -100,103 +144,51 @@ def test_addon_validations_runs_full_pytest_suite():
 
 def test_release_retries_when_exact_version_asset_is_missing():
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
-    version = workflow_step(make_release, "Get version and check tag")
-    changelog = workflow_step(make_release, "Get Changelog")
-    create_zip = workflow_step(make_release, "Create Zip")
-    create_release = workflow_step(make_release, "Create Release")
-    retry_condition = (
-        "if: steps.version.outputs.tag_exists == 'false' || "
-        "steps.version.outputs.asset_exists == 'false'"
-    )
-
-    assert "filename=${{ github.event.repository.name }}-${version}.zip" in version
-    assert 'gh api "repos/${{ github.repository }}/releases/tags/v$version"' in version
-    assert 'grep -Fxq -- "$filename"' in version
-    assert 'echo "asset_exists=true" >> "$GITHUB_OUTPUT"' in version
-    assert 'echo "asset_exists=false" >> "$GITHUB_OUTPUT"' in version
-    assert retry_condition in changelog
-    assert retry_condition in create_zip
-    assert "scripts/build_release.py" in create_zip
-    assert "filename=${{ steps.version.outputs.filename }}" in create_zip
-    assert retry_condition in create_release
-    assert 'files: "${{ steps.create-zip.outputs.filename }}"' in create_release
-    assert "fail_on_unmatched_files: true" in create_release
+    publish = workflow_step(make_release, "Publish or verify immutable release")
+    assert 'gh release view "$tag"' in publish
+    assert 'gh release download "$tag" --pattern "$ASSET_NAME"' in publish
+    assert 'test "$(sha256sum "$tmp"' in publish
+    assert 'gh release upload "$tag" "$ASSET_NAME"' in publish
+    assert 'gh release create "$tag" "$ASSET_NAME" --verify-tag' in publish
 
 
 def test_release_validates_addon_before_version_or_filename_output():
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
-    version = workflow_step(make_release, "Get version and check tag")
-    parser_call = "from scripts.build_release import parse_addon_xml"
-
-    assert parser_call in version
-    assert "string(/addon/@version)" not in version
-    parser_index = version.index(parser_call)
-    filename_index = version.index("filename=${{ github.event.repository.name }}-${version}.zip")
-    version_output_index = version.index(
-        'echo "version=$version" >> "$GITHUB_OUTPUT"'
-    )
-    filename_output_index = version.index(
-        'echo "filename=$filename" >> "$GITHUB_OUTPUT"'
-    )
-    assert "$GITHUB_OUTPUT" not in version[:parser_index]
-    assert parser_index < filename_index < version_output_index < filename_output_index
+    verify = workflow_step(make_release, "Verify package identity and digest")
+    assert "scripts/build_release.py --verify-only" in verify
+    assert "parse_addon_xml" in verify
+    assert 'test "$source_version" = "$VERSION"' in verify
+    assert 'test "$ASSET_NAME" = "plugin.video.gronkhtv-${VERSION}.zip"' in verify
 
 
 def test_release_finishes_with_exact_asset_verification():
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
-    create_release = workflow_step(make_release, "Create Release")
-    verify = workflow_step(make_release, "Verify release asset")
-
-    assert make_release.index(create_release) < make_release.index(verify)
-    assert "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in verify
-    assert (
-        'gh api "repos/${{ github.repository }}/releases/tags/'
-        'v${{ steps.version.outputs.version }}"' in verify
-    )
-    assert "--jq '.assets[].name'" in verify
-    assert 'grep -Fxq -- "${{ steps.version.outputs.filename }}"' in verify
-    assert "steps.create-zip.outputs.filename" not in verify
-    assert make_release.rstrip().endswith(verify.rstrip())
+    publish = workflow_step(make_release, "Publish or verify immutable release")
+    assert "EXPECTED_SHA256" in publish
+    assert "VALIDATED_SHA" in publish
+    assert "gh release download" in publish
 
 
 def test_release_builds_zip_before_tag_creation():
-    """Verify workflow order: Create Zip -> Verify Zip -> Check tag -> Create tag -> Create Release -> Verify asset."""
+    """Validated artifact verification precedes immutable tag/release publication."""
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
-
-    # Find step indices
-    create_zip_idx = make_release.index("      - name: Create Zip\n")
-    verify_zip_idx = make_release.index("      - name: Verify Zip\n")
-    check_tag_idx = make_release.index("      - name: Check tag points to current commit (retry safety)\n")
-    create_tag_idx = make_release.index("      - name: Create and push tag\n")
-    create_release_idx = make_release.index("      - name: Create Release\n")
-    verify_asset_idx = make_release.index("      - name: Verify release asset\n")
-
-    # Order: Create Zip -> Verify Zip -> Check tag -> Create tag -> Create Release -> Verify asset
-    assert create_zip_idx < verify_zip_idx, "Create Zip must come before Verify Zip"
-    assert verify_zip_idx < check_tag_idx, "Verify Zip must come before Check tag"
-    assert check_tag_idx < create_tag_idx, "Check tag must come before Create tag"
-    assert create_tag_idx < create_release_idx, "Create tag must come before Create Release"
-    assert create_release_idx < verify_asset_idx, "Create Release must come before Verify asset"
+    download = make_release.index("      - name: Download exact validated package\n")
+    verify = make_release.index("      - name: Verify package identity and digest\n")
+    publish = make_release.index("      - name: Publish or verify immutable release\n")
+    assert download < verify < publish
 
 
 def test_release_has_exact_head_check_for_retry():
-    """On retry with existing tag but missing asset, fail unless tag points to current commit."""
+    """On retry, an existing tag must resolve to the exact validated commit."""
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
-
-    # Check for the exact-head check step
-    assert "Check tag points to current commit (retry safety)" in make_release
-    assert "tag_sha=$(git rev-parse" in make_release
-    assert 'if [ "$tag_sha" != "${{ github.sha }}" ]; then' in make_release
-    assert "Refusing to attach asset built from different commit" in make_release
-    assert "exit 1" in make_release
+    assert 'test "$(git rev-parse "${tag}^{commit}")" = "$VALIDATED_SHA"' in make_release
 
 
 def test_release_quotes_output_path():
-    """Output path in Create Zip must be quoted: \"${GITHUB_WORKSPACE}/${filename}\"."""
+    """The exact artifact path is quoted for validation and release."""
     make_release = (WORKFLOWS / "make-release.yml").read_text(encoding="utf-8")
-
-    create_zip_step = workflow_step(make_release, "Create Zip")
-    assert '"${GITHUB_WORKSPACE}/${filename}"' in create_zip_step
+    verify = workflow_step(make_release, "Verify package identity and digest")
+    assert '--output "$ASSET_NAME"' in verify
 
 
 def test_validated_package_contains_only_runtime_files(tmp_path):
@@ -269,19 +261,16 @@ def test_evidence_json_roundtrip_matches_notifier_schema():
     assert "package filename does not match configured identity" in source
 
 
-def test_addon_validations_calls_pinned_package_only_for_develop_push():
+def test_addon_validations_packages_main_push_or_exact_dispatched_candidate():
     text = (WORKFLOWS / "addon-validations.yml").read_text(encoding="utf-8")
     workflow = load_workflow(WORKFLOWS / "addon-validations.yml")
     package = workflow["jobs"]["package"]
 
-    assert workflow["on"] == {
-        "push": {"branches": ["main", "develop"]},
-        "pull_request": {"branches": ["main", "develop"]},
-    }
+    assert set(workflow["on"]) == {"push", "pull_request", "workflow_dispatch"}
+    assert workflow["on"]["workflow_dispatch"]["inputs"]["candidate_sha"]["required"] == "true"
     assert package["needs"] == "addon-validations"
-    assert package["if"] == (
-        "github.event_name == 'push' && github.ref == 'refs/heads/develop'"
-    )
+    assert "refs/heads/main" in package["if"]
+    assert "inputs.candidate_sha == github.sha" in package["if"]
     assert package["uses"] == PACKAGE_WORKFLOW
     assert package["permissions"] == {"contents": "read", "id-token": "write"}
     assert package["with"] == {
@@ -344,7 +333,7 @@ def test_local_notifier_is_a_strict_pinned_reusable_wrapper():
         "validation_workflow": "Add-on Validations",
         "validation_workflow_path": ".github/workflows/addon-validations.yml",
         "validation_event": "${{ inputs.validation_event }}",
-        "expected_branch": "develop",
+        "expected_branch": "main",
         "addon_id": "${{ inputs.addon_id }}",
         "addon_version": "${{ inputs.addon_version }}",
         "asset_name": "${{ inputs.asset_name }}",
@@ -484,7 +473,8 @@ def test_pinned_notifier_owns_pagination_identity_and_metadata_only_payload():
     )
     assert "validation workflow path must be a canonical API path" in source
     assert "validation event must be push or workflow_dispatch" in source
-    assert "expected branch must be develop" in source
+    assert "SOURCE_BRANCHES" in source
+    assert '"Serph91P/plugin.video.gronkhtv": "main"' in source
     assert "configured add-on ID is invalid" in source
     assert "configured add-on version is invalid" in source
     assert "package filename does not match configured identity" in source
@@ -507,11 +497,12 @@ def test_publication_decoupled_from_validations_run():
     assert (
         "github.event.workflow_run.event == 'push'" in publication_wf
     )
-    assert "github.event.workflow_run.head_branch == 'develop'" in publication_wf
+    assert "github.event.workflow_run.head_branch == 'main'" in publication_wf
     assert "workflow_run" not in publication["on"].get("push", {})
     assert "workflow_run" not in publication["on"].get("pull_request", {})
 
     notify_call = publication["jobs"]["notify"]
+    assert notify_call["needs"] == ["extract", "release"]
     assert notify_call["uses"] == "./.github/workflows/notify-repository.yml"
     assert notify_call["with"]["validation_run_id"] == (
         "${{ github.event.workflow_run.id }}"

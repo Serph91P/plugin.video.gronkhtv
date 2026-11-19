@@ -7,6 +7,7 @@ import xbmcplugin
 from urllib.request import build_opener, install_opener
 import json
 import math
+import threading
 from functools import lru_cache
 import time
 import xbmcvfs
@@ -14,6 +15,12 @@ import os
 import inputstreamhelper
 
 from account import AuthenticationError, GronkhTVSession, SessionError
+from account.progress import ProgressClient
+from account.progress_sync import ProgressSync
+from account.session import verified_user
+from account.operation_lock import progress_operation
+from account.resume_start import ResumeStartController
+from account.sync_store import SyncStore
 from context_menu import (
     chapter_label,
     details_label,
@@ -22,6 +29,13 @@ from context_menu import (
     resume_label,
 )
 from gronkhtv_api import (
+    API_BASE,
+    catalog_playlist_path,
+    catalog_seasons,
+    catalog_series,
+    catalog_tags,
+    catalog_video_by_id,
+    catalog_videos,
     category_videos,
     configure_account_session,
     discovery,
@@ -31,6 +45,7 @@ from gronkhtv_api import (
     search_videos,
     video_by_episode,
 )
+from gronkhtv_api import non_negative_seconds as _non_negative_finite
 from live import twitch_plugin_entries, twitch_plugin_url
 from playback import configure_authenticated_hls
 from resume_store import is_completed, read_record, remove_record, write_record
@@ -60,7 +75,6 @@ _CATEGORIES = [
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _SEARCH_PAGE_SIZE = 20
-_MAX_CHAPTER_ROUTE_OFFSET = 31536000
 
 # Addon data paths
 _ADDON_DATA = xbmcvfs.translatePath(
@@ -70,13 +84,35 @@ _RESUME_DIR = os.path.join(_ADDON_DATA, "resume_points")
 _WATCHED_DIR = os.path.join(_ADDON_DATA, "watched_episodes")
 _FAVORITES_FILE = os.path.join(_ADDON_DATA, "favorites.json")
 _ACCOUNT_COOKIE_FILE = os.path.join(_ADDON_DATA, "account", "cookies.txt")
+_PROGRESS_SYNC_FILE = os.path.join(_ADDON_DATA, "account", "progress-sync.sqlite3")
+
+
+def _sync_account_indicator_from_storage():
+    """Initialize the settings UI from the persisted session marker.
+
+    Kodi may open add-on settings without routing through ``handle_open_settings``.
+    A cookie file is therefore the only local, non-blocking startup signal that
+    can keep Logout reachable until the session is validated by a controller.
+    """
+    session_present = os.path.exists(_ACCOUNT_COOKIE_FILE)
+    _addon.setSetting("account_session_present", "true" if session_present else "false")
+    # A persisted cookie makes account controls available, but is not proof that
+    # the backend still accepts the session.
+    _addon.setSetting("account_logged_in", "false")
+    # Never display an old account name while the saved cookie is unverified.
+    _addon.setSetting("account_status", _addon.getLocalizedString(30228 if session_present else 30209))
+
+
 _account_session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
 configure_account_session(
     _account_session if os.path.exists(_ACCOUNT_COOKIE_FILE) else None
 )
+_sync_account_indicator_from_storage()
 
 chapter_cache = {}
 video_info_cache = {}
+_PLAYBACK_GENERATION = 0
+_LEGACY_LOOKUP_SEMAPHORE = threading.BoundedSemaphore(value=1)
 
 
 @lru_cache(maxsize=100)
@@ -214,7 +250,7 @@ def get_playlist_url(episode):
     return playlist_url_for_episode(episode)
 
 
-def _configure_authenticated_playback(list_item, playlist_url):
+def _configure_authenticated_playback(list_item, playlist_url, *, require_cookie=False):
     if not _setting_enabled("use_account_playlists", True):
         return False
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
@@ -229,6 +265,8 @@ def _configure_authenticated_playback(list_item, playlist_url):
         return False
 
     headers = _account_session.request_headers(playlist_url)
+    if require_cookie and not headers.get("Cookie"):
+        raise AuthenticationError("GronkhTV playback cookie is unavailable")
     configure_authenticated_hls(list_item, headers, helper.inputstream_addon)
     return True
 
@@ -265,6 +303,211 @@ def _set_account_status(status):
     _addon.setSetting("account_status", status)
 
 
+def _account_progress_enabled():
+    return _setting_enabled("sync_watch_progress") and os.path.exists(_ACCOUNT_COOKIE_FILE)
+
+
+def _session_file_identity():
+    try:
+        stat = os.stat(_ACCOUNT_COOKIE_FILE)
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    except OSError:
+        return None
+
+
+def _account_progress_sync():
+    """Bind a private API snapshot to a freshly validated account, not SQLite."""
+    if not _account_progress_enabled():
+        return None
+    try:
+        identity = _session_file_identity()
+        session = GronkhTVSession(_ACCOUNT_COOKIE_FILE)
+        user = session.current_user(timeout=2)
+        account_id = _account_id(user)
+        if identity is None or account_id is None or _session_file_identity() != identity:
+            return None
+        return ProgressSync(
+            SyncStore(_PROGRESS_SYNC_FILE), ProgressClient(session), account_id,
+            is_active=lambda: _account_progress_enabled() and _session_file_identity() == identity,
+        )
+    except Exception as exc:
+        xbmc.log(f"[Gronkh.tv] Account progress unavailable ({type(exc).__name__})", xbmc.LOGWARNING)
+        return None
+
+
+def _account_id(user):
+    if not isinstance(user, dict):
+        return None
+    account_id = user.get("id")
+    if isinstance(account_id, bool):
+        return None
+    if isinstance(account_id, int):
+        return str(account_id)
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id
+    return None
+
+
+def _account_resume_offset(progress_sync, video_id, local_offset, explicit_offset=None, duration=0):
+    """Only a server GET can supply account resume, never a private fallback."""
+    if explicit_offset is not None:
+        return explicit_offset
+    if progress_sync is None or not video_id:
+        return 0 if _account_progress_enabled() else local_offset
+    result = ResumeStartController(progress_sync, video_id).resolve(
+        local_offset=0,
+        timeout_seconds=3,
+        aborted=xbmc.Monitor().abortRequested,
+    )
+    return 0 if _account_watched(result, duration) else result.get("offset") or 0
+
+
+def _account_watched(progress, duration):
+    """Project server state onto Kodi's user-approved 95% watched indicator."""
+    return progress.get("state") == "valid" and (
+        progress.get("marked_as_watched") is True
+        or is_completed({"position": progress.get("offset"), "duration": duration})
+    )
+
+
+def _listing_account_progress(videos, timeout_seconds=2.25, maximum_reads=None):
+    """Read this page's account state with four workers and a shared deadline.
+
+    The progress adapter has a per-request timeout; this additional shared
+    deadline prevents a long page from serially blocking Kodi's directory
+    renderer. Only the authenticated coordinator is used here. Reads are
+    transient; there is no local account-progress cache or upload from browsing.
+    """
+    progress_sync = _account_progress_sync()
+    if progress_sync is None:
+        return {}
+    deadline = time.monotonic() + timeout_seconds
+    candidates = []
+    attempted_items = 0
+    for video in videos:
+        if (maximum_reads is not None and attempted_items >= maximum_reads) or time.monotonic() >= deadline:
+            break
+        if not isinstance(video, dict):
+            continue
+        episode = video.get("episode")
+        if episode is None:
+            continue
+        attempted_items += 1
+        video_id = video.get("id")
+        if not video_id:
+            # Legacy metadata has only an episode number.  Keep its lookup out
+            # of the renderer thread, wait no longer than the shared budget,
+            # and permit only one outstanding lookup across list renders.
+            if not _LEGACY_LOOKUP_SEMAPHORE.acquire(blocking=False):
+                break
+            lookup_done = threading.Event()
+            resolved = [None]
+
+            def resolve_legacy_id():
+                try:
+                    info = get_video_info(episode)
+                    if isinstance(info, dict):
+                        resolved[0] = info.get("id")
+                except Exception:
+                    pass
+                finally:
+                    _LEGACY_LOOKUP_SEMAPHORE.release()
+                    lookup_done.set()
+
+            threading.Thread(target=resolve_legacy_id, daemon=True).start()
+            lookup_done.wait(max(0, deadline - time.monotonic()))
+            if not lookup_done.is_set() or time.monotonic() >= deadline:
+                break
+            video_id = resolved[0]
+        if video_id and time.monotonic() < deadline:
+            candidates.append((episode, video_id))
+    results = {}
+    lock = threading.Lock()
+    done = threading.Event()
+    work = iter(candidates)
+    remaining = [min(4, len(candidates))]
+
+    def read():
+        try:
+            while time.monotonic() < deadline:
+                with lock:
+                    candidate = next(work, None)
+                if candidate is None:
+                    return
+                episode, video_id = candidate
+                try:
+                    result = progress_sync.prepare_playback(video_id)
+                except Exception:
+                    continue
+                with lock:
+                    if time.monotonic() < deadline and result.get("state") in {"valid", "absent"}:
+                        results[episode] = result
+        finally:
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    done.set()
+
+    for _ in range(remaining[0]):
+        threading.Thread(target=read, daemon=True).start()
+    if candidates:
+        done.wait(max(0, deadline - time.monotonic()))
+    with lock:
+        return dict(results)
+
+
+def _playback_sync_context(episode):
+    """Return the immutable sync queue and backend identifier for one play."""
+    progress_sync = _account_progress_sync()
+    if progress_sync is None:
+        return None, None
+    try:
+        info = get_video_info(episode)
+    except Exception as exc:
+        xbmc.log(f"[Gronkh.tv] Could not resolve backend video for sync: {exc}", xbmc.LOGWARNING)
+        return None, None
+    video_id = info.get("id") if isinstance(info, dict) else None
+    return progress_sync, video_id
+
+
+def _monitor_episode(episode, progress_sync, video_id):
+    """Keep guest playback on its legacy monitor call shape."""
+    if progress_sync is not None and video_id:
+        return monitor_playback(episode, progress_sync=progress_sync, video_id=video_id)
+    return monitor_playback(episode)
+
+
+def _account_playback_event(previous, current, duration, speed):
+    """Classify explicit player state without inventing completion metadata."""
+    if speed == 0:
+        return "pause"
+    if previous is not None and abs(current - previous) > 5:
+        return "seek"
+    return "tick"
+
+
+def _player_speed(player):
+    """Kodi versions without getSpeed are treated as normally playing."""
+    getter = getattr(player, "getSpeed", None)
+    if getter is None:
+        return 1
+    try:
+        return getter()
+    except Exception:
+        return 1
+
+
+def _begin_playback_generation():
+    """Invalidate every older monitor before assigning a new media identity."""
+    global _PLAYBACK_GENERATION
+    _PLAYBACK_GENERATION += 1
+    return _PLAYBACK_GENERATION
+
+
+def _is_current_playback_generation(generation):
+    return generation == _PLAYBACK_GENERATION
+
+
 def _page_from_offset(offset):
     try:
         offset = int(offset)
@@ -298,7 +541,7 @@ def get_videos(category, offset=0, search_str="", game_id=None):
                 if search_str != ""
                 else xbmcgui.Dialog().input("Suche", type=xbmcgui.INPUT_ALPHANUM)
             )
-        videos = search_videos(query=search_query)
+        videos = search_videos(query=search_query, page=_page_from_offset(offset))
     elif category == _CATEGORIES[6]:  # Favoriten
         videos = get_favorites()
     return videos, search_query if category == _CATEGORIES[3] else ""
@@ -337,6 +580,7 @@ def list_categories():
         is_folder = True
         xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, is_folder)
 
+    _videothek_folder(_addon.getLocalizedString(30300), "videothek")
     xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
     xbmcplugin.endOfDirectory(_HANDLE)
 
@@ -456,18 +700,30 @@ def list_live_streams():
     xbmcplugin.endOfDirectory(_HANDLE)
 
 
-def _read_account_user():
+def _read_account_user(timeout=None):
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
         return None
+    identity = _session_file_identity()
     try:
-        user = _account_session.current_user()
+        user = (
+            _account_session.current_user(timeout=timeout)
+            if timeout is not None
+            else _account_session.current_user()
+        )
+        user = verified_user(user)
     except (AuthenticationError, SessionError):
-        _account_session.clear()
+        # Keep persisted credentials available for an explicit retry or Logout.
+        # Rendering/opening account controls must never destroy session data.
         configure_account_session(None)
+        _addon.setSetting("account_session_present", "true")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30210))
+        return None
+
+    if not os.path.exists(_ACCOUNT_COOKIE_FILE) or _session_file_identity() != identity:
         return None
 
     name = _account_name(user)
@@ -476,6 +732,7 @@ def _read_account_user():
         if name
         else _addon.getLocalizedString(30211)
     )
+    _addon.setSetting("account_session_present", "true")
     _addon.setSetting("account_logged_in", "true")
     _set_account_status(status)
     return user
@@ -518,6 +775,11 @@ def list_account():
             "account_login",
             "DefaultAddonService.png",
         )
+        _add_account_entry(
+            _addon.getLocalizedString(30205),
+            "account_logout",
+            "DefaultAddonService.png",
+        )
     _add_account_entry(
         _addon.getLocalizedString(30212),
         "open_settings",
@@ -551,6 +813,8 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         return
 
     videos, query = get_videos(category, offset, search_str, game_id)
+    account_progress = _listing_account_progress(videos)
+    account_mode = _account_progress_enabled()
 
     for video in videos:
         list_item = xbmcgui.ListItem(label=video["title"])
@@ -590,10 +854,18 @@ def list_videos(category, offset=0, search_str="", game_id=None):
                 games_in_stream.append(game.get("title"))
 
         # Kontextmenü für Resume hinzufügen
-        resume_record = get_resume_record(ep, legacy_duration=video_duration)
-        resume_point = resume_record["position"] if resume_record else 0
-        resume_duration = resume_record["duration"] if resume_record else video_duration
-        watched = is_watched(ep)
+        if account_mode:
+            remote = account_progress.get(ep, {})
+            resume_point = remote.get("offset") or 0
+            resume_duration = video_duration
+            watched = _account_watched(remote, video_duration)
+            if watched:
+                resume_point = 0
+        else:
+            resume_record = get_resume_record(ep, legacy_duration=video_duration)
+            resume_point = resume_record["position"] if resume_record else 0
+            resume_duration = resume_record["duration"] if resume_record else video_duration
+            watched = is_watched(ep)
         if resume_point > 60:  # Nur anzeigen wenn mehr als 1 Minute geschaut
             cm.insert(
                 0,
@@ -610,6 +882,18 @@ def list_videos(category, offset=0, search_str="", game_id=None):
                 ),
             )
 
+        if account_mode and not watched:
+            cm.append((
+                _addon.getLocalizedString(30227),
+                f"RunPlugin(plugin://plugin.video.gronkhtv/?action=mark_watched&episode={ep})",
+            ))
+
+        if account_mode and ((remote.get("offset") or 0) > 0 or watched):
+            cm.append((
+                _addon.getLocalizedString(30232),
+                f"RunPlugin(plugin://plugin.video.gronkhtv/?action=reset_resume&episode={ep})",
+            ))
+
         # Favoriten-Menü
         if is_favorite(ep):
             cm.append(
@@ -623,6 +907,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
             video_json = quote_plus(
                 json.dumps(
                     {
+                        "id": video.get("id"),
                         "episode": ep,
                         "title": video["title"],
                         "preview_url": preview_url,
@@ -653,7 +938,8 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         # Tags als Genres nutzen
         tags = video.get("tags", [])
         genres = ["Streams und Let's Plays"] + [
-            t.get("title", "") for t in tags if t.get("title")
+            t["title"] for t in tags
+            if isinstance(t, dict) and isinstance(t.get("title"), str) and t["title"]
         ]
 
         # Erweiterter Plot mit mehr Infos (ohne Emojis für Kodi-Kompatibilität)
@@ -661,6 +947,8 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         duration_str = seconds_to_time(video.get("video_length", 0))
 
         plot_parts = []
+        if account_mode and not remote:
+            plot_parts.append(_addon.getLocalizedString(30231))
         if views:
             plot_parts.append(f"Aufrufe: {views:,}")
         plot_parts.append(f"Dauer: {duration_str}")
@@ -687,7 +975,7 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         tag.setPremiered(video.get("created_at", ""))
         tag.setFirstAired(video.get("created_at", ""))
         tag.setPlot(plot)
-        tag.setPlaycount(1 if watched or resume_point > 0 else 0)
+        tag.setPlaycount(1 if watched or (not account_mode and resume_point > 0) else 0)
 
         # Resume-Fortschritt setzen für Fortschrittsbalken
         if resume_point > 0:
@@ -697,15 +985,17 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         url = get_url(action="play", video=video["episode"])
         xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, False)
 
-    if (
-        category == _CATEGORIES[2]
-        and len(videos) == _SEARCH_PAGE_SIZE
-        and videos[-1]["episode"] != 1
+    has_more = getattr(videos, "has_more", None)
+    if category == _CATEGORIES[2] and (
+        has_more or (has_more is None and len(videos) == _SEARCH_PAGE_SIZE and videos[-1]["episode"] != 1)
     ):
         add_more_item(category, offset)
     elif category == _CATEGORIES[3]:
-        handle_search_results(videos, query)
-    elif game_id and len(videos) == _SEARCH_PAGE_SIZE:
+        if has_more:
+            add_more_item(category, offset, query)
+        if videos or not has_more:
+            handle_search_results(videos, query)
+    elif game_id and (has_more or (has_more is None and len(videos) == _SEARCH_PAGE_SIZE)):
         add_more_game_item(game_id, category, offset)
     elif category == _CATEGORIES[6] and not videos:
         # Leere Favoriten-Liste
@@ -717,17 +1007,20 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         xbmcplugin.addDirectoryItem(_HANDLE, "", list_item, False)
 
     xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
-    xbmcplugin.endOfDirectory(_HANDLE)
+    if account_mode:
+        xbmcplugin.endOfDirectory(_HANDLE, cacheToDisc=False)
+    else:
+        xbmcplugin.endOfDirectory(_HANDLE)
 
 
-def add_more_item(category, offset):
+def add_more_item(category, offset, query=""):
     list_item = xbmcgui.ListItem(label="... mehr")
     tag = list_item.getVideoInfoTag()
     tag.setTitle("... mehr")
     tag.setGenres(["Streams und Let's Plays"])
     tag.setMediaType("video")
     url = get_url(
-        action="listing", category=category, offset=int(offset) + _SEARCH_PAGE_SIZE
+        action="listing", category=category, offset=int(offset) + _SEARCH_PAGE_SIZE, search_str=query
     )
     xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, True)
 
@@ -852,8 +1145,13 @@ def play_video(path, episode, start_offset=0):
     tag.setEpisode(int(episode))
     tag.setMediaType("video")
 
-    resume_record = get_resume_record(episode, legacy_duration=video_length)
+    progress_sync = _account_progress_sync()
+    account_mode = progress_sync is not None or _account_progress_enabled()
+    resume_record = None if account_mode else get_resume_record(episode, legacy_duration=video_length)
     resume_point = resume_record["position"] if resume_record else 0
+    backend_video_id = info.get("id") if isinstance(info, dict) else None
+    if start_offset == 0 and progress_sync is not None and backend_video_id:
+        resume_point = _account_resume_offset(progress_sync, backend_video_id, resume_point, duration=video_length)
     xbmc.log(f"[Gronkh.tv] Resume point: {resume_point}", xbmc.LOGINFO)
 
     # Start-Offset (für Kapitel-Sprung oder Resume)
@@ -865,11 +1163,38 @@ def play_video(path, episode, start_offset=0):
     xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=play_item)
 
     # Playback überwachen und ggf. nächste Episode starten
-    monitor_playback(episode, next_episode)
+    monitor_playback(
+        episode,
+        next_episode,
+        progress_sync=progress_sync,
+        video_id=backend_video_id,
+    )
 
 
-def monitor_playback(episode, next_episode=None):
+def monitor_playback(
+    episode, next_episode=None, progress_sync=None, video_id=None, generation=None
+):
+    if progress_sync is not None or _account_progress_enabled():
+        while True:
+            with progress_operation(_PROGRESS_SYNC_FILE) as acquired:
+                if acquired:
+                    return _monitor_playback(episode, next_episode, progress_sync, video_id, generation)
+            if xbmc.Monitor().waitForAbort(0.1):
+                return
+    return _monitor_playback(episode, next_episode, progress_sync, video_id, generation)
+
+
+def _monitor_playback(
+    episode, next_episode=None, progress_sync=None, video_id=None, generation=None
+):
     """Überwacht die Wiedergabe, speichert Fortschritt und startet ggf. nächste Episode"""
+    global _PLAYBACK_GENERATION
+    if generation is None:
+        generation = _begin_playback_generation()
+    elif generation > _PLAYBACK_GENERATION:
+        _PLAYBACK_GENERATION = generation
+    if not _is_current_playback_generation(generation):
+        return
     player = xbmc.Player()
     monitor = xbmc.Monitor()
 
@@ -883,27 +1208,59 @@ def monitor_playback(episode, next_episode=None):
         xbmc.log("[Gronkh.tv] Playback did not start", xbmc.LOGWARNING)
         return
 
+    try:
+        media_path = player.getPlayingFile()
+    except (AttributeError, RuntimeError):
+        media_path = None
     latest = None
+    previous_position = None
     next_save = time.monotonic() + 5
+    was_paused = False
+    account_mode = progress_sync is not None or _account_progress_enabled()
 
     try:
         while player.isPlayingVideo() and not monitor.abortRequested():
+            if not _is_current_playback_generation(generation):
+                return
             try:
+                if media_path and player.getPlayingFile() != media_path:
+                    return
                 current_time = _non_negative_finite(player.getTime(), "player time")
                 total_time = _non_negative_finite(
                     player.getTotalTime(), "player duration"
                 )
-                if latest is None or current_time > 0 or latest["position"] == 0:
-                    if latest and total_time == 0 and latest["duration"] > 0:
-                        total_time = latest["duration"]
-                    latest = {"position": current_time, "duration": total_time}
+                if latest and total_time == 0 and latest["duration"] > 0:
+                    total_time = latest["duration"]
+                latest = {"position": current_time, "duration": total_time}
 
+                event = _account_playback_event(
+                    previous_position,
+                    current_time,
+                    total_time,
+                    _player_speed(player),
+                )
+                previous_position = current_time
                 now = time.monotonic()
-                if latest and now >= next_save:
+                if latest and not account_mode and now >= next_save:
                     save_resume_point(
                         episode, latest["position"], latest["duration"]
                     )
                     next_save = now + 5
+                if (
+                    latest
+                    and progress_sync is not None
+                    and video_id
+                    and event == "pause" and not was_paused
+                ):
+                    state = progress_sync.record_position(
+                        video_id,
+                        latest["position"],
+                        latest["duration"],
+                        event=event,
+                    )
+                    if state != "synchronized":
+                        xbmc.log(f"[Gronkh.tv] Account progress upload: {state}", xbmc.LOGWARNING)
+                was_paused = event == "pause"
             except Exception as exc:
                 xbmc.log(
                     f"[Gronkh.tv] Error in playback monitor: {exc}",
@@ -912,16 +1269,40 @@ def monitor_playback(episode, next_episode=None):
             if monitor.waitForAbort(1):
                 break
     finally:
-        if latest:
-            save_resume_point(episode, latest["position"], latest["duration"])
-            xbmc.log(
-                "[Gronkh.tv] Final resume point saved: "
-                f"{latest['position']}/{latest['duration']}",
-                xbmc.LOGINFO,
-            )
+        if latest and _is_current_playback_generation(generation):
+            if not account_mode:
+                save_resume_point(episode, latest["position"], latest["duration"])
+            if progress_sync is not None and video_id:
+                try:
+                    state = progress_sync.record_position(
+                        video_id,
+                        latest["position"],
+                        latest["duration"],
+                        event="stop",
+                    )
+                    if state == "synchronized":
+                        progress_sync.flush_pending(exclude_video_id=video_id)
+                        xbmc.executebuiltin("Container.Refresh")
+                    else:
+                        xbmc.log(f"[Gronkh.tv] Account progress upload: {state}", xbmc.LOGWARNING)
+                except Exception as exc:
+                    xbmc.log(
+                        f"[Gronkh.tv] Could not queue account progress: {exc}",
+                        xbmc.LOGWARNING,
+                    )
+            if not account_mode:
+                xbmc.log(
+                    "[Gronkh.tv] Final local resume point saved: "
+                    f"{latest['position']}/{latest['duration']}", xbmc.LOGINFO,
+                )
 
     # Prüfen ob Video zu Ende geschaut wurde (95%+)
-    if latest and latest["duration"] > 0 and latest["position"] > 0:
+    if (
+        latest
+        and _is_current_playback_generation(generation)
+        and latest["duration"] > 0
+        and latest["position"] > 0
+    ):
         progress = (latest["position"] / latest["duration"]) * 100
         if progress >= 95 and next_episode and next_episode.get("episode"):
             # Automatisch nächste Episode fragen
@@ -938,12 +1319,32 @@ def monitor_playback(episode, next_episode=None):
                 xbmc.log(
                     f"[Gronkh.tv] Auto-playing next episode: {next_ep}", xbmc.LOGINFO
                 )
+                next_info = get_video_info(next_ep)
+                if not isinstance(next_info, dict):
+                    xbmc.log(
+                        "[Gronkh.tv] Cannot auto-play without backend video metadata",
+                        xbmc.LOGWARNING,
+                    )
+                    return
+                next_video_id = next_info.get("id")
+                if not next_video_id:
+                    xbmc.log(
+                        "[Gronkh.tv] Cannot auto-play without a backend video identity",
+                        xbmc.LOGWARNING,
+                    )
+                    return
                 next_url = get_playlist_url(next_ep)
                 _play_direct(next_url, player)
 
                 # Warten bis nächste Episode startet
                 xbmc.sleep(2000)
-                monitor_playback(next_ep)
+                monitor_playback(
+                    next_ep,
+                    next_info.get("next", {}),
+                    progress_sync=progress_sync,
+                    video_id=next_video_id,
+                    generation=_begin_playback_generation(),
+                )
 
 
 def _resume_path(episode):
@@ -1067,12 +1468,13 @@ def jump_to_chapter(params):
         xbmc.LOGINFO,
     )
     player = xbmc.Player()
+    progress_sync, video_id = _playback_sync_context(episode)
     url = get_playlist_url(episode)
     xbmc.log(f"[Gronkh.tv] Starting playback of {url}", xbmc.LOGINFO)
     _play_direct(url, player)
 
     if _seek_to_offset(player, offset, expected_path=url):
-        monitor_playback(episode)
+        _monitor_episode(episode, progress_sync, video_id)
         return True
     _stop_failed_playback(player)
     _report_seek_failure("Kapitelsprung fehlgeschlagen")
@@ -1088,12 +1490,23 @@ def router(paramstring):
         "play": handle_play,
         "play_resume": handle_play_resume,
         "play_from_start": handle_play_from_start,
+        "mark_watched": handle_mark_watched,
+        "reset_resume": handle_reset_resume,
         "jump_to_chapter": jump_to_chapter,
         "add_favorite": handle_add_favorite,
         "remove_favorite": handle_remove_favorite,
         "show_details": handle_show_details,
         "show_live_stream": handle_show_live_stream,
         "list_game_videos": handle_list_game_videos,
+        "videothek": _videothek_directory,
+        "videothek_videos": _videothek_directory,
+        "videothek_search": _videothek_directory,
+        "videothek_tags": _videothek_directory,
+        "videothek_series": _videothek_directory,
+        "videothek_games": _videothek_directory,
+        "videothek_seasons": _videothek_directory,
+        "videothek_details": _videothek_details,
+        "videothek_play": _videothek_play,
         "account_login": handle_account_login,
         "account_logout": handle_account_logout,
         "account_status": handle_account_status,
@@ -1117,6 +1530,137 @@ def router(paramstring):
         xbmc.log(f"[Gronkh.tv] Traceback: {traceback.format_exc()}", xbmc.LOGERROR)
 
     xbmc.log("[Gronkh.tv] Router finished", xbmc.LOGINFO)
+
+
+def _videothek_folder(label, action, **params):
+    xbmcplugin.addDirectoryItem(_HANDLE, get_url(action=action, **params),
+                                xbmcgui.ListItem(label=label), True)
+
+
+def _videothek_notice(message):
+    xbmcgui.Dialog().notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
+
+
+def _videothek_directory(params):
+    action = params["action"]
+    xbmcplugin.setPluginCategory(_HANDLE, _addon.getLocalizedString(30300))
+    xbmcplugin.setContent(_HANDLE, "videos")
+    succeeded = False
+    try:
+        if action == "videothek":
+            for label, route, arguments in (
+                (30301, "videothek_videos", {}),
+                (30302, "videothek_videos", {"order": "views"}),
+                (30303, "videothek_search", {}),
+                (30304, "videothek_tags", {}),
+                (30305, "videothek_series", {}),
+                (30306, "videothek_games", {}),
+            ):
+                _videothek_folder(_addon.getLocalizedString(label), route, **arguments)
+        elif action == "videothek_tags":
+            for tag, title in catalog_tags():
+                _videothek_folder(title, "videothek_videos", tag=tag)
+        elif action in ("videothek_games", "videothek_series"):
+            rows, more = catalog_series(params.get("page", 1))
+            game = params.get("game")
+            if action == "videothek_games":
+                games = {row["slug"]: row["game"] for row in rows if row["slug"] and row["game"]}
+                for slug, title in games.items():
+                    # Start at page 1: matching series can precede this page.
+                    _videothek_folder(title, "videothek_series", game=slug)
+            else:
+                for row in rows:
+                    if not game or row["slug"] == game:
+                        _videothek_folder(row["title"], "videothek_seasons", series=row["id"])
+            _videothek_more(params, more)
+        elif action == "videothek_seasons":
+            series = params.get("series")
+            for season in catalog_seasons(series):
+                _videothek_folder(season["title"], "videothek_videos", series=series, season=season["id"])
+        else:
+            if action == "videothek_search":
+                query = xbmcgui.Dialog().input(_addon.getLocalizedString(30303), type=xbmcgui.INPUT_ALPHANUM).strip()
+                if not query:
+                    return
+                params = {"action": "videothek_videos", "query": query}
+            _list_videothek_videos(params)
+        succeeded = True
+    except (SessionError, RuntimeError, ValueError):
+        _videothek_notice(30309)
+    finally:
+        xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
+        xbmcplugin.endOfDirectory(_HANDLE, succeeded=succeeded, cacheToDisc=False)
+
+
+def _videothek_more(params, page):
+    if page is not None:
+        _videothek_folder(_addon.getLocalizedString(30307), **dict(params, page=page))
+
+
+def _list_videothek_videos(params):
+    rows, more = catalog_videos(**{key: params[key] for key in ("page", "query", "tag", "order", "series", "season")
+                                   if key in params})
+    for video in rows:
+        video_id = video["id"]
+        item = xbmcgui.ListItem(label=video["title"])
+        item.setProperty("IsPlayable", "true")
+        if video["preview_url"]:
+            item.setArt({"thumb": video["preview_url"]})
+        tag = item.getVideoInfoTag()
+        tag.setTitle(video["title"])
+        tag.setMediaType("video")
+        tag.setDuration(video["video_length"])
+        tag.setPlot(video["series_title"] or video["description"])
+        details = get_url(action="videothek_details", id=video_id)
+        context = [(details_label(), f"RunPlugin({details})")]
+        if video["series_id"]:
+            series_url = get_url(action="videothek_seasons", series=video["series_id"])
+            context.append((_addon.getLocalizedString(30305), f"Container.Update({series_url})"))
+        item.addContextMenuItems(context)
+        xbmcplugin.addDirectoryItem(_HANDLE, get_url(action="videothek_play", id=video_id), item, False)
+    _videothek_more(params, more)
+    if not rows and more is None:
+        _videothek_notice(30308)
+
+
+def _videothek_session():
+    if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        raise AuthenticationError("GronkhTV login required")
+    _account_session.current_user()
+    return _account_session
+
+
+def _videothek_details(params):
+    try:
+        video = catalog_video_by_id(params.get("id"), _videothek_session())
+        details = "\n\n".join(text for text in (video["series_title"], video["description"]) if text)
+        xbmcgui.Dialog().textviewer(video["title"], details)
+    except AuthenticationError:
+        _videothek_notice(30310)
+    except (SessionError, ValueError):
+        _videothek_notice(30309)
+
+
+def _videothek_play(params):
+    try:
+        path = catalog_playlist_path(params.get("id"))
+        session = _videothek_session()
+        video = catalog_video_by_id(params.get("id"), session)
+        url = API_BASE + path
+        item = xbmcgui.ListItem(label=video["title"], path=url)
+        if not _configure_authenticated_playback(item, url, require_cookie=True):
+            _videothek_notice(30311)
+        elif session.request_bytes(path).startswith(b"#EXTM3U"):
+            item.setProperty("IsPlayable", "true")
+            xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=item)
+            return
+        else:
+            _videothek_notice(30309)
+    except AuthenticationError:
+        _videothek_notice(30310)
+    except (SessionError, ValueError, RuntimeError):
+        _videothek_notice(30309)
+    xbmcplugin.setResolvedUrl(_HANDLE, False, listitem=xbmcgui.ListItem())
 
 
 def handle_listing(params):
@@ -1177,6 +1721,11 @@ def handle_show_live_stream(params):
 
 
 def handle_account_login(params=None):
+    existing_user = _read_account_user()
+    if existing_user:
+        xbmc.executebuiltin("Container.Refresh")
+        return
+
     dialog = xbmcgui.Dialog()
     saved_login = _addon.getSetting("account_email")
     login = dialog.input(
@@ -1205,6 +1754,9 @@ def handle_account_login(params=None):
             if not code:
                 _account_session.clear()
                 configure_account_session(None)
+                _addon.setSetting("account_session_present", "false")
+                _addon.setSetting("account_logged_in", "false")
+                _set_account_status(_addon.getLocalizedString(30209))
                 dialog.notification(
                     _plugin,
                     _addon.getLocalizedString(30215),
@@ -1221,6 +1773,7 @@ def handle_account_login(params=None):
             raise AuthenticationError(_addon.getLocalizedString(30216))
         configure_account_session(_account_session)
         _addon.setSetting("account_email", login)
+        _addon.setSetting("account_session_present", "true")
         _addon.setSetting("account_logged_in", "true")
         name = _account_name(result.user)
         status = (
@@ -1238,12 +1791,24 @@ def handle_account_login(params=None):
     except (AuthenticationError, SessionError, ValueError) as exc:
         _account_session.clear()
         configure_account_session(None)
+        _addon.setSetting("account_session_present", "false")
         _addon.setSetting("account_logged_in", "false")
         _set_account_status(_addon.getLocalizedString(30209))
-        xbmc.log(f"[Gronkh.tv] Account login failed: {exc}", xbmc.LOGWARNING)
+        diagnostic = (
+            exc.auth_diagnostic()
+            if isinstance(exc, SessionError)
+            else "unavailable"
+        )
+        xbmc.log(
+            f"[Gronkh.tv] Account login failed: {diagnostic}",
+            xbmc.LOGWARNING,
+        )
+        message = _addon.getLocalizedString(30216)
+        if diagnostic != "unavailable":
+            message = f"{message} ({diagnostic})"
         dialog.notification(
             _plugin,
-            _addon.getLocalizedString(30216),
+            message,
             xbmcgui.NOTIFICATION_ERROR,
         )
 
@@ -1254,10 +1819,16 @@ def handle_account_logout(params=None):
         return
     try:
         _account_session.logout()
-    except SessionError as exc:
-        xbmc.log(f"[Gronkh.tv] Remote logout failed: {exc}", xbmc.LOGWARNING)
-        _account_session.clear()
+    except SessionError:
+        # logout() already removed its old local state before dispatch.
+        xbmc.log("[Gronkh.tv] Remote logout failed", xbmc.LOGWARNING)
+    if os.path.exists(_ACCOUNT_COOKIE_FILE):
+        # A newer invocation saved a session while the old logout was in flight.
+        # Do not erase its cookie or overwrite its confirmed account indicator.
+        xbmc.executebuiltin("Container.Refresh")
+        return
     configure_account_session(None)
+    _addon.setSetting("account_session_present", "false")
     _addon.setSetting("account_logged_in", "false")
     _set_account_status(_addon.getLocalizedString(30209))
     dialog.notification(
@@ -1270,7 +1841,21 @@ def handle_account_logout(params=None):
 
 def handle_account_status(params=None):
     user = _read_account_user()
-    status = _addon.getSetting("account_status") or _addon.getLocalizedString(30209)
+    if not _setting_enabled("sync_watch_progress"):
+        status = _addon.getLocalizedString(30220)
+    elif not user:
+        status = _addon.getLocalizedString(30223)
+    else:
+        try:
+            state = SyncStore(_PROGRESS_SYNC_FILE).display_status(_account_id(user))
+        except Exception:
+            state = "pending"
+        labels = {
+            "synchronized": 30221,
+            "pending": 30222,
+            "authentication_required": 30223,
+        }
+        status = _addon.getLocalizedString(labels.get(state, 30222))
     notification = xbmcgui.NOTIFICATION_INFO if user else xbmcgui.NOTIFICATION_WARNING
     xbmcgui.Dialog().notification(_plugin, status, notification)
 
@@ -1295,33 +1880,115 @@ def handle_list_game_videos(params):
 def handle_play_resume(params):
     """Video an gespeicherter Position fortsetzen"""
     episode = _positive_int(params.get("episode"), "episode")
-    resume_record = get_resume_record(episode)
-    resume_point = resume_record["position"] if resume_record else 0
+    progress_sync, video_id = _playback_sync_context(episode)
+    if progress_sync is not None and video_id:
+        info = get_video_info(episode)
+        duration = info.get("source_length", 0) if isinstance(info, dict) else 0
+        resume_point = _account_resume_offset(progress_sync, video_id, 0, duration=duration)
+    elif _account_progress_enabled():
+        _report_seek_failure("Kontofortschritt nicht verfügbar")
+        return False
+    else:
+        resume_record = get_resume_record(episode)
+        resume_point = resume_record["position"] if resume_record else 0
     url = get_playlist_url(episode)
     player = _play_direct(url)
 
-    if resume_point > 0 and _seek_to_offset(
-        player, resume_point, expected_path=url
-    ):
-        monitor_playback(episode)
+    if resume_point == 0 or _seek_to_offset(player, resume_point, expected_path=url):
+        _monitor_episode(episode, progress_sync, video_id)
         return True
     _stop_failed_playback(player)
     _report_seek_failure("Fortsetzen fehlgeschlagen")
     return False
 
 
-def handle_play_from_start(params):
-    """Video von Anfang starten und Resume-Point löschen"""
+def handle_mark_watched(params):
+    """Explicit account command; never replace it with a private Kodi marker."""
     episode = _positive_int(params.get("episode"), "episode")
-    try:
-        remove_record(xbmcvfs, _resume_path(episode))
-        clear_watched(episode)
-    except Exception as e:
-        xbmc.log(f"[Gronkh.tv] Error deleting resume point: {str(e)}", xbmc.LOGERROR)
+    message = 30223
+    if _account_progress_enabled():
+        progress_sync = _account_progress_sync()
+        if progress_sync is not None:
+            try:
+                info = get_video_info(episode)
+                if not isinstance(info, dict):
+                    raise ValueError("Video metadata unavailable")
+                duration = _non_negative_finite(info.get("source_length"), "duration")
+                state = progress_sync.mark_watched(info["id"], duration)
+                if state == "synchronized":
+                    confirmed = _account_watched(progress_sync.prepare_playback(info["id"]), duration)
+                    xbmc.executebuiltin("Container.Refresh")
+                    if confirmed:
+                        return True
+                    message = 30230
+                else:
+                    message = {"pending": 30222, "authentication_required": 30223}.get(state, 30229)
+            except Exception as exc:
+                xbmc.log(f"[Gronkh.tv] Account mark watched failed ({type(exc).__name__})", xbmc.LOGWARNING)
+                message = 30229
+    xbmcgui.Dialog().notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
+    return False
+
+
+def handle_reset_resume(params):
+    """Explicit non-playing reset; a queued zero is not a completed reset."""
+    episode = _positive_int(params.get("episode"), "episode")
+    dialog = xbmcgui.Dialog()
+    if not dialog.yesno(_plugin, _addon.getLocalizedString(30233)):
+        return False
+    with progress_operation(_PROGRESS_SYNC_FILE) as acquired:
+        if acquired:
+            return _reset_account_progress(episode, dialog)
+    dialog.notification(_plugin, _addon.getLocalizedString(30234), xbmcgui.NOTIFICATION_WARNING)
+    return False
+
+
+def _reset_account_progress(episode, dialog):
+    message = 30223
+    if xbmc.Player().isPlayingVideo():
+        message = 30234
+    elif _account_progress_enabled():
+        progress_sync = _account_progress_sync()
+        if progress_sync is not None:
+            try:
+                info = get_video_info(episode)
+                video_id = info.get("id") if isinstance(info, dict) else None
+                if not video_id:
+                    raise ValueError("Video identity unavailable")
+                state = progress_sync.record_position(video_id, 0, event="stop")
+                if state == "synchronized":
+                    remote = progress_sync.prepare_playback(video_id)
+                    if (remote.get("state") == "valid" and remote.get("offset") == 0
+                            and not remote.get("marked_as_watched")):
+                        removed = remove_record(xbmcvfs, _resume_path(episode))
+                        cleared = clear_watched(episode) if removed else False
+                        xbmc.executebuiltin("Container.Refresh")
+                        if removed and cleared:
+                            return True
+                    message = 30235
+                else:
+                    message = {"pending": 30222, "authentication_required": 30223}.get(state, 30235)
+            except Exception as exc:
+                xbmc.log(f"[Gronkh.tv] Account reset failed ({type(exc).__name__})", xbmc.LOGWARNING)
+                message = 30235
+    dialog.notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
+    return False
+
+
+def handle_play_from_start(params):
+    """Start playback explicitly; a real account reset is a separate action."""
+    episode = _positive_int(params.get("episode"), "episode")
+    if not _account_progress_enabled():
+        try:
+            remove_record(xbmcvfs, _resume_path(episode))
+            clear_watched(episode)
+        except Exception as e:
+            xbmc.log(f"[Gronkh.tv] Error deleting resume point: {str(e)}", xbmc.LOGERROR)
 
     url = get_playlist_url(episode)
     _play_direct(url)
-    monitor_playback(episode)
+    progress_sync, video_id = _playback_sync_context(episode)
+    _monitor_episode(episode, progress_sync, video_id)
 
 
 def seconds_to_time(s):
@@ -1340,18 +2007,6 @@ def _positive_int(value, name):
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
         raise ValueError(f"{name} must be a positive integer")
-    return parsed
-
-
-def _non_negative_finite(value, name):
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be finite non-negative seconds")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be finite non-negative seconds") from exc
-    if not math.isfinite(parsed) or not 0 <= parsed <= _MAX_CHAPTER_ROUTE_OFFSET:
-        raise ValueError(f"{name} must be finite non-negative seconds")
     return parsed
 
 
