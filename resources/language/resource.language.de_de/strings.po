@@ -175,3 +175,51 @@ msgstr "Vor dem Zurücksetzen die Wiedergabe beenden und laufende Fortschritts-U
 msgctxt "#30235"
 msgid "Progress reset could not be completed or confirmed"
 msgstr "Fortschritt konnte nicht vollständig zurückgesetzt oder bestätigt werden"
+
+msgctxt "#30300"
+msgid "Video library"
+msgstr "Videothek"
+
+msgctxt "#30301"
+msgid "Browse videos"
+msgstr "Videos durchsuchen"
+
+msgctxt "#30302"
+msgid "Most viewed videos"
+msgstr "Meistgesehene Videos"
+
+msgctxt "#30303"
+msgid "Search videos"
+msgstr "Videos suchen"
+
+msgctxt "#30304"
+msgid "Browse by tag"
+msgstr "Nach Tags"
+
+msgctxt "#30305"
+msgid "Browse by series"
+msgstr "Nach Serien"
+
+msgctxt "#30306"
+msgid "Browse by game"
+msgstr "Nach Spielen"
+
+msgctxt "#30307"
+msgid "Next page"
+msgstr "Nächste Seite"
+
+msgctxt "#30308"
+msgid "No matching videos on this page"
+msgstr "Keine passenden Videos auf dieser Seite"
+
+msgctxt "#30309"
+msgid "GronkhTV could not load this content"
+msgstr "GronkhTV konnte diesen Inhalt nicht laden"
+
+msgctxt "#30310"
+msgid "Sign in under Account again or check your access to this video"
+msgstr "Bitte unter Konto erneut anmelden oder die Berechtigung für dieses Video prüfen"
+
+msgctxt "#30311"
+msgid "Enable account playback and make sure InputStream Adaptive is available"
+msgstr "Bitte Kontowiedergabe aktivieren und prüfen, ob InputStream Adaptive verfügbar ist"

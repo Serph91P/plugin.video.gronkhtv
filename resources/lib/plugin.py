@@ -29,6 +29,13 @@ from context_menu import (
     resume_label,
 )
 from gronkhtv_api import (
+    API_BASE,
+    catalog_playlist_path,
+    catalog_seasons,
+    catalog_series,
+    catalog_tags,
+    catalog_video_by_id,
+    catalog_videos,
     category_videos,
     configure_account_session,
     discovery,
@@ -243,7 +250,7 @@ def get_playlist_url(episode):
     return playlist_url_for_episode(episode)
 
 
-def _configure_authenticated_playback(list_item, playlist_url):
+def _configure_authenticated_playback(list_item, playlist_url, *, require_cookie=False):
     if not _setting_enabled("use_account_playlists", True):
         return False
     if not os.path.exists(_ACCOUNT_COOKIE_FILE):
@@ -258,6 +265,8 @@ def _configure_authenticated_playback(list_item, playlist_url):
         return False
 
     headers = _account_session.request_headers(playlist_url)
+    if require_cookie and not headers.get("Cookie"):
+        raise AuthenticationError("GronkhTV playback cookie is unavailable")
     configure_authenticated_hls(list_item, headers, helper.inputstream_addon)
     return True
 
@@ -532,7 +541,7 @@ def get_videos(category, offset=0, search_str="", game_id=None):
                 if search_str != ""
                 else xbmcgui.Dialog().input("Suche", type=xbmcgui.INPUT_ALPHANUM)
             )
-        videos = search_videos(query=search_query)
+        videos = search_videos(query=search_query, page=_page_from_offset(offset))
     elif category == _CATEGORIES[6]:  # Favoriten
         videos = get_favorites()
     return videos, search_query if category == _CATEGORIES[3] else ""
@@ -571,6 +580,7 @@ def list_categories():
         is_folder = True
         xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, is_folder)
 
+    _videothek_folder(_addon.getLocalizedString(30300), "videothek")
     xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
     xbmcplugin.endOfDirectory(_HANDLE)
 
@@ -974,15 +984,17 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         url = get_url(action="play", video=video["episode"])
         xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, False)
 
-    if (
-        category == _CATEGORIES[2]
-        and len(videos) == _SEARCH_PAGE_SIZE
-        and videos[-1]["episode"] != 1
+    has_more = getattr(videos, "has_more", None)
+    if category == _CATEGORIES[2] and (
+        has_more or (has_more is None and len(videos) == _SEARCH_PAGE_SIZE and videos[-1]["episode"] != 1)
     ):
         add_more_item(category, offset)
     elif category == _CATEGORIES[3]:
-        handle_search_results(videos, query)
-    elif game_id and len(videos) == _SEARCH_PAGE_SIZE:
+        if has_more:
+            add_more_item(category, offset, query)
+        if videos or not has_more:
+            handle_search_results(videos, query)
+    elif game_id and (has_more or (has_more is None and len(videos) == _SEARCH_PAGE_SIZE)):
         add_more_game_item(game_id, category, offset)
     elif category == _CATEGORIES[6] and not videos:
         # Leere Favoriten-Liste
@@ -1000,14 +1012,14 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         xbmcplugin.endOfDirectory(_HANDLE)
 
 
-def add_more_item(category, offset):
+def add_more_item(category, offset, query=""):
     list_item = xbmcgui.ListItem(label="... mehr")
     tag = list_item.getVideoInfoTag()
     tag.setTitle("... mehr")
     tag.setGenres(["Streams und Let's Plays"])
     tag.setMediaType("video")
     url = get_url(
-        action="listing", category=category, offset=int(offset) + _SEARCH_PAGE_SIZE
+        action="listing", category=category, offset=int(offset) + _SEARCH_PAGE_SIZE, search_str=query
     )
     xbmcplugin.addDirectoryItem(_HANDLE, url, list_item, True)
 
@@ -1485,6 +1497,15 @@ def router(paramstring):
         "show_details": handle_show_details,
         "show_live_stream": handle_show_live_stream,
         "list_game_videos": handle_list_game_videos,
+        "videothek": _videothek_directory,
+        "videothek_videos": _videothek_directory,
+        "videothek_search": _videothek_directory,
+        "videothek_tags": _videothek_directory,
+        "videothek_series": _videothek_directory,
+        "videothek_games": _videothek_directory,
+        "videothek_seasons": _videothek_directory,
+        "videothek_details": _videothek_details,
+        "videothek_play": _videothek_play,
         "account_login": handle_account_login,
         "account_logout": handle_account_logout,
         "account_status": handle_account_status,
@@ -1508,6 +1529,136 @@ def router(paramstring):
         xbmc.log(f"[Gronkh.tv] Traceback: {traceback.format_exc()}", xbmc.LOGERROR)
 
     xbmc.log("[Gronkh.tv] Router finished", xbmc.LOGINFO)
+
+
+def _videothek_folder(label, action, **params):
+    xbmcplugin.addDirectoryItem(_HANDLE, get_url(action=action, **params),
+                                xbmcgui.ListItem(label=label), True)
+
+
+def _videothek_notice(message):
+    xbmcgui.Dialog().notification(_plugin, _addon.getLocalizedString(message), xbmcgui.NOTIFICATION_WARNING)
+
+
+def _videothek_directory(params):
+    action = params["action"]
+    xbmcplugin.setPluginCategory(_HANDLE, _addon.getLocalizedString(30300))
+    xbmcplugin.setContent(_HANDLE, "videos")
+    succeeded = False
+    try:
+        if action == "videothek":
+            for label, route, arguments in (
+                (30301, "videothek_videos", {}),
+                (30302, "videothek_videos", {"order": "views"}),
+                (30303, "videothek_search", {}),
+                (30304, "videothek_tags", {}),
+                (30305, "videothek_series", {}),
+                (30306, "videothek_games", {}),
+            ):
+                _videothek_folder(_addon.getLocalizedString(label), route, **arguments)
+        elif action == "videothek_tags":
+            for tag, title in catalog_tags():
+                _videothek_folder(title, "videothek_videos", tag=tag)
+        elif action in ("videothek_games", "videothek_series"):
+            rows, more = catalog_series(params.get("page", 1))
+            game = params.get("game")
+            if action == "videothek_games":
+                games = {row["slug"]: row["game"] for row in rows if row["slug"] and row["game"]}
+                for slug, title in games.items():
+                    _videothek_folder(title, "videothek_series", game=slug, page=params.get("page", 1))
+            else:
+                for row in rows:
+                    if not game or row["slug"] == game:
+                        _videothek_folder(row["title"], "videothek_seasons", series=row["id"])
+            _videothek_more(params, more)
+        elif action == "videothek_seasons":
+            series = params.get("series")
+            for season in catalog_seasons(series):
+                _videothek_folder(season["title"], "videothek_videos", series=series, season=season["id"])
+        else:
+            if action == "videothek_search":
+                query = xbmcgui.Dialog().input(_addon.getLocalizedString(30303), type=xbmcgui.INPUT_ALPHANUM).strip()
+                if not query:
+                    return
+                params = {"action": "videothek_videos", "query": query}
+            _list_videothek_videos(params)
+        succeeded = True
+    except (SessionError, RuntimeError, ValueError):
+        _videothek_notice(30309)
+    finally:
+        xbmcplugin.addSortMethod(_HANDLE, xbmcplugin.SORT_METHOD_NONE)
+        xbmcplugin.endOfDirectory(_HANDLE, succeeded=succeeded, cacheToDisc=False)
+
+
+def _videothek_more(params, page):
+    if page is not None:
+        _videothek_folder(_addon.getLocalizedString(30307), **dict(params, page=page))
+
+
+def _list_videothek_videos(params):
+    rows, more = catalog_videos(**{key: params[key] for key in ("page", "query", "tag", "order", "series", "season")
+                                   if key in params})
+    for video in rows:
+        video_id = video["id"]
+        item = xbmcgui.ListItem(label=video["title"])
+        item.setProperty("IsPlayable", "true")
+        if video["preview_url"]:
+            item.setArt({"thumb": video["preview_url"]})
+        tag = item.getVideoInfoTag()
+        tag.setTitle(video["title"])
+        tag.setMediaType("video")
+        tag.setDuration(video["video_length"])
+        tag.setPlot(video["series_title"] or video["description"])
+        details = get_url(action="videothek_details", id=video_id)
+        context = [(details_label(), f"RunPlugin({details})")]
+        if video["series_id"]:
+            series_url = get_url(action="videothek_seasons", series=video["series_id"])
+            context.append((_addon.getLocalizedString(30305), f"Container.Update({series_url})"))
+        item.addContextMenuItems(context)
+        xbmcplugin.addDirectoryItem(_HANDLE, get_url(action="videothek_play", id=video_id), item, False)
+    _videothek_more(params, more)
+    if not rows and more is None:
+        _videothek_notice(30308)
+
+
+def _videothek_session():
+    if not os.path.exists(_ACCOUNT_COOKIE_FILE):
+        raise AuthenticationError("GronkhTV login required")
+    _account_session.current_user()
+    return _account_session
+
+
+def _videothek_details(params):
+    try:
+        video = catalog_video_by_id(params.get("id"), _videothek_session())
+        details = "\n\n".join(text for text in (video["series_title"], video["description"]) if text)
+        xbmcgui.Dialog().textviewer(video["title"], details)
+    except AuthenticationError:
+        _videothek_notice(30310)
+    except (SessionError, ValueError):
+        _videothek_notice(30309)
+
+
+def _videothek_play(params):
+    try:
+        path = catalog_playlist_path(params.get("id"))
+        session = _videothek_session()
+        video = catalog_video_by_id(params.get("id"), session)
+        url = API_BASE + path
+        item = xbmcgui.ListItem(label=video["title"], path=url)
+        if not _configure_authenticated_playback(item, url, require_cookie=True):
+            _videothek_notice(30311)
+        elif session.request_bytes(path).startswith(b"#EXTM3U"):
+            item.setProperty("IsPlayable", "true")
+            xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=item)
+            return
+        else:
+            _videothek_notice(30309)
+    except AuthenticationError:
+        _videothek_notice(30310)
+    except (SessionError, ValueError, RuntimeError):
+        _videothek_notice(30309)
+    xbmcplugin.setResolvedUrl(_HANDLE, False, listitem=xbmcgui.ListItem())
 
 
 def handle_listing(params):

@@ -175,3 +175,51 @@ msgstr "Stop playback and wait for active progress uploads before resetting"
 msgctxt "#30235"
 msgid "Progress reset could not be completed or confirmed"
 msgstr "Progress reset could not be completed or confirmed"
+
+msgctxt "#30300"
+msgid "Video library"
+msgstr "Video library"
+
+msgctxt "#30301"
+msgid "Browse videos"
+msgstr "Browse videos"
+
+msgctxt "#30302"
+msgid "Most viewed videos"
+msgstr "Most viewed videos"
+
+msgctxt "#30303"
+msgid "Search videos"
+msgstr "Search videos"
+
+msgctxt "#30304"
+msgid "Browse by tag"
+msgstr "Browse by tag"
+
+msgctxt "#30305"
+msgid "Browse by series"
+msgstr "Browse by series"
+
+msgctxt "#30306"
+msgid "Browse by game"
+msgstr "Browse by game"
+
+msgctxt "#30307"
+msgid "Next page"
+msgstr "Next page"
+
+msgctxt "#30308"
+msgid "No matching videos on this page"
+msgstr "No matching videos on this page"
+
+msgctxt "#30309"
+msgid "GronkhTV could not load this content"
+msgstr "GronkhTV could not load this content"
+
+msgctxt "#30310"
+msgid "Sign in under Account again or check your access to this video"
+msgstr "Sign in under Account again or check your access to this video"
+
+msgctxt "#30311"
+msgid "Enable account playback and make sure InputStream Adaptive is available"
+msgstr "Enable account playback and make sure InputStream Adaptive is available"
