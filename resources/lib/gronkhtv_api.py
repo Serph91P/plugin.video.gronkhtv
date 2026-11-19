@@ -66,15 +66,14 @@ def normalize_video(video):
     if not isinstance(video, dict):
         video = {}
 
-    meta = video.get("meta") or {}
-    urls = video.get("urls") or {}
-    chapters = video.get("chapters") or []
+    meta = _mapping(video.get("meta"))
+    urls = _mapping(video.get("urls"))
 
     normalized = {
         "id": video.get("id"),
-        "episode": video.get("episode"),
-        "title": video.get("title", ""),
-        "created_at": video.get("created_at", ""),
+        "episode": _episode_number(video, meta),
+        "title": _text(video.get("title")),
+        "created_at": _text(video.get("created_at")),
         "video_length": _as_int(meta.get("duration"), 0),
         "source_length": _as_int(meta.get("duration"), 0),
         "source_width": _as_int(meta.get("width"), 0),
@@ -83,8 +82,8 @@ def normalize_video(video):
         "views": _as_int(video.get("views"), 0),
         "preview_url": urls.get("thumbnail", ""),
         "playlist_url": urls.get("playlist", ""),
-        "tags": video.get("tags") or [],
-        "chapters": [normalize_chapter(chapter) for chapter in chapters],
+        "tags": _rows(video.get("tags")),
+        "chapters": [normalize_chapter(chapter) for chapter in _rows(video.get("chapters"))],
         "previous": _normalize_related_video(video.get("previous")),
         "next": _normalize_related_video(video.get("next")),
     }
@@ -133,18 +132,12 @@ def playlist_url_for_episode(episode):
 
 
 def discovery(kind):
-    return [
-        normalize_video(video)
-        for video in unwrap_data(get_json(f"/videos/discovery/{kind}")) or []
-    ]
+    return _stream_rows(get_json(f"/videos/discovery/{kind}"))
 
 
 def search_videos(query=None, page=None):
     payload = _search_payload(query=query, page=page)
-    return [
-        normalize_video(video)
-        for video in unwrap_data(post_json("/videos/search", payload)) or []
-    ]
+    return _stream_rows(post_json("/videos/search", payload))
 
 
 def search_categories(query=None, page=None):
@@ -159,7 +152,35 @@ def category_videos(slug, page=None):
     path = f"/categories/{slug}/videos"
     if page is not None:
         path = f"{path}?{urlencode({'page': page})}"
-    return [normalize_video(video) for video in unwrap_data(get_json(path)) or []]
+    return _stream_rows(get_json(path))
+
+
+def _stream_rows(payload):
+    videos = (normalize_video(row) for row in _rows(unwrap_data(payload)))
+    return [video for video in videos if video["episode"] is not None]
+
+
+def _rows(value):
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _episode_number(video, meta):
+    if meta.get("type", "stream") != "stream":
+        return None
+    for value in (meta.get("episode"), video.get("episode")):
+        try:
+            return _positive_int(value, "episode")
+        except ValueError:
+            continue
+    return None
 
 
 def live_streams():
@@ -257,7 +278,7 @@ def _positive_int(value, name):
         raise ValueError(f"{name} must be a positive integer")
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
         raise ValueError(f"{name} must be a positive integer")
@@ -277,13 +298,13 @@ def _normalize_related_video(video):
     if not isinstance(video, dict):
         return None
 
-    meta = video.get("meta") or {}
-    urls = video.get("urls") or {}
+    meta = _mapping(video.get("meta"))
+    urls = _mapping(video.get("urls"))
     return {
         "id": video.get("id"),
-        "episode": video.get("episode"),
-        "title": video.get("title", ""),
-        "created_at": video.get("created_at", ""),
+        "episode": _episode_number(video, meta),
+        "title": _text(video.get("title")),
+        "created_at": _text(video.get("created_at")),
         "video_length": _as_int(meta.get("duration"), 0),
         "source_length": _as_int(meta.get("duration"), 0),
         "source_width": _as_int(meta.get("width"), 0),
@@ -292,7 +313,7 @@ def _normalize_related_video(video):
         "views": _as_int(video.get("views"), 0),
         "preview_url": urls.get("thumbnail", ""),
         "playlist_url": urls.get("playlist", ""),
-        "tags": video.get("tags") or [],
+        "tags": _rows(video.get("tags")),
         "chapters": [],
         "previous": None,
         "next": None,
@@ -303,7 +324,7 @@ def _normalize_category(category):
     if not isinstance(category, dict):
         category = {}
 
-    urls = category.get("urls") or {}
+    urls = _mapping(category.get("urls"))
     return {
         "id": category.get("id"),
         "title": category.get("title", ""),
@@ -316,7 +337,7 @@ def _normalize_category(category):
 
 def _category_to_legacy_game(category):
     thumbnail = ""
-    urls = category.get("urls") or {}
+    urls = _mapping(category.get("urls"))
     boxarts = urls.get("boxarts") or {}
     if isinstance(boxarts, dict):
         thumbnail = boxarts.get("url") or boxarts.get("thumbnail") or ""
@@ -370,8 +391,8 @@ def _normalize_watch_progress(progress):
 def _as_int(value, default):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         try:
             return int(float(value))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default

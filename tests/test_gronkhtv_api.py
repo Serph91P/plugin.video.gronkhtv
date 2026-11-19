@@ -79,6 +79,26 @@ LIVE_STREAM_PAYLOAD = {
 }
 
 
+def test_current_stream_details_and_related_rows_use_integer_meta_episode(monkeypatch):
+    current = dict(VIDEO_PAYLOAD)
+    del current["episode"]
+    current["meta"] = {"type": "stream", "episode": "1135"}
+    current["next"] = {"meta": {"type": "stream", "episode": "1136"}}
+    monkeypatch.setattr(gronkhtv_api, "get_json", lambda path: {"data": current})
+    assert video_by_episode(1135)["episode"] == 1135
+    assert video_by_episode(1135)["next"]["episode"] == 1136
+    assert gronkhtv_api.playlist_url_for_episode(1135) == VIDEO_PAYLOAD["urls"]["playlist"]
+
+
+@pytest.mark.parametrize("source", ["search", "game"])
+def test_stream_lists_drop_non_streams_and_invalid_numbers(monkeypatch, source):
+    rows = [VIDEO_PAYLOAD, {"meta": {"type": "stream", "episode": "1135"}},
+            {"episode": 1, "meta": {"type": "letsplay"}}, {"episode": True}, {"episode": "1.2"}]
+    monkeypatch.setattr(gronkhtv_api, "get_json", lambda *a, **kw: {"data": rows})
+    videos = search_videos("test") if source == "search" else category_videos("test-game")
+    assert [row["episode"] for row in videos] == [1105, 1135]
+
+
 def test_unwrap_data_accepts_wrapped_payloads_and_raw_values():
     wrapped = {"data": [{"id": "video"}]}
     raw = [{"user_login": "gronkh"}]
