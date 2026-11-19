@@ -11,12 +11,15 @@ A = '01a1efd4-4702-7096-b76e-1132060b433d'
 B = '01a1f3b4-fbbb-7b68-9bed-3bbc6e3b2819'
 SERIES = '01a1efd4-47c1-72e2-9245-0429a854fa95'
 SEASON = '01a1efd4-4c1f-72f6-86ba-1f4400f748c7'
+SERIES_B = '01a1f3b4-fbbb-7b68-9bed-3bbc6e3b2820'
+SEASON_B = '01a1f3b4-fbbb-7b68-9bed-3bbc6e3b2821'
 
 
 def video(video_id, kind='letsplay', tag_id=22):
+    series, season = (SERIES_B, SEASON_B) if video_id == B else (SERIES, SEASON)
     return {'id': video_id, 'title': video_id, 'tags': [{'tag_id': tag_id, 'title': 'Demo'}],
-            'meta': {'episode': '1', 'type': kind, 'season': {'id': SEASON, 'title': 'Series',
-                     'meta': {'playlist_id': SERIES}}}}
+            'meta': {'episode': '1', 'type': kind, 'season': {'id': season, 'title': 'Season 1',
+                     'meta': {'playlist_id': series}}}}
 
 
 def page(rows, current, last):
@@ -83,6 +86,10 @@ def kodi(plugin, monkeypatch):
         def setEpisode(self, episode):
             assert type(episode) is int
 
+        def setGenres(self, genres):
+            assert all(isinstance(genre, str) for genre in genres)
+            self.genres = genres
+
         def setProperty(self, key, value):
             self.properties[key] = value
 
@@ -140,6 +147,73 @@ def test_game_picker_opens_its_series_even_without_category_videos(plugin, kodi,
         assert [item.label for _, item, _ in kodi.items] == [label]
         selected = kodi.items[0][0]
     assert 'action=videothek_play' in selected
+
+
+def test_game_picker_reaches_series_before_and_after_the_page_where_selected(plugin, kodi, monkeypatch):
+    game = {'title': 'Game', 'meta': {'slug': '0-game'}}
+    other = {'id': B, 'title': 'Other', 'category': {'title': 'Else', 'meta': {'slug': 'else'}}}
+    pages = {
+        '/playlists?page=1': page([{'id': SERIES, 'title': 'Early', 'category': game}, other], 1, 3),
+        '/playlists?page=2': page([other], 2, 3),
+        '/playlists?page=3': page([{'id': SERIES_B, 'title': 'Late', 'category': game}], 3, 3),
+    }
+    requests = []
+
+    def get(path):
+        requests.append(path)
+        return pages[path]
+
+    def open_link(url):
+        kodi.items.clear()
+        plugin.router(urlsplit(url).query)
+        assert kodi.ended[-1]['succeeded']
+
+    monkeypatch.setattr(api, 'get_json', get)
+    plugin.router('action=videothek_games&page=3')
+    open_link(next(url for url, item, _ in kodi.items if item.label == 'Game'))
+    assert [item.label for url, item, _ in kodi.items if 'action=videothek_seasons' in url] == ['Early']
+    assert requests == ['/playlists?page=3', '/playlists?page=1']
+    open_link(next(url for url, _, _ in kodi.items if 'page=2' in url))
+    assert len(kodi.items) == 1  # Empty filtered page still has a Next link.
+    open_link(kodi.items[0][0])
+    assert [item.label for _, item, _ in kodi.items] == ['Late']
+    assert requests[2:] == ['/playlists?page=2', '/playlists?page=3']
+
+
+@pytest.mark.parametrize('bad_offset', [-1, 'nan', 'inf', 31536001, True, 'not seconds', None])
+def test_latest_uploads_omits_bad_chapter_and_still_renders_neighbor(plugin, kodi, monkeypatch, bad_offset):
+    first = {'title': 'Current', 'meta': {'type': 'stream', 'episode': '1135'}}
+    second = {'title': 'Neighbor', 'meta': {'type': 'stream', 'episode': '1136'}}
+    responses = {
+        '/videos/discovery/newest': {'data': [first, second]},
+        '/videos/episode/1135': {'data': dict(first, chapters=[
+            {'title': 'Bad chapter', 'start_offset': bad_offset},
+            {'title': 'Good chapter', 'offset': '42', 'category': {'title': 17}},
+        ])},
+        '/videos/episode/1136': {'data': second},
+    }
+    monkeypatch.setattr(api, 'get_json', responses.__getitem__)
+    plugin.router(f'action=listing&category={plugin._CATEGORIES[0]}')
+    assert [item.label for _, item, _ in kodi.items] == ['Current', 'Neighbor']
+    chapter_links = [url for _, url in kodi.items[0][1].context if 'action=jump_to_chapter' in url]
+    assert chapter_links == ['RunPlugin(plugin://plugin.video.gronkhtv/?action=jump_to_chapter&episode=1135&offset=42)']
+    assert len(kodi.ended) == 1
+
+
+def test_latest_uploads_omits_bad_tag_title_and_still_renders_neighbor(plugin, kodi, monkeypatch):
+    first = {'title': 'Current', 'meta': {'type': 'stream', 'episode': '1135'},
+             'tags': [{'title': 17}, {'title': 'Valid genre'}]}
+    second = {'title': 'Neighbor', 'meta': {'type': 'stream', 'episode': '1136'}}
+    responses = {
+        '/videos/discovery/newest': {'data': [first, second]},
+        '/videos/episode/1135': {'data': first},
+        '/videos/episode/1136': {'data': second},
+    }
+    monkeypatch.setattr(api, 'get_json', responses.__getitem__)
+    plugin.router(f'action=listing&category={plugin._CATEGORIES[0]}')
+    assert [item.label for _, item, _ in kodi.items] == ['Current', 'Neighbor']
+    assert kodi.items[0][1].genres == ["Streams und Let's Plays", 'Valid genre']
+    assert len(kodi.ended) == 1
 
 
 def test_mixed_stream_search_keeps_next_page_after_filtering(plugin, kodi, monkeypatch):

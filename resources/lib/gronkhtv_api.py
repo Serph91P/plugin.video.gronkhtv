@@ -11,6 +11,7 @@ API_BASE = "https://backend.gronkh.tv/v3"
 _TIMEOUT = 10
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _MAX_URL_DECODE_ROUNDS = 4
+_MAX_CHAPTER_ROUTE_OFFSET = 31536000
 DEFAULT_HEADERS = {
     "User-Agent": _UA,
     "Accept": "application/json",
@@ -83,14 +84,30 @@ def normalize_video(video):
         "preview_url": _text(urls.get("thumbnail")),
         "playlist_url": _text(urls.get("playlist")),
         "tags": _rows(video.get("tags")),
-        "chapters": [normalize_chapter(chapter) for chapter in _rows(video.get("chapters"))],
+        "chapters": [],
         "previous": _normalize_related_video(video.get("previous")),
         "next": _normalize_related_video(video.get("next")),
     }
+    for row in _rows(video.get("chapters")):
+        chapter = normalize_chapter(row)
+        if chapter is not None:
+            normalized["chapters"].append(chapter)
     progress = _normalize_watch_progress(video.get("watch_progress"))
     if progress is not None:
         normalized["watch_progress"] = progress
     return normalized
+
+
+def non_negative_seconds(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite non-negative seconds")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite non-negative seconds") from exc
+    if not math.isfinite(parsed) or not 0 <= parsed <= _MAX_CHAPTER_ROUTE_OFFSET:
+        raise ValueError(f"{name} must be finite non-negative seconds")
+    return parsed
 
 
 def normalize_chapter(chapter):
@@ -98,11 +115,14 @@ def normalize_chapter(chapter):
         chapter = {}
 
     category = _normalize_category(chapter.get("category") or chapter.get("game"))
-    title = chapter.get("title") or category.get("title") or "Unbenanntes Kapitel"
-    offset = chapter.get("start_offset", chapter.get("offset"))
+    title = _text(chapter.get("title")) or category["title"] or "Unbenanntes Kapitel"
+    try:
+        offset = non_negative_seconds(chapter.get("start_offset", chapter.get("offset", 0)), "chapter offset")
+    except ValueError:
+        return None
     return {
         "title": title,
-        "offset": _as_int(offset, 0),
+        "offset": int(offset),
         "category": category,
         "game": _category_to_legacy_game(category),
     }
@@ -444,7 +464,7 @@ def _normalize_category(category):
     urls = _mapping(category.get("urls"))
     return {
         "id": category.get("id"),
-        "title": category.get("title", ""),
+        "title": _text(category.get("title")),
         "slug": category.get("slug"),
         "urls": urls,
         "videos_count": _as_int(category.get("videos_count"), 0),

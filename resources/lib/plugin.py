@@ -45,6 +45,7 @@ from gronkhtv_api import (
     search_videos,
     video_by_episode,
 )
+from gronkhtv_api import non_negative_seconds as _non_negative_finite
 from live import twitch_plugin_entries, twitch_plugin_url
 from playback import configure_authenticated_hls
 from resume_store import is_completed, read_record, remove_record, write_record
@@ -74,7 +75,6 @@ _CATEGORIES = [
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _SEARCH_PAGE_SIZE = 20
-_MAX_CHAPTER_ROUTE_OFFSET = 31536000
 
 # Addon data paths
 _ADDON_DATA = xbmcvfs.translatePath(
@@ -938,7 +938,8 @@ def list_videos(category, offset=0, search_str="", game_id=None):
         # Tags als Genres nutzen
         tags = video.get("tags", [])
         genres = ["Streams und Let's Plays"] + [
-            t.get("title", "") for t in tags if t.get("title")
+            t["title"] for t in tags
+            if isinstance(t, dict) and isinstance(t.get("title"), str) and t["title"]
         ]
 
         # Erweiterter Plot mit mehr Infos (ohne Emojis für Kodi-Kompatibilität)
@@ -1565,7 +1566,8 @@ def _videothek_directory(params):
             if action == "videothek_games":
                 games = {row["slug"]: row["game"] for row in rows if row["slug"] and row["game"]}
                 for slug, title in games.items():
-                    _videothek_folder(title, "videothek_series", game=slug, page=params.get("page", 1))
+                    # Start at page 1: matching series can precede this page.
+                    _videothek_folder(title, "videothek_series", game=slug)
             else:
                 for row in rows:
                     if not game or row["slug"] == game:
@@ -2005,18 +2007,6 @@ def _positive_int(value, name):
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
         raise ValueError(f"{name} must be a positive integer")
-    return parsed
-
-
-def _non_negative_finite(value, name):
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be finite non-negative seconds")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be finite non-negative seconds") from exc
-    if not math.isfinite(parsed) or not 0 <= parsed <= _MAX_CHAPTER_ROUTE_OFFSET:
-        raise ValueError(f"{name} must be finite non-negative seconds")
     return parsed
 
 
