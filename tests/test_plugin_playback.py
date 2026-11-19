@@ -110,6 +110,39 @@ def plugin(monkeypatch, tmp_path):
     return module
 
 
+def test_latest_uploads_passes_integer_stream_episodes_to_kodi(plugin, monkeypatch):
+    import gronkhtv_api as api
+
+    rows = [
+        {"title": "Current", "meta": {"type": "stream", "episode": "1135"}},
+        {"title": "Legacy", "episode": 1134},
+        {"title": "Not a stream", "meta": {"type": "letsplay", "episode": "1135"}},
+        {"title": "No number"}, None, {"meta": "broken"},
+    ]
+    monkeypatch.setattr(api, "get_json", lambda path: {"data": rows} if "/discovery/" in path else {})
+    episodes = []
+
+    class Item:
+        def __init__(self, label):
+            pass
+
+        def getVideoInfoTag(self):
+            return self
+
+        def setEpisode(self, value):
+            assert type(value) is int
+            episodes.append(value)
+
+        def __getattr__(self, name):
+            return lambda *args: None
+
+    monkeypatch.setattr(plugin.xbmcgui, "ListItem", Item)
+    for name in ("setPluginCategory", "setContent", "addDirectoryItem", "addSortMethod", "endOfDirectory"):
+        monkeypatch.setattr(plugin.xbmcplugin, name, lambda *args, **kwargs: None, raising=False)
+    plugin.list_videos(plugin._CATEGORIES[0])
+    assert episodes == [1135, 1134]
+
+
 @pytest.mark.parametrize(
     "handler,parameter",
     [

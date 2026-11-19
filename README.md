@@ -6,6 +6,7 @@
 
 - Aktuelle, meistgesehene und alle Archiv-Streams
 - Suche, Spiele-Filter und Kapitel
+- Separate Videothek für Let's Plays: Folgen, Serien und Staffeln durchsuchen
 - Favoriten, Wiedergabefortschritt und Auto-Next
 - GronkhTV-Anmeldung mit optionaler Zwei-Faktor-Authentifizierung
 - Kontositzung fuer API-Anfragen und geschuetzte HLS-Wiedergabe
@@ -21,6 +22,12 @@
 Das Passwort wird nicht gespeichert. Das Addon speichert nur die von GronkhTV gesetzten Sitzungscookies im Kodi-Profil und setzt die Datei auf restriktive Zugriffsrechte. Ueber **Von GronkhTV abmelden** wird die lokale Sitzung entfernt.
 
 Die Option **Kontositzung fuer Archiv-Wiedergabe verwenden** uebergibt die Sitzung auch an InputStream Adaptive. Ist keine gueltige Kontositzung vorhanden, bleiben oeffentlich erreichbare Archiv-Inhalte nutzbar.
+
+## Videothek
+
+Öffne **Videothek** im Hauptmenü. Dort kannst du Videos durchsuchen, nach Aufrufen sortieren, nach einem Titel suchen oder über **Nach Tags**, **Nach Serien** und **Nach Spielen** einsteigen. Die Spiele werden den Serien zugeordnet, unabhängig von den Kapiteln im Streamarchiv. Bei einem Tagfilter kann eine Seite leer sein; über **Nächste Seite** geht es weiter, solange der Server weitere Ergebnisse meldet.
+
+Für Details und Wiedergabe verwende deine bestehende GronkhTV-Anmeldung; zur Wiedergabe müssen Kontowiedergabe und InputStream Adaptive verfügbar sein. Folgen werden direkt über ihre Video-ID geöffnet. Die Videothek nutzt keine Stream-Favoriten und liest oder schreibt keine Stream-Fortschrittsdaten.
 
 ## Live-Streams
 

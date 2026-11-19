@@ -11,6 +11,7 @@ API_BASE = "https://backend.gronkh.tv/v3"
 _TIMEOUT = 10
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _MAX_URL_DECODE_ROUNDS = 4
+_MAX_CHAPTER_ROUTE_OFFSET = 31536000
 DEFAULT_HEADERS = {
     "User-Agent": _UA,
     "Accept": "application/json",
@@ -66,32 +67,47 @@ def normalize_video(video):
     if not isinstance(video, dict):
         video = {}
 
-    meta = video.get("meta") or {}
-    urls = video.get("urls") or {}
-    chapters = video.get("chapters") or []
+    meta = _mapping(video.get("meta"))
+    urls = _mapping(video.get("urls"))
 
     normalized = {
         "id": video.get("id"),
-        "episode": video.get("episode"),
-        "title": video.get("title", ""),
-        "created_at": video.get("created_at", ""),
+        "episode": _episode_number(video, meta),
+        "title": _text(video.get("title")),
+        "created_at": _text(video.get("created_at")),
         "video_length": _as_int(meta.get("duration"), 0),
         "source_length": _as_int(meta.get("duration"), 0),
         "source_width": _as_int(meta.get("width"), 0),
         "source_height": _as_int(meta.get("height"), 0),
         "source_fps": _as_int(meta.get("fps"), 0),
         "views": _as_int(video.get("views"), 0),
-        "preview_url": urls.get("thumbnail", ""),
-        "playlist_url": urls.get("playlist", ""),
-        "tags": video.get("tags") or [],
-        "chapters": [normalize_chapter(chapter) for chapter in chapters],
+        "preview_url": _text(urls.get("thumbnail")),
+        "playlist_url": _text(urls.get("playlist")),
+        "tags": _rows(video.get("tags")),
+        "chapters": [],
         "previous": _normalize_related_video(video.get("previous")),
         "next": _normalize_related_video(video.get("next")),
     }
+    for row in _rows(video.get("chapters")):
+        chapter = normalize_chapter(row)
+        if chapter is not None:
+            normalized["chapters"].append(chapter)
     progress = _normalize_watch_progress(video.get("watch_progress"))
     if progress is not None:
         normalized["watch_progress"] = progress
     return normalized
+
+
+def non_negative_seconds(value, name):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite non-negative seconds")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite non-negative seconds") from exc
+    if not math.isfinite(parsed) or not 0 <= parsed <= _MAX_CHAPTER_ROUTE_OFFSET:
+        raise ValueError(f"{name} must be finite non-negative seconds")
+    return parsed
 
 
 def normalize_chapter(chapter):
@@ -99,11 +115,14 @@ def normalize_chapter(chapter):
         chapter = {}
 
     category = _normalize_category(chapter.get("category") or chapter.get("game"))
-    title = chapter.get("title") or category.get("title") or "Unbenanntes Kapitel"
-    offset = chapter.get("start_offset", chapter.get("offset"))
+    title = _text(chapter.get("title")) or category["title"] or "Unbenanntes Kapitel"
+    try:
+        offset = non_negative_seconds(chapter.get("start_offset", chapter.get("offset", 0)), "chapter offset")
+    except ValueError:
+        return None
     return {
         "title": title,
-        "offset": _as_int(offset, 0),
+        "offset": int(offset),
         "category": category,
         "game": _category_to_legacy_game(category),
     }
@@ -111,7 +130,10 @@ def normalize_chapter(chapter):
 
 def video_by_episode(episode):
     episode = _positive_int(episode, "episode")
-    return normalize_video(unwrap_data(get_json(f"/videos/episode/{episode}")))
+    video = normalize_video(unwrap_data(get_json(f"/videos/episode/{episode}")))
+    if video["episode"] != episode:
+        raise ValueError("GronkhTV returned an invalid stream episode")
+    return video
 
 
 def playlist_url_for_video(video):
@@ -133,18 +155,12 @@ def playlist_url_for_episode(episode):
 
 
 def discovery(kind):
-    return [
-        normalize_video(video)
-        for video in unwrap_data(get_json(f"/videos/discovery/{kind}")) or []
-    ]
+    return _stream_rows(get_json(f"/videos/discovery/{kind}"))
 
 
 def search_videos(query=None, page=None):
     payload = _search_payload(query=query, page=page)
-    return [
-        normalize_video(video)
-        for video in unwrap_data(post_json("/videos/search", payload)) or []
-    ]
+    return _stream_rows(post_json("/videos/search", payload), page)
 
 
 def search_categories(query=None, page=None):
@@ -159,7 +175,45 @@ def category_videos(slug, page=None):
     path = f"/categories/{slug}/videos"
     if page is not None:
         path = f"{path}?{urlencode({'page': page})}"
-    return [normalize_video(video) for video in unwrap_data(get_json(path)) or []]
+    return _stream_rows(get_json(path), page)
+
+
+class _StreamRows(list):
+    """Keep server paging independent of the number of usable stream rows."""
+
+    def __init__(self, videos, has_more):
+        super().__init__(videos)
+        self.has_more = has_more
+
+
+def _stream_rows(payload, page=None):
+    videos = (normalize_video(row) for row in _rows(unwrap_data(payload)))
+    meta = _mapping(_mapping(payload).get("meta"))
+    has_more = _next_page(payload, page) is not None if page and "last_page" in meta else None
+    return _StreamRows((video for video in videos if video["episode"] is not None), has_more)
+
+
+def _rows(value):
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _episode_number(video, meta):
+    if meta.get("type", "stream") != "stream":
+        return None
+    for value in (meta.get("episode"), video.get("episode")):
+        try:
+            return _positive_int(value, "episode")
+        except ValueError:
+            continue
+    return None
 
 
 def live_streams():
@@ -167,6 +221,110 @@ def live_streams():
         normalize_live_stream(stream)
         for stream in unwrap_data(get_json("/promoted/streams")) or []
     ]
+
+
+def _uuid(value):
+    canonical = str(UUID(str(value)))
+    if not isinstance(value, str) or value.lower() != canonical:
+        raise ValueError("GronkhTV requires a video or series UUID")
+    return canonical
+
+
+def _optional_uuid(value):
+    try:
+        return _uuid(value)
+    except ValueError:
+        return None
+
+
+def _catalog_video(row):
+    meta = _mapping(row.get("meta"))
+    video_id = _optional_uuid(row.get("id"))
+    if not video_id or meta.get("type") != "letsplay":
+        return None
+    video = normalize_video(row)
+    video["id"] = video_id
+    season = _mapping(meta.get("season"))
+    video["series_id"] = _optional_uuid(_mapping(season.get("meta")).get("playlist_id"))
+    video["series_title"] = _text(season.get("title"))
+    video["description"] = _text(row.get("description"))
+    return video
+
+
+def _next_page(response, page):
+    meta = _mapping(_mapping(response).get("meta"))
+    current = _as_int(meta.get("current_page"), 0)
+    last = _as_int(meta.get("last_page"), 0)
+    return current + 1 if current == page and current < last else None
+
+
+def catalog_videos(page=1, query=None, tag=None, order="relevancy", series=None, season=None):
+    page = _positive_int(page, "page")
+    if tag is not None:
+        tag = _positive_int(tag, "tag")
+    if order not in ("relevancy", "views"):
+        raise ValueError("Unsupported catalog order")
+    if series or season:
+        series, season = _uuid(series), _uuid(season)
+        response = get_json(f"/playlists/{series}/seasons/{season}/videos?page={page}")
+    else:
+        payload = _search_payload(query=query, page=page)
+        payload.update(order=order, dir="desc")
+        if tag is not None:
+            payload["tags"] = [str(tag)]
+        response = post_json("/videos/search", payload)
+    videos = []
+    for row in _rows(unwrap_data(response)):
+        # The search API also returns unrelated rows when tags are supplied.
+        if tag is not None and not any(type(t.get("tag_id")) is int and t["tag_id"] == tag
+                                       for t in _rows(row.get("tags"))):
+            continue
+        video = _catalog_video(row)
+        if video:
+            videos.append(video)
+    return videos, _next_page(response, page)
+
+
+def catalog_series(page):
+    page = _positive_int(page, "page")
+    response = get_json(f"/playlists?page={page}")
+    series = {}
+    for row in _rows(unwrap_data(response)):
+        series_id = _optional_uuid(row.get("id"))
+        title = _text(row.get("title"))
+        if not series_id or not title or row.get("is_watch_later"):
+            continue
+        category = _mapping(row.get("category"))
+        series.setdefault(series_id, {
+            "id": series_id, "title": title, "game": _text(category.get("title")),
+            "slug": _text(_mapping(category.get("meta")).get("slug")),
+        })
+    return list(series.values()), _next_page(response, page)
+
+
+def catalog_seasons(series):
+    return [{"id": season, "title": _text(row.get("title"))}
+            for row in _rows(unwrap_data(get_json(f"/playlists/{_uuid(series)}/seasons")))
+            if (season := _optional_uuid(row.get("id")))]
+
+
+def catalog_tags():
+    return [(row["tag_id"], row["title"]) for row in _rows(unwrap_data(get_json("/tags")))
+            if type(row.get("tag_id")) is int and row["tag_id"] > 0 and _text(row.get("title"))]
+
+
+def catalog_video_by_id(video_id, session=None):
+    video_id = _uuid(video_id)
+    path = f"/videos/{video_id}"
+    get = session.request_json if session is not None else get_json
+    video = _catalog_video(_mapping(unwrap_data(get(path))))
+    if not video or video["id"] != video_id:
+        raise ValueError("GronkhTV returned a different video")
+    return video
+
+
+def catalog_playlist_path(video_id):
+    return f"/videos/{_uuid(video_id)}/playlist"
 
 
 def normalize_live_stream(stream):
@@ -257,7 +415,7 @@ def _positive_int(value, name):
         raise ValueError(f"{name} must be a positive integer")
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed <= 0 or str(value).strip() not in {str(parsed), f"+{parsed}"}:
         raise ValueError(f"{name} must be a positive integer")
@@ -277,13 +435,13 @@ def _normalize_related_video(video):
     if not isinstance(video, dict):
         return None
 
-    meta = video.get("meta") or {}
-    urls = video.get("urls") or {}
+    meta = _mapping(video.get("meta"))
+    urls = _mapping(video.get("urls"))
     return {
         "id": video.get("id"),
-        "episode": video.get("episode"),
-        "title": video.get("title", ""),
-        "created_at": video.get("created_at", ""),
+        "episode": _episode_number(video, meta),
+        "title": _text(video.get("title")),
+        "created_at": _text(video.get("created_at")),
         "video_length": _as_int(meta.get("duration"), 0),
         "source_length": _as_int(meta.get("duration"), 0),
         "source_width": _as_int(meta.get("width"), 0),
@@ -292,7 +450,7 @@ def _normalize_related_video(video):
         "views": _as_int(video.get("views"), 0),
         "preview_url": urls.get("thumbnail", ""),
         "playlist_url": urls.get("playlist", ""),
-        "tags": video.get("tags") or [],
+        "tags": _rows(video.get("tags")),
         "chapters": [],
         "previous": None,
         "next": None,
@@ -303,10 +461,10 @@ def _normalize_category(category):
     if not isinstance(category, dict):
         category = {}
 
-    urls = category.get("urls") or {}
+    urls = _mapping(category.get("urls"))
     return {
         "id": category.get("id"),
-        "title": category.get("title", ""),
+        "title": _text(category.get("title")),
         "slug": category.get("slug"),
         "urls": urls,
         "videos_count": _as_int(category.get("videos_count"), 0),
@@ -316,7 +474,7 @@ def _normalize_category(category):
 
 def _category_to_legacy_game(category):
     thumbnail = ""
-    urls = category.get("urls") or {}
+    urls = _mapping(category.get("urls"))
     boxarts = urls.get("boxarts") or {}
     if isinstance(boxarts, dict):
         thumbnail = boxarts.get("url") or boxarts.get("thumbnail") or ""
@@ -370,8 +528,8 @@ def _normalize_watch_progress(progress):
 def _as_int(value, default):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         try:
             return int(float(value))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
