@@ -35,6 +35,8 @@ class ProgressClient:
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise ProgressProtocolError("Video response has no data object")
         data = payload["data"]
+        if "id" in data and _video_id(data["id"]) != video_id:
+            raise ProgressProtocolError("Progress response belongs to a different video")
         if "watch_progress" not in data:
             raise ProgressProtocolError("Video response has no watch_progress field")
         progress = data["watch_progress"]
