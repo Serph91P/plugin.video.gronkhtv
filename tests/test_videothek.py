@@ -96,6 +96,9 @@ def kodi(plugin, monkeypatch):
         def setProperty(self, key, value):
             self.properties[key] = value
 
+        def setTitle(self, title):
+            self.title = title
+
         def setResumePoint(self, position, duration):
             self.resume = position, duration
 
@@ -358,7 +361,7 @@ def provider(plugin, kodi, monkeypatch):
         monkeypatch.setattr(plugin, '_account_session', Session(cookie))
         return cookie
 
-    return types.SimpleNamespace(state=state, offsets=offsets, requests=requests, connect=connect,
+    return types.SimpleNamespace(state=state, offsets=offsets, requests=requests, connect=connect, rows=rows,
                                  settings=settings, posts=lambda: [r for r in requests if r[1] == 'POST'])
 
 
@@ -464,6 +467,66 @@ def test_videothek_optional_read_does_not_block_playback(plugin, kodi, monkeypat
     assert not provider.posts()
 
 
+@pytest.mark.parametrize(('mode', 'start', 'watched'), [
+    ('fresh', 90, 0), ('account-switch', 0, None), ('error', 0, None),
+    ('disabled', 0, None), ('now-watched', 0, 1), ('was-watched', 0, None),
+    ('local-bookmark-only', 0, None), ('unknown-duration', 0, 0),
+])
+def test_videothek_kodi_resume_uses_only_fresh_account_state(
+    plugin, kodi, monkeypatch, tmp_path, provider, mode, start, watched,
+):
+    root = tmp_path / 'client'
+    provider.connect(root)
+    if mode != 'local-bookmark-only':
+        provider.offsets['alice', A] = {'offset': 285 if mode == 'was-watched' else 75}
+    plugin.router('action=videothek_videos')
+    route, listed, _ = kodi.items[0]
+    if mode == 'was-watched':
+        assert listed.playcount == 1
+        provider.offsets.clear()
+    elif mode != 'local-bookmark-only':
+        assert listed.resume == (75, 300)
+
+    if mode == 'fresh':
+        provider.offsets['alice', A] = {'offset': 90}
+    elif mode == 'account-switch':
+        provider.connect(root, user='bob')
+    elif mode == 'error':
+        provider.state.read = 'error'
+    elif mode == 'disabled':
+        provider.settings['sync_watch_progress'] = 'false'
+    elif mode == 'now-watched':
+        provider.offsets['alice', A] = {'offset': 285}
+    elif mode == 'unknown-duration':
+        provider.rows[A]['meta']['duration'] = 0
+
+    playback_samples(plugin, kodi, monkeypatch, (None, 0, 1), [])
+    plugin.router(urlsplit(route).query)
+    success, resolved = kodi.playback[-1]
+    assert success
+    # Kodi Nexus/Omega: GetPluginResult uses OverrideInfotag on the source
+    # item; without it VideoInfoTag::Merge preserves an unset resume/playcount.
+    candidate = vars(resolved).get('resume', (0, 0))
+    playcount = vars(resolved).get('playcount')
+    if listed.properties.get('OverrideInfotag', '').lower() == 'true':
+        assert resolved.title == listed.title == A
+        resume = candidate
+    else:
+        resume = candidate if candidate[1] > 0 else vars(listed).get('resume', (0, 0))
+        if playcount is None:
+            playcount = vars(listed).get('playcount')
+    # PlayFile handles StartPercent before STARTOFFSET_RESUME (set by the
+    # Resume menu), which otherwise takes the tag or falls back to a bookmark.
+    properties = {**listed.properties, **resolved.properties}
+    actual = float(properties['StartPercent']) * 300 / 100 if 'StartPercent' in properties else (
+        resume[0] if resume[1] > 0 else 44
+    )
+    assert actual == start
+    assert resume == ((90, 300) if mode == 'fresh' else (0, 0))
+    assert playcount == watched
+    assert not provider.posts()
+
+
 @pytest.mark.parametrize('mode', ['same-before', 'different-before', 'invalid-sample', 'no-start', 'non-hls', 'bad-id'])
 def test_videothek_does_not_upload_unbound_samples(plugin, kodi, monkeypatch, tmp_path, provider, mode):
     provider.connect(tmp_path / 'client')
@@ -510,6 +573,27 @@ def test_videothek_account_switch_rejects_stale_session(plugin, kodi, monkeypatc
         assert kodi.playback[-1][1].resume == (75, 300)
     assert not provider.posts()
     assert not SyncStore(plugin._PROGRESS_SYNC_FILE).pending_uploads('alice')
+
+
+@pytest.mark.parametrize('logout', [True, False], ids=['logout', 'switch'])
+def test_videothek_rechecks_session_after_player_preflight(plugin, kodi, monkeypatch, tmp_path, provider, logout):
+    cookie = provider.connect(tmp_path / 'client')
+    provider.offsets['alice', A] = {'offset': 75}
+
+    def get_playing_file():
+        if logout:
+            cookie.unlink()
+        else:
+            cookie.write_text('bob')
+        return f'{api.API_BASE}/videos/{A}/playlist'
+
+    monkeypatch.setattr(plugin.xbmc, 'Monitor', lambda: types.SimpleNamespace(abortRequested=lambda: False))
+    monkeypatch.setattr(plugin.xbmc, 'Player', lambda: types.SimpleNamespace(
+        isPlayingVideo=lambda: True, getPlayingFile=get_playing_file,
+    ))
+    plugin.router(f'action=videothek_play&id={A}')
+    assert [success for success, _ in kodi.playback] == [False]
+    assert not provider.posts()
 
 
 def test_videothek_failed_write_is_queued_only_for_playing_account(plugin, kodi, monkeypatch, tmp_path, provider):

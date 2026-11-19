@@ -1636,14 +1636,11 @@ def _list_videothek_videos(params):
         video_id = video["id"]
         item = xbmcgui.ListItem(label=video["title"])
         item.setProperty("IsPlayable", "true")
+        # Kodi must replace, not merge, the potentially stale listing tag.
+        item.setProperty("OverrideInfotag", "true")
         if video["preview_url"]:
             item.setArt({"thumb": video["preview_url"]})
-        tag = item.getVideoInfoTag()
-        tag.setTitle(video["title"])
-        tag.setMediaType("video")
-        tag.setDuration(video["video_length"])
-        tag.setPlot(video["series_title"] or video["description"])
-        _videothek_apply_progress(tag, progress.get(video_id), video["video_length"])
+        _videothek_apply_progress(_videothek_tag(item, video), progress.get(video_id), video["video_length"])
         details = get_url(action="videothek_details", id=video_id)
         context = [(details_label(), f"RunPlugin({details})")]
         if video["series_id"]:
@@ -1674,13 +1671,24 @@ def _videothek_details(params):
         _videothek_notice(30309)
 
 
+def _videothek_tag(item, video):
+    tag = item.getVideoInfoTag()
+    tag.setTitle(video["title"])
+    tag.setMediaType("video")
+    tag.setDuration(video["video_length"])
+    tag.setPlot(video["series_title"] or video["description"])
+    return tag
+
+
 def _videothek_apply_progress(tag, progress, duration):
     if not progress or progress.get("state") != "valid":
-        return
+        return False
     watched = _account_watched(progress, duration)
     tag.setPlaycount(int(watched))
-    if not watched and progress["offset"] > 0:
+    if not watched and duration > 0 and progress["offset"] > 0:
         tag.setResumePoint(progress["offset"], duration)
+        return True
+    return False
 
 
 def _videothek_media_matches(player, url, video_id):
@@ -1711,28 +1719,30 @@ def _videothek_play(params):
         if not _configure_authenticated_playback(item, url, require_cookie=True, session=session):
             _videothek_notice(30311)
         elif session.request_bytes(path).startswith(b"#EXTM3U"):
+            progress = None
             progress_sync = _bound_progress_sync(session, user, identity)
             if progress_sync is not None:
                 progress = ResumeStartController(progress_sync, video_id).resolve(
                     local_offset=0, aborted=xbmc.Monitor().abortRequested,
                 )
-                if progress_sync.is_active():
-                    _videothek_apply_progress(item.getVideoInfoTag(), progress, video["video_length"])
-            if _session_file_identity() != identity:
-                raise AuthenticationError("GronkhTV login changed before playback")
 
             def media_matches(player):
                 return _videothek_media_matches(player, url, video_id)
 
             # A same-item replay is ambiguous while Kodi still plays the old item.
             # Do not arm a new monitor in that case, but still resolve playback.
-            if progress_sync is not None:
-                player = xbmc.Player()
-                if not progress_sync.is_active() or (player.isPlayingVideo() and media_matches(player)):
-                    progress_sync = None
+            player = xbmc.Player() if progress_sync is not None else None
+            already_playing = player is not None and player.isPlayingVideo() and media_matches(player)
+            if progress_sync is None or not progress_sync.is_active():
+                progress = progress_sync = None
+            if not _videothek_apply_progress(_videothek_tag(item, video), progress, video["video_length"]):
+                # Kodi applies StartPercent before following its Resume sentinel to a local bookmark.
+                item.setProperty("StartPercent", "0")
             item.setProperty("IsPlayable", "true")
+            if _session_file_identity() != identity:
+                raise AuthenticationError("GronkhTV login changed before playback")
             xbmcplugin.setResolvedUrl(_HANDLE, True, listitem=item)
-            if progress_sync is not None:
+            if progress_sync is not None and not already_playing:
                 monitor_playback(None, progress_sync=progress_sync, video_id=video_id, media_matches=media_matches)
             return
         else:
