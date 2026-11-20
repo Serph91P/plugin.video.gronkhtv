@@ -15,6 +15,9 @@ class ProgressSync:
         self._is_active = is_active
         self._write_lock = threading.Lock()
 
+    def is_active(self):
+        return self._is_active()
+
     def prepare_playback(self, video_id):
         if not self._is_active():
             return {"state": "authentication_required", "offset": None}
