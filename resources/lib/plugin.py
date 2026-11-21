@@ -1288,7 +1288,9 @@ def _monitor_playback(
                         latest["duration"],
                         event=event,
                     )
-                    if state != "synchronized":
+                    if state == "synchronized" and media_matches is not None:
+                        _refresh_videothek_listing()
+                    elif state != "synchronized":
                         xbmc.log(f"[Gronkh.tv] Account progress upload: {state}", xbmc.LOGWARNING)
                 was_paused = event == "pause"
             except Exception as exc:
@@ -1313,7 +1315,9 @@ def _monitor_playback(
                     if state == "synchronized":
                         if media_matches is None:
                             progress_sync.flush_pending(exclude_video_id=video_id)
-                        xbmc.executebuiltin("Container.Refresh")
+                            xbmc.executebuiltin("Container.Refresh")
+                        else:
+                            _refresh_videothek_listing()
                     else:
                         xbmc.log(f"[Gronkh.tv] Account progress upload: {state}", xbmc.LOGWARNING)
                 except Exception as exc:
@@ -1531,7 +1535,7 @@ def router(paramstring):
         "list_game_videos": handle_list_game_videos,
         "videothek": _videothek_directory,
         "videothek_videos": _videothek_directory,
-        "videothek_search": _videothek_directory,
+        "videothek_search": _videothek_search,
         "videothek_tags": _videothek_directory,
         "videothek_series": _videothek_directory,
         "videothek_games": _videothek_directory,
@@ -1563,9 +1567,9 @@ def router(paramstring):
     xbmc.log("[Gronkh.tv] Router finished", xbmc.LOGINFO)
 
 
-def _videothek_folder(label, action, **params):
+def _videothek_folder(label, action, *, is_folder=True, **params):
     xbmcplugin.addDirectoryItem(_HANDLE, get_url(action=action, **params),
-                                xbmcgui.ListItem(label=label), True)
+                                xbmcgui.ListItem(label=label), is_folder)
 
 
 def _videothek_notice(message):
@@ -1587,7 +1591,8 @@ def _videothek_directory(params):
                 (30305, "videothek_series", {}),
                 (30306, "videothek_games", {}),
             ):
-                _videothek_folder(_addon.getLocalizedString(label), route, **arguments)
+                _videothek_folder(_addon.getLocalizedString(label), route,
+                                  is_folder=route != "videothek_search", **arguments)
         elif action == "videothek_tags":
             for tag, title in catalog_tags():
                 _videothek_folder(title, "videothek_videos", tag=tag)
@@ -1609,11 +1614,6 @@ def _videothek_directory(params):
             for season in catalog_seasons(series):
                 _videothek_folder(season["title"], "videothek_videos", series=series, season=season["id"])
         else:
-            if action == "videothek_search":
-                query = xbmcgui.Dialog().input(_addon.getLocalizedString(30303), type=xbmcgui.INPUT_ALPHANUM).strip()
-                if not query:
-                    return
-                params = {"action": "videothek_videos", "query": query}
             _list_videothek_videos(params)
         succeeded = True
     except (SessionError, RuntimeError, ValueError):
@@ -1628,19 +1628,58 @@ def _videothek_more(params, page):
         _videothek_folder(_addon.getLocalizedString(30307), **dict(params, page=page))
 
 
+def _videothek_search(_params):
+    query = xbmcgui.Dialog().input(_addon.getLocalizedString(30303), type=xbmcgui.INPUT_ALPHANUM).strip()
+    if query:
+        # Kodi can reopen the results path after playback without prompting again.
+        xbmc.executebuiltin(f'Container.Update({get_url(action="videothek_videos", query=query)})')
+
+
+def _refresh_videothek_listing():
+    base, _, query = xbmc.getInfoLabel("Container.FolderPath").partition("?")
+    if base == _URL and dict(parse_qsl(query)).get("action") == "videothek_videos":
+        xbmc.executebuiltin("Container.Refresh")
+
+
 def _list_videothek_videos(params):
     rows, more = catalog_videos(**{key: params[key] for key in ("page", "query", "tag", "order", "series", "season")
                                    if key in params})
     progress = _listing_account_progress(rows, uuid_only=True) if rows else {}
+    account_mode = _account_progress_enabled()
+    major = xbmc.getInfoLabel("System.BuildVersion").partition(".")[0]
+    # Nexus opens the native resume menu even on non-playable plugin rows.
+    native_bookmark = major.isdecimal() and int(major) >= 21
     for video in rows:
         video_id = video["id"]
+        duration = video["video_length"]
+        remote = progress.get(video_id)
         item = xbmcgui.ListItem(label=video["title"])
-        item.setProperty("IsPlayable", "true")
-        # Kodi must replace, not merge, the potentially stale listing tag.
+        # A playable listing bookmark lets Kodi ask before we can read fresh progress.
+        item.setProperty("IsPlayable", "false")
         item.setProperty("OverrideInfotag", "true")
         if video["preview_url"]:
             item.setArt({"thumb": video["preview_url"]})
-        _videothek_apply_progress(_videothek_tag(item, video), progress.get(video_id), video["video_length"])
+        tag = _videothek_tag(item, video)
+        if not native_bookmark:
+            # Nexus treats a zero bookmark with a positive total as set: no DB fallback, no native prompt.
+            tag.setResumePoint(0, max(1, duration))
+        offset = _videothek_apply_progress(tag, remote, duration, resume=native_bookmark)
+        status = ""
+        if offset:
+            status = f"{offset / duration:.1%} ({seconds_to_time(int(offset))})"
+            if not native_bookmark:
+                item.setProperty("WatchedProgress", str(max(1, int(100 * offset / duration))))
+        elif remote and _account_watched(remote, duration):
+            status = xbmc.getLocalizedString(16102)  # Watched
+        if status:
+            display_title = f'{video["title"]} [{status}]'
+            item.setLabel(display_title)
+            tag.setTitle(display_title)  # Kodi's video sort masks can rebuild the label from the tag.
+        elif account_mode and not remote:
+            status = _addon.getLocalizedString(30231)
+        if status:
+            plot = video["series_title"] or video["description"]
+            tag.setPlot("\n\n".join(filter(None, (status, plot))))
         details = get_url(action="videothek_details", id=video_id)
         context = [(details_label(), f"RunPlugin({details})")]
         if video["series_id"]:
@@ -1680,15 +1719,16 @@ def _videothek_tag(item, video):
     return tag
 
 
-def _videothek_apply_progress(tag, progress, duration):
+def _videothek_apply_progress(tag, progress, duration, *, resume=True):
     if not progress or progress.get("state") != "valid":
-        return False
+        return 0
     watched = _account_watched(progress, duration)
     tag.setPlaycount(int(watched))
     if not watched and duration > 0 and progress["offset"] > 0:
-        tag.setResumePoint(progress["offset"], duration)
-        return True
-    return False
+        if resume:
+            tag.setResumePoint(progress["offset"], duration)
+        return progress["offset"]
+    return 0
 
 
 def _videothek_media_matches(player, url, video_id):
@@ -1707,6 +1747,12 @@ def _videothek_media_matches(player, url, video_id):
 def _videothek_play(params):
     try:
         path = catalog_playlist_path(params.get("id"))
+        if _HANDLE == -1:
+            # Non-playable plugin rows run as scripts. Resolve the same UUID on
+            # a fresh item without the listing bookmark or a native resume menu.
+            route = get_url(action="videothek_play", id=_optional_uuid(params["id"]))
+            xbmc.executebuiltin(f"PlayMedia({route},noresume)")
+            return
         identity = _session_file_identity()
         if identity is None:
             raise AuthenticationError("GronkhTV login required")
@@ -1731,13 +1777,31 @@ def _videothek_play(params):
             def media_matches(player):
                 return _videothek_media_matches(player, url, video_id)
 
-            # A same-item replay is ambiguous while Kodi still plays the old item.
-            # Do not arm a new monitor in that case, but still resolve playback.
-            player = xbmc.Player() if progress_sync is not None else None
-            already_playing = player is not None and player.isPlayingVideo() and media_matches(player)
             if progress_sync is None or not progress_sync.is_active():
                 progress = progress_sync = None
-            if not _videothek_apply_progress(_videothek_tag(item, video), progress, video["video_length"]):
+            duration = video["video_length"]
+            choice = None
+            if (progress_sync is not None and progress and progress.get("state") == "valid" and duration > 0
+                    and progress["offset"] > 0 and not _account_watched(progress, duration)):
+                position = seconds_to_time(int(progress["offset"]))
+                choice = xbmcgui.Dialog().select(video["title"], [
+                    xbmc.getLocalizedString(12022).format(position),
+                    xbmc.getLocalizedString(12021),
+                ])
+                if choice not in (0, 1):
+                    xbmcplugin.setResolvedUrl(_HANDLE, False, listitem=xbmcgui.ListItem())
+                    return
+            # A same-item replay is ambiguous while Kodi still plays the old item.
+            player = xbmc.Player() if progress_sync is not None else None
+            already_playing = player is not None and player.isPlayingVideo() and media_matches(player)
+            if progress_sync is not None and not progress_sync.is_active():
+                if choice is not None:
+                    xbmcplugin.setResolvedUrl(_HANDLE, False, listitem=xbmcgui.ListItem())
+                    return
+                progress = progress_sync = None
+            resume = choice == 0
+            _videothek_apply_progress(_videothek_tag(item, video), progress, duration, resume=resume)
+            if not resume:
                 # Kodi applies StartPercent before following its Resume sentinel to a local bookmark.
                 item.setProperty("StartPercent", "0")
             item.setProperty("IsPlayable", "true")
@@ -1753,7 +1817,8 @@ def _videothek_play(params):
         _videothek_notice(30310)
     except (SessionError, ValueError, RuntimeError):
         _videothek_notice(30309)
-    xbmcplugin.setResolvedUrl(_HANDLE, False, listitem=xbmcgui.ListItem())
+    if _HANDLE != -1:
+        xbmcplugin.setResolvedUrl(_HANDLE, False, listitem=xbmcgui.ListItem())
 
 
 def handle_listing(params):
