@@ -99,6 +99,12 @@ def kodi(plugin, monkeypatch):
         def setTitle(self, title):
             self.title = title
 
+        def setPlot(self, plot):
+            self.plot = plot
+
+        def setLabel(self, label):
+            self.label = label
+
         def setResumePoint(self, position, duration):
             self.resume = position, duration
 
@@ -108,11 +114,25 @@ def kodi(plugin, monkeypatch):
         def __getattr__(self, name):
             return lambda *args: None
 
-    events = types.SimpleNamespace(items=[], playback=[], notifications=[], details=[], ended=[])
+    events = types.SimpleNamespace(items=[], playback=[], notifications=[], details=[], ended=[],
+                                   prompts=[], choice=0, on_select=lambda: None, query='')
+
+    def select(heading, choices):
+        events.prompts.append((heading, list(choices)))
+        events.on_select()
+        return events.choice
+
     monkeypatch.setattr(plugin.xbmcgui, 'ListItem', Item)
+    monkeypatch.setattr(plugin.xbmc, 'getLocalizedString', {
+        12021: 'Play from beginning', 12022: 'Resume from {0:s}', 16102: 'Watched',
+    }.__getitem__, raising=False)
+    monkeypatch.setattr(plugin.xbmc, 'getInfoLabel', lambda label: '22.0rc2' if label == 'System.BuildVersion' else '',
+                        raising=False)
     monkeypatch.setattr(plugin.xbmcgui, 'Dialog', lambda: types.SimpleNamespace(
         notification=lambda *args: events.notifications.append(args),
         textviewer=lambda *args: events.details.append(args),
+        select=select,
+        input=lambda *a, **kw: events.query,
     ))
     for name, fn in {
         'addDirectoryItem': lambda _, url, item, folder: events.items.append((url, item, folder)),
@@ -433,6 +453,149 @@ def test_videothek_progress_roundtrip_two_clients(plugin, kodi, monkeypatch, tmp
     assert len(provider.posts()) == 2
 
 
+def test_videothek_progress_is_readable_before_play(plugin, kodi, monkeypatch, tmp_path, provider):
+    provider.connect(tmp_path / 'client')
+    provider.offsets['alice', A] = {'offset': 75}
+    plugin.router('action=videothek_videos')
+    _, item, folder = kodi.items[0]
+    assert not folder
+    assert '25.0%' in item.label and '0:01:15' in item.label
+    assert '25.0%' in item.plot and '0:01:15' in item.plot
+    assert item.resume == (75, 300) and item.playcount == 0
+    assert not kodi.playback and not provider.posts()
+
+
+def test_videothek_selection_routes_around_native_resume_menu(plugin, kodi, monkeypatch, tmp_path, provider):
+    provider.connect(tmp_path / 'client')
+    provider.offsets['alice', A] = {'offset': 75}
+    plugin.router('action=videothek_videos')
+    route, listed, folder = kodi.items[0]
+    # Piers GUIWindowVideoBase::OnSelect enters the native video action
+    # processor for nonfolder playable plugin URLs. It sees this bookmark.
+    assert listed.resume == (75, 300) and not folder
+    assert listed.properties.get('IsPlayable') != 'true'
+    calls = []
+    monkeypatch.setattr(plugin, '_HANDLE', -1)
+    monkeypatch.setattr(plugin.xbmc, 'executebuiltin', calls.append)
+    plugin.router(urlsplit(route).query)
+    assert calls == [f'PlayMedia({route},noresume)']
+    assert not kodi.prompts and not kodi.playback and not provider.posts()
+
+
+@pytest.mark.parametrize('offset', [75, 0])
+def test_videothek_nexus_shields_listing_from_local_bookmark(
+    plugin, kodi, monkeypatch, tmp_path, provider, offset,
+):
+    provider.connect(tmp_path / 'client')
+    provider.offsets['alice', A] = {'offset': offset}
+    monkeypatch.setattr(plugin.xbmc, 'getInfoLabel', lambda label: '20.1 (20.1.0)')
+    plugin.router('action=videothek_videos')
+    route, item, folder = kodi.items[0]
+    # Nexus falls back to its video DB if the tag lacks a bookmark with positive total time.
+    assert vars(item).get('resume') == (0, 300)
+    assert not folder and item.properties['IsPlayable'] == 'false'
+    assert route.endswith(f'?action=videothek_play&id={A}')
+    if offset:
+        assert item.properties['WatchedProgress'] == '25'
+        assert '25.0%' in item.title and '25.0%' in item.plot
+    else:
+        assert 'WatchedProgress' not in item.properties
+        assert '25.0%' not in item.title and '25.0%' not in item.plot
+
+
+@pytest.mark.parametrize('choice', [0, 1, -1])
+def test_videothek_prompts_for_fresh_position_even_without_listing_bookmark(
+    plugin, kodi, monkeypatch, tmp_path, provider, choice,
+):
+    provider.connect(tmp_path / 'client')
+    plugin.router('action=videothek_videos')
+    route, listed, _ = kodi.items[0]
+    assert 'resume' not in vars(listed)
+    provider.offsets['alice', A] = {'offset': 90}
+    kodi.choice = choice
+    playback_samples(plugin, kodi, monkeypatch, (None, 0, 1), [])
+    plugin.router(urlsplit(route).query)
+    assert len(kodi.prompts) == 1
+    assert kodi.prompts[0][1] == ['Resume from 0:01:30', 'Play from beginning']
+    assert len(kodi.playback) == 1
+    ok, resolved = kodi.playback[0]
+    assert ok == (choice != -1)
+    if choice == 0:
+        assert resolved.resume == (90, 300) and 'StartPercent' not in resolved.properties
+    elif choice == 1:
+        assert resolved.properties['StartPercent'] == '0' and 'resume' not in vars(resolved)
+    else:
+        assert not resolved.path
+    assert provider.offsets['alice', A] == {'offset': 90} and not provider.posts()
+
+
+@pytest.mark.parametrize('change', ['switch', 'logout', 'sync-off'])
+def test_videothek_choice_does_not_survive_context_change(plugin, kodi, monkeypatch, tmp_path, provider, change):
+    root = tmp_path / 'client'
+    cookie = provider.connect(root)
+    provider.offsets['alice', A] = {'offset': 90}
+    if change == 'switch':
+        kodi.on_select = lambda: provider.connect(root, user='bob')
+    elif change == 'logout':
+        kodi.on_select = cookie.unlink
+    else:
+        kodi.on_select = lambda: provider.settings.update(sync_watch_progress='false')
+    playback_samples(plugin, kodi, monkeypatch, (None, 0, 1), [])
+    plugin.router(f'action=videothek_play&id={A}')
+    assert len(kodi.prompts) == 1
+    assert [ok for ok, _ in kodi.playback] == [False]
+    assert not provider.posts()
+
+
+def test_videothek_search_refreshes_results_without_reopening_keyboard(plugin, kodi, monkeypatch, tmp_path, provider):
+    provider.connect(tmp_path / 'client')
+    plugin.router('action=videothek')
+    source, _, folder = next(row for row in kodi.items if 'action=videothek_search' in row[0])
+    assert not folder
+    kodi.items.clear()
+    kodi.query = 'Demo + Test'
+    commands = []
+    with monkeypatch.context() as m:
+        m.setattr(plugin, '_HANDLE', -1)
+        m.setattr(plugin.xbmc, 'executebuiltin', commands.append)
+        plugin.router(urlsplit(source).query)
+    assert commands == ['Container.Update(plugin://plugin.video.gronkhtv/?action=videothek_videos&query=Demo+%2B+Test)']
+    query = urlsplit(commands[0].removeprefix('Container.Update(').removesuffix(')')).query
+    kodi.query = ''
+    for progress, expected in [({'offset': 90}, '30.0%'), ({'offset': 15}, '5.0%'), ({'offset': 0}, None)]:
+        provider.offsets['alice', A] = progress
+        kodi.items.clear()
+        plugin.router(query)
+        item = kodi.items[0][1]
+        if expected:
+            assert expected in item.label and item.resume == (progress['offset'], 300)
+        else:
+            assert item.label == A and 'resume' not in vars(item) and item.playcount == 0
+        assert not kodi.ended[-1]['cacheToDisc']
+    assert not provider.posts()
+
+
+def test_videothek_successful_pause_and_stop_refresh_current_listing(plugin, kodi, monkeypatch, tmp_path, provider):
+    provider.connect(tmp_path / 'client')
+    folder = 'action=videothek_videos'
+    plugin.router(folder)
+    route = kodi.items[0][0]
+    monkeypatch.setattr(plugin.xbmc, 'getInfoLabel', lambda label: f'{plugin._URL}?{folder}', raising=False)
+    refreshed = []
+
+    def builtin(command):
+        assert command == 'Container.Refresh'
+        kodi.items.clear()
+        plugin.router(folder)
+        refreshed.append(kodi.items[0][1].label)
+
+    monkeypatch.setattr(plugin.xbmc, 'executebuiltin', builtin)
+    path = f'{api.API_BASE}/videos/{A}/playlist'
+    playback_samples(plugin, kodi, monkeypatch, (None, 0, 1), [(path, 60, 0), (path, 90, 1)])
+    plugin.router(urlsplit(route).query)
+    assert refreshed == [f'{A} [20.0% (0:01:00)]', f'{A} [30.0% (0:01:30)]']
+
+
 @pytest.mark.parametrize('watch_progress', [{'offset': 285}, {'offset': 15, 'marked_as_watched': True}])
 def test_videothek_watched_projects_without_resuming(plugin, kodi, monkeypatch, tmp_path, provider, watch_progress):
     provider.connect(tmp_path / 'client')
@@ -440,6 +603,7 @@ def test_videothek_watched_projects_without_resuming(plugin, kodi, monkeypatch, 
     plugin.router('action=videothek_videos')
     item = kodi.items[0][1]
     assert item.playcount == 1 and 'resume' not in vars(item)
+    assert 'Watched' in item.label and 'Watched' in item.plot
     playback_samples(plugin, kodi, monkeypatch, (None, 0, 1), [])
     plugin.router(f'action=videothek_play&id={A}')
     assert kodi.playback[-1][1].playcount == 1 and 'resume' not in vars(kodi.playback[-1][1])
@@ -464,6 +628,9 @@ def test_videothek_optional_read_does_not_block_playback(plugin, kodi, monkeypat
     assert kodi.playback[-1][0] is True
     for item in (kodi.items[0][1], kodi.playback[-1][1]):
         assert 'resume' not in vars(item) and 'playcount' not in vars(item)
+    if mode not in ('disabled', 'absent'):
+        assert '30231' in kodi.items[0][1].plot
+    assert not kodi.prompts
     assert not provider.posts()
 
 
@@ -509,7 +676,7 @@ def test_videothek_kodi_resume_uses_only_fresh_account_state(
     candidate = vars(resolved).get('resume', (0, 0))
     playcount = vars(resolved).get('playcount')
     if listed.properties.get('OverrideInfotag', '').lower() == 'true':
-        assert resolved.title == listed.title == A
+        assert resolved.title == A and listed.title.startswith(A)
         resume = candidate
     else:
         resume = candidate if candidate[1] > 0 else vars(listed).get('resume', (0, 0))
@@ -524,6 +691,9 @@ def test_videothek_kodi_resume_uses_only_fresh_account_state(
     assert actual == start
     assert resume == ((90, 300) if mode == 'fresh' else (0, 0))
     assert playcount == watched
+    assert len(kodi.prompts) == (1 if mode == 'fresh' else 0)
+    if mode == 'fresh':
+        assert '0:01:30' in kodi.prompts[0][1][0]
     assert not provider.posts()
 
 
