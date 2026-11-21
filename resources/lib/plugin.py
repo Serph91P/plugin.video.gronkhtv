@@ -1660,6 +1660,9 @@ def _list_videothek_videos(params):
         if video["preview_url"]:
             item.setArt({"thumb": video["preview_url"]})
         tag = _videothek_tag(item, video)
+        if not native_bookmark:
+            # Nexus treats a zero bookmark with a positive total as set: no DB fallback, no native prompt.
+            tag.setResumePoint(0, max(1, duration))
         offset = _videothek_apply_progress(tag, remote, duration, resume=native_bookmark)
         status = ""
         if offset:

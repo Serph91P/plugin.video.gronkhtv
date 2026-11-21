@@ -482,18 +482,25 @@ def test_videothek_selection_routes_around_native_resume_menu(plugin, kodi, monk
     assert not kodi.prompts and not kodi.playback and not provider.posts()
 
 
-def test_videothek_nexus_shows_progress_without_triggering_its_native_resume_menu(
-    plugin, kodi, monkeypatch, tmp_path, provider,
+@pytest.mark.parametrize('offset', [75, 0])
+def test_videothek_nexus_shields_listing_from_local_bookmark(
+    plugin, kodi, monkeypatch, tmp_path, provider, offset,
 ):
     provider.connect(tmp_path / 'client')
-    provider.offsets['alice', A] = {'offset': 75}
+    provider.offsets['alice', A] = {'offset': offset}
     monkeypatch.setattr(plugin.xbmc, 'getInfoLabel', lambda label: '20.1 (20.1.0)')
     plugin.router('action=videothek_videos')
-    _, item, _ = kodi.items[0]
-    # Nexus runs the resume chooser even on a non-playable plugin row.
-    assert 'resume' not in vars(item)
-    assert item.properties['WatchedProgress'] == '25'
-    assert '25.0%' in item.title and '25.0%' in item.plot
+    route, item, folder = kodi.items[0]
+    # Nexus falls back to its video DB if the tag lacks a bookmark with positive total time.
+    assert vars(item).get('resume') == (0, 300)
+    assert not folder and item.properties['IsPlayable'] == 'false'
+    assert route.endswith(f'?action=videothek_play&id={A}')
+    if offset:
+        assert item.properties['WatchedProgress'] == '25'
+        assert '25.0%' in item.title and '25.0%' in item.plot
+    else:
+        assert 'WatchedProgress' not in item.properties
+        assert '25.0%' not in item.title and '25.0%' not in item.plot
 
 
 @pytest.mark.parametrize('choice', [0, 1, -1])
