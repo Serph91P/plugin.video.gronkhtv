@@ -79,6 +79,10 @@ def kodi(plugin, monkeypatch):
             self.label, self.path = label, path
             self.properties = {}
             self.context = []
+            self.art = {}
+
+        def setArt(self, art):
+            self.art.update(art)
 
         def getVideoInfoTag(self):
             return self
@@ -383,6 +387,25 @@ def provider(plugin, kodi, monkeypatch):
 
     return types.SimpleNamespace(state=state, offsets=offsets, requests=requests, connect=connect, rows=rows,
                                  settings=settings, posts=lambda: [r for r in requests if r[1] == 'POST'])
+
+
+@pytest.mark.parametrize('has_preview', [True, False])
+def test_videothek_passes_selected_preview_to_playback_osd(plugin, kodi, provider, tmp_path, has_preview):
+    provider.connect(tmp_path)
+    provider.settings['sync_watch_progress'] = 'false'
+    provider.rows[A]['urls'] = {'thumbnail': 'https://art.example.test/other.jpg'}
+    preview = 'https://art.example.test/selected.jpg'
+    if has_preview:
+        provider.rows[B]['urls'] = {'thumbnail': preview}
+
+    plugin.router('action=videothek_videos')
+    url, row, _ = next(entry for entry in kodi.items if entry[1].label == B)
+    assert row.art.get('thumb', '') == (preview if has_preview else '')
+
+    plugin.router(urlsplit(url).query)
+    [(success, item)] = kodi.playback
+    assert success
+    assert item.art == ({'thumb': preview, 'landscape': preview} if has_preview else {})
 
 
 def playback_samples(plugin, kodi, monkeypatch, before, after, *, native_pause=False):
