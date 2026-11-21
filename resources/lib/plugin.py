@@ -1716,6 +1716,8 @@ def _videothek_play(params):
         video_id = video["id"]
         url = API_BASE + path
         item = xbmcgui.ListItem(label=video["title"], path=url)
+        if preview_url := video["preview_url"]:
+            item.setArt({"thumb": preview_url, "landscape": preview_url})
         if not _configure_authenticated_playback(item, url, require_cookie=True, session=session):
             _videothek_notice(30311)
         elif session.request_bytes(path).startswith(b"#EXTM3U"):
